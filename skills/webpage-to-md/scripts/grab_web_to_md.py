@@ -37,7 +37,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Callable
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Callable, Union
 from urllib.parse import urljoin, urlparse, unquote
 
 import requests
@@ -83,6 +83,168 @@ def _resolve_user_agent(user_agent: Optional[str], ua_preset: str) -> str:
     if user_agent and user_agent.strip():
         return user_agent.strip()
     return UA_PRESETS.get(ua_preset, UA_PRESETS["chrome-win"])
+
+
+_DEFAULT_MAX_IMAGE_BYTES = 25 * 1024 * 1024  # 25MB/张；设为 0 表示不限制
+
+
+def redact_url(url: str) -> str:
+    """
+    URL 脱敏：默认仅保留 scheme://host/path，移除 query/fragment。
+
+    - 仅对 http/https 且含 netloc 的 URL 生效
+    - 其他形式（相对路径、空字符串等）原样返回
+    """
+    try:
+        p = urlparse(url)
+        if p.scheme in ("http", "https") and p.netloc:
+            return p._replace(query="", fragment="").geturl()
+    except Exception:
+        pass
+    return url
+
+
+def _redact_url_to_local_map(url_to_local: Dict[str, str]) -> Dict[str, Union[str, List[str]]]:
+    """
+    将 URL->本地路径映射中的 URL 脱敏（去 query/fragment）。
+    为避免脱敏后 key 冲突导致覆盖，冲突时把 value 变成列表。
+    """
+    out: Dict[str, Union[str, List[str]]] = {}
+    for raw_url, local_path in url_to_local.items():
+        key = redact_url(raw_url)
+        if key in out:
+            prev = out[key]
+            if isinstance(prev, list):
+                if local_path not in prev:
+                    prev.append(local_path)
+            else:
+                if local_path != prev:
+                    out[key] = [prev, local_path]
+        else:
+            out[key] = local_path
+    return out
+
+
+def _host_of(url: str) -> str:
+    try:
+        return (urlparse(url).hostname or "").lower()
+    except Exception:
+        return ""
+
+
+def _is_same_host(url_a: str, url_b: str) -> bool:
+    ha = _host_of(url_a)
+    hb = _host_of(url_b)
+    return bool(ha) and ha == hb
+
+
+def _create_anonymous_image_session(base_session: requests.Session) -> requests.Session:
+    """
+    创建“干净 session”用于跨域图片下载：
+    - 不携带 Cookie / Authorization / 自定义 Header
+    - 只保留少量安全 Header（如 UA / Accept-Language）
+    """
+    s = requests.Session()
+    # 继承网络配置，避免“页面可访问但跨域图片因代理/证书/adapter 不一致而失败”
+    try:
+        s.trust_env = base_session.trust_env
+    except Exception:
+        pass
+    try:
+        s.proxies = dict(getattr(base_session, "proxies", {}) or {})
+    except Exception:
+        pass
+    try:
+        s.verify = getattr(base_session, "verify", True)
+    except Exception:
+        pass
+    try:
+        s.cert = getattr(base_session, "cert", None)
+    except Exception:
+        pass
+    try:
+        # 复用 base_session 的 adapter（如自定义 TLS/重试/代理适配器）
+        for prefix, adapter in getattr(base_session, "adapters", {}).items():
+            s.mount(prefix, adapter)
+    except Exception:
+        pass
+
+    ua = base_session.headers.get("User-Agent") or UA_PRESETS["chrome-win"]
+    accept_lang = base_session.headers.get("Accept-Language") or "en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7"
+    s.headers.update(
+        {
+            "User-Agent": ua,
+            "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+            "Accept-Language": accept_lang,
+        }
+    )
+    return s
+
+
+# 最大重定向次数，防止无限循环
+_MAX_REDIRECTS = 10
+
+
+def _safe_image_get(
+    img_url: str,
+    page_url: str,
+    session: requests.Session,
+    anon_session: requests.Session,
+    timeout_s: int,
+    referer: str,
+) -> requests.Response:
+    """
+    安全地 GET 图片 URL，手动处理重定向并在跨域时切换到干净 session。
+    
+    防止同域 URL 重定向到第三方 CDN 时泄露敏感请求头。
+    """
+    current_url = img_url
+    current_session = session if _is_same_host(img_url, page_url) else anon_session
+    
+    for _ in range(_MAX_REDIRECTS):
+        headers = {"Connection": "close"}
+        if referer:
+            headers["Referer"] = referer
+        r = current_session.get(
+            current_url,
+            timeout=timeout_s,
+            stream=True,
+            allow_redirects=False,  # 关键：禁用自动重定向
+            headers=headers,
+        )
+        
+        # 非重定向响应，直接返回
+        if r.status_code not in (301, 302, 303, 307, 308):
+            return r
+        
+        # 获取重定向目标
+        location = r.headers.get("Location")
+        if not location:
+            # 没有 Location 头：视为错误，避免 3xx 被误当作成功写入图片
+            try:
+                r.close()
+            except Exception:
+                pass
+            raise RuntimeError(f"图片重定向响应缺少 Location 头: {current_url} (status={r.status_code})")
+        
+        # 关闭当前响应
+        try:
+            r.close()
+        except Exception:
+            pass
+        
+        # 解析重定向目标（可能是相对路径）
+        next_url = urljoin(current_url, location)
+        
+        # 每次重定向都按“目标 URL 是否与 page_url 同 host”重新选择 session：
+        # - 同 host：允许携带 Cookie/Auth
+        # - 跨 host：使用干净 session
+        current_session = session if _is_same_host(next_url, page_url) else anon_session
+        
+        current_url = next_url
+    
+    # 超过最大重定向次数
+    raise RuntimeError(f"图片 URL 重定向次数超过 {_MAX_REDIRECTS} 次: {img_url}")
 
 
 def generate_frontmatter(title: str, url: str, tags: Optional[List[str]] = None) -> str:
@@ -388,52 +550,119 @@ def download_images(
     timeout_s: int,
     retries: int = 3,
     best_effort: bool = False,
+    *,
+    page_url: str,
+    redact_urls: bool = True,
+    max_image_bytes: int = _DEFAULT_MAX_IMAGE_BYTES,
 ) -> Dict[str, str]:
     os.makedirs(assets_dir, exist_ok=True)
     url_to_local: Dict[str, str] = {}
+    anon_session = _create_anonymous_image_session(session)
+    referer = redact_url(page_url) if redact_urls else page_url
+    max_bytes: Optional[int] = max_image_bytes if (max_image_bytes and max_image_bytes > 0) else None
+    known_image_exts = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".avif", ".bmp", ".ico"}
 
     for idx, img_url in enumerate(image_urls, start=1):
+        if not img_url:
+            continue
+        parsed_img = urlparse(img_url)
+        if parsed_img.scheme not in ("http", "https"):
+            # 不支持 data/file 等 scheme（也避免触达本地 file://）
+            continue
+
         last_err: Optional[Exception] = None
         r: Optional[requests.Response] = None
-        content: Optional[bytes] = None
         for attempt in range(1, retries + 1):
             try:
-                r = session.get(img_url, timeout=timeout_s, stream=True, headers={"Connection": "close"})
+                # 使用安全的图片获取函数，手动处理重定向并在跨域时切换到干净 session
+                r = _safe_image_get(
+                    img_url=img_url,
+                    page_url=page_url,
+                    session=session,
+                    anon_session=anon_session,
+                    timeout_s=timeout_s,
+                    referer=referer,
+                )
                 r.raise_for_status()
-                content = b"".join(r.iter_content(chunk_size=1024 * 64))
                 break
             except Exception as e:  # noqa: BLE001 - CLI tool wants retries on network errors
                 last_err = e
+                # 关键：如果 raise_for_status() 失败（4xx/5xx），r 虽然非 None 但内容无效
+                # 必须重置为 None，否则后续 `if r is None:` 误判为成功
+                if r is not None:
+                    try:
+                        r.close()
+                    except Exception:
+                        pass
+                    r = None
                 if attempt >= retries:
                     break
                 time.sleep(min(2.0, 0.4 * attempt))
 
-        if content is None or r is None:
+        if r is None:
             if best_effort:
                 print(f"警告：图片下载失败，已跳过：{img_url}\n  - 错误：{last_err}", file=sys.stderr)
                 continue
             raise last_err or RuntimeError("image download failed")
 
-        parsed = urlparse(img_url)
-        base = os.path.basename(parsed.path.rstrip("/"))
-        base = unquote(base) or f"image-{idx}"
-        name_root, name_ext = os.path.splitext(base)
+        try:
+            # 生成本地文件名（扩展名优先取 URL path，其次 Content-Type，再次嗅探首块内容）
+            base = os.path.basename(parsed_img.path.rstrip("/"))
+            base = unquote(base) or f"image-{idx}"
+            name_root, name_ext = os.path.splitext(base)
 
-        if not name_ext:
-            name_ext = (
-                ext_from_content_type(r.headers.get("Content-Type") if r else None)
-                or sniff_ext(content or b"")
-                or ".bin"
-            )
+            it = r.iter_content(chunk_size=1024 * 64)
+            head = b""
+            for chunk in it:
+                if chunk:
+                    head = chunk
+                    break
 
-        safe_root = _sanitize_filename_part(name_root)
-        filename = f"{idx:02d}-{safe_root}{name_ext}"
-        # 检查路径长度，必要时截断
-        filename = _safe_path_length(assets_dir, filename)
-        local_path = os.path.join(assets_dir, filename)
+            if (not name_ext) or (name_ext.lower() not in known_image_exts):
+                detected = ext_from_content_type(r.headers.get("Content-Type") if r else None) or sniff_ext(head or b"")
+                if detected:
+                    name_ext = detected
+                elif not name_ext:
+                    name_ext = ".bin"
 
-        with open(local_path, "wb") as f:
-            f.write(content or b"")
+            safe_root = _sanitize_filename_part(name_root)
+            filename = f"{idx:02d}-{safe_root}{name_ext}"
+            filename = _safe_path_length(assets_dir, filename)
+            local_path = os.path.join(assets_dir, filename)
+            tmp_path = local_path + ".part"
+
+            size = 0
+            try:
+                with open(tmp_path, "wb") as f:
+                    if head:
+                        f.write(head)
+                        size += len(head)
+                        if max_bytes is not None and size > max_bytes:
+                            raise RuntimeError(f"图片过大（>{max_bytes} bytes）")
+                    for chunk in it:
+                        if not chunk:
+                            continue
+                        size += len(chunk)
+                        if max_bytes is not None and size > max_bytes:
+                            raise RuntimeError(f"图片过大（>{max_bytes} bytes）")
+                        f.write(chunk)
+                os.replace(tmp_path, local_path)
+            finally:
+                if os.path.exists(tmp_path):
+                    try:
+                        os.remove(tmp_path)
+                    except OSError:
+                        pass
+        except Exception as e:
+            if best_effort:
+                print(f"警告：图片保存失败，已跳过：{img_url}\n  - 错误：{e}", file=sys.stderr)
+                continue
+            raise
+        finally:
+            try:
+                r.close()
+            except Exception:
+                pass
 
         local_abs = os.path.abspath(local_path)
         md_dir_abs = os.path.abspath(md_dir or ".")
@@ -523,7 +752,8 @@ class HTMLToMarkdown(HTMLParser):
         self.a_href: Optional[str] = None
         self.a_text: List[str] = []
 
-        self.list_stack: List[Dict[str, int | str]] = []
+        # 兼容 Python < 3.10：避免 PEP604 `int | str` 写法
+        self.list_stack: List[Dict[str, Union[int, str]]] = []
 
         self.in_table = False
         self.table_depth = 0
@@ -560,11 +790,28 @@ class HTMLToMarkdown(HTMLParser):
         """将属性列表转换为 HTML 属性字符串。"""
         parts = []
         for name, value in attrs_list:
+            safe_name = (name or "").strip()
+            if not safe_name:
+                continue
+            low = safe_name.lower()
+
+            # 安全净化：移除事件属性（onclick/onerror/...）
+            if low.startswith("on"):
+                continue
+
+            # 安全净化：过滤 javascript: / vbscript:；过滤 file:（避免后续渲染链路触达本地文件）
+            if value is not None and low in ("href", "src", "xlink:href", "srcset"):
+                v = str(value).strip()
+                if re.match(r"(?i)^(?:javascript|vbscript):", v):
+                    continue
+                if low in ("src", "xlink:href") and v.lower().startswith("file:"):
+                    continue
+
             if value is None:
-                parts.append(name)
+                parts.append(safe_name)
             else:
-                escaped = htmllib.escape(value, quote=True)
-                parts.append(f'{name}="{escaped}"')
+                escaped = htmllib.escape(str(value), quote=True)
+                parts.append(f'{safe_name}="{escaped}"')
         return " ".join(parts)
 
     @staticmethod
@@ -1612,7 +1859,7 @@ def strip_yaml_frontmatter(md_text: str) -> str:
     return md_text
 
 
-def generate_pdf_from_markdown(md_path: str, pdf_path: str) -> None:
+def generate_pdf_from_markdown(md_path: str, pdf_path: str, *, allow_file_access: bool = False) -> None:
     browser = _find_pdf_browser()
     if not browser:
         raise RuntimeError("未找到可用于打印 PDF 的浏览器（msedge/chrome）。请安装 Edge/Chrome 或加入 PATH。")
@@ -1654,7 +1901,11 @@ def generate_pdf_from_markdown(md_path: str, pdf_path: str) -> None:
             "--disable-gpu",
             "--no-first-run",
             "--no-default-browser-check",
-            "--allow-file-access-from-files",
+        ]
+        if allow_file_access:
+            # 安全提示：该参数会放宽 file:// 资源访问限制；仅在确有需要时开启。
+            common.append("--allow-file-access-from-files")
+        common += [
             f"--print-to-pdf={pdf_abs}",
             url,
         ]
@@ -2438,6 +2689,9 @@ def batch_download_images(
     retries: int = 3,
     best_effort: bool = True,
     progress_callback: Optional[Callable[[int, int, str], None]] = None,
+    *,
+    redact_urls: bool = True,
+    max_image_bytes: int = _DEFAULT_MAX_IMAGE_BYTES,
 ) -> Dict[str, str]:
     """
     批量下载所有页面的图片到统一的 assets 目录
@@ -2471,60 +2725,125 @@ def batch_download_images(
     os.makedirs(assets_dir, exist_ok=True)
     url_to_local: Dict[str, str] = {}
     total = len(all_image_urls)
+    anon_session = _create_anonymous_image_session(session)
+    max_bytes: Optional[int] = max_image_bytes if (max_image_bytes and max_image_bytes > 0) else None
+    known_image_exts = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".avif", ".bmp", ".ico"}
+
+    # 记录每个图片 URL 的“归属页面”，用于 Referer 与同域判断
+    img_referer: Dict[str, str] = {}
+    for result in results:
+        if not result.success:
+            continue
+        for u in result.image_urls:
+            if u and u not in img_referer:
+                img_referer[u] = result.url
     
     for idx, img_url in enumerate(all_image_urls, start=1):
         if progress_callback:
             progress_callback(idx, total, img_url)
-        
+
+        if not img_url:
+            continue
+        parsed_img = urlparse(img_url)
+        if parsed_img.scheme not in ("http", "https"):
+            continue
+
+        referer_url = img_referer.get(img_url) or ""
+        referer = redact_url(referer_url) if (redact_urls and referer_url) else referer_url
         last_err: Optional[Exception] = None
         r: Optional[requests.Response] = None
-        content: Optional[bytes] = None
         
         for attempt in range(1, retries + 1):
             try:
-                r = session.get(img_url, timeout=timeout_s, stream=True, headers={"Connection": "close"})
+                # 使用安全的图片获取函数，手动处理重定向并在跨域时切换到干净 session
+                r = _safe_image_get(
+                    img_url=img_url,
+                    page_url=referer_url or "",  # 用 referer_url 判断同域
+                    session=session,
+                    anon_session=anon_session,
+                    timeout_s=timeout_s,
+                    referer=referer,
+                )
                 r.raise_for_status()
-                content = b"".join(r.iter_content(chunk_size=1024 * 64))
                 break
             except Exception as e:
                 last_err = e
+                # 关键：如果 raise_for_status() 失败（4xx/5xx），r 虽然非 None 但内容无效
+                # 必须重置为 None，否则后续 `if r is None:` 误判为成功
+                if r is not None:
+                    try:
+                        r.close()
+                    except Exception:
+                        pass
+                    r = None
                 if attempt >= retries:
                     break
                 time.sleep(min(2.0, 0.4 * attempt))
         
-        if content is None or r is None:
+        if r is None:
             if best_effort:
                 print(f"  警告：图片下载失败，已跳过：{img_url[:60]}...", file=sys.stderr)
                 continue
             raise last_err or RuntimeError("image download failed")
         
-        # 生成本地文件名
-        parsed = urlparse(img_url)
-        base = os.path.basename(parsed.path.rstrip("/"))
-        base = unquote(base) or f"image-{idx}"
-        name_root, name_ext = os.path.splitext(base)
-        
-        # 已知图片扩展名列表
-        known_image_exts = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".avif", ".bmp", ".ico"}
-        
-        # 如果没有扩展名，或者扩展名不是已知图片格式，从 Content-Type 或文件内容检测
-        if not name_ext or name_ext.lower() not in known_image_exts:
-            detected_ext = (
-                ext_from_content_type(r.headers.get("Content-Type") if r else None)
-                or sniff_ext(content or b"")
-            )
-            if detected_ext:
-                name_ext = detected_ext
-            elif not name_ext:
-                name_ext = ".bin"
-        
-        safe_root = _sanitize_filename_part(name_root)
-        filename = f"{idx:03d}-{safe_root}{name_ext}"
-        filename = _safe_path_length(assets_dir, filename)
-        local_path = os.path.join(assets_dir, filename)
-        
-        with open(local_path, "wb") as f:
-            f.write(content or b"")
+        try:
+            # 生成本地文件名（扩展名优先取 URL path，其次 Content-Type，再次嗅探首块内容）
+            base = os.path.basename(parsed_img.path.rstrip("/"))
+            base = unquote(base) or f"image-{idx}"
+            name_root, name_ext = os.path.splitext(base)
+
+            it = r.iter_content(chunk_size=1024 * 64)
+            head = b""
+            for chunk in it:
+                if chunk:
+                    head = chunk
+                    break
+
+            if (not name_ext) or (name_ext.lower() not in known_image_exts):
+                detected = ext_from_content_type(r.headers.get("Content-Type") if r else None) or sniff_ext(head or b"")
+                if detected:
+                    name_ext = detected
+                elif not name_ext:
+                    name_ext = ".bin"
+
+            safe_root = _sanitize_filename_part(name_root)
+            filename = f"{idx:03d}-{safe_root}{name_ext}"
+            filename = _safe_path_length(assets_dir, filename)
+            local_path = os.path.join(assets_dir, filename)
+            tmp_path = local_path + ".part"
+
+            size = 0
+            try:
+                with open(tmp_path, "wb") as f:
+                    if head:
+                        f.write(head)
+                        size += len(head)
+                        if max_bytes is not None and size > max_bytes:
+                            raise RuntimeError(f"图片过大（>{max_bytes} bytes）")
+                    for chunk in it:
+                        if not chunk:
+                            continue
+                        size += len(chunk)
+                        if max_bytes is not None and size > max_bytes:
+                            raise RuntimeError(f"图片过大（>{max_bytes} bytes）")
+                        f.write(chunk)
+                os.replace(tmp_path, local_path)
+            finally:
+                if os.path.exists(tmp_path):
+                    try:
+                        os.remove(tmp_path)
+                    except OSError:
+                        pass
+        except Exception as e:
+            if best_effort:
+                print(f"  警告：图片保存失败，已跳过：{img_url[:60]}...\n    错误：{e}", file=sys.stderr)
+                continue
+            raise
+        finally:
+            try:
+                r.close()
+            except Exception:
+                pass
         
         # 计算相对路径
         local_abs = os.path.abspath(local_path)
@@ -2659,6 +2978,7 @@ def generate_merged_markdown(
     source_url: Optional[str] = None,
     rewrite_links: bool = False,
     show_source_summary: bool = True,
+    redact_urls: bool = True,
 ) -> str:
     """
     将多个页面结果合并为单个 Markdown 文档
@@ -2687,8 +3007,9 @@ def generate_merged_markdown(
     title = main_title or "批量导出文档"
     parts.append("---")
     parts.append(f'title: "{title}"')
-    if source_url:
-        parts.append(f'source: "{source_url}"')
+    safe_source_url = redact_url(source_url) if (redact_urls and source_url) else source_url
+    if safe_source_url:
+        parts.append(f'source: "{safe_source_url}"')
     parts.append(f'date: "{date_str}"')
     parts.append(f'pages: {len([r for r in results if r.success])}')
     parts.append("---")
@@ -2706,8 +3027,8 @@ def generate_merged_markdown(
             parts.append("")
             parts.append(f"- **导出时间**：{date_str}")
             parts.append(f"- **页面数量**：{len(success_results)} 页")
-            if source_url:
-                parts.append(f"- **来源站点**：{source_url}")
+            if safe_source_url:
+                parts.append(f"- **来源站点**：{safe_source_url}")
             else:
                 # 从第一个 URL 提取域名
                 first_url = success_results[0].url
@@ -2738,7 +3059,8 @@ def generate_merged_markdown(
             parts.append("")
             parts.append(f"> ⚠️ 获取失败：{result.error}")
             parts.append("")
-            parts.append(f"- 原始链接：{result.url}")
+            fail_url = redact_url(result.url) if redact_urls else result.url
+            parts.append(f"- 原始链接：{fail_url}")
             parts.append("")
             parts.append("---")
             parts.append("")
@@ -2750,7 +3072,8 @@ def generate_merged_markdown(
         parts.append("")
         parts.append(f"## {result.title}")
         parts.append("")
-        parts.append(f"- 来源：{result.url}")
+        page_url = redact_url(result.url) if redact_urls else result.url
+        parts.append(f"- 来源：{page_url}")
         parts.append("")
         
         # 页面内容（调整标题级别：# -> ###, ## -> ####, etc.）
@@ -2811,6 +3134,7 @@ def batch_save_individual(
     results: List[BatchPageResult],
     output_dir: str,
     include_frontmatter: bool = True,
+    redact_urls: bool = True,
 ) -> List[str]:
     """
     将结果保存为独立的 MD 文件
@@ -2839,10 +3163,11 @@ def batch_save_individual(
         
         # 写入文件
         with open(filepath, "w", encoding="utf-8") as f:
+            page_url = redact_url(result.url) if redact_urls else result.url
             if include_frontmatter:
-                f.write(generate_frontmatter(result.title, result.url))
+                f.write(generate_frontmatter(result.title, page_url))
             f.write(f"# {result.title}\n\n")
-            f.write(f"- Source: {result.url}\n\n")
+            f.write(f"- Source: {page_url}\n\n")
             f.write(result.md_content)
         
         saved_files.append(filepath)
@@ -2858,6 +3183,7 @@ def fetch_html(
 ) -> str:
     last_err: Optional[Exception] = None
     for attempt in range(1, retries + 1):
+        r: Optional[requests.Response] = None
         try:
             r = session.get(
                 url,
@@ -2877,6 +3203,12 @@ def fetch_html(
             if attempt >= retries:
                 raise
             time.sleep(min(3.0, 0.6 * attempt))
+        finally:
+            if r is not None:
+                try:
+                    r.close()
+                except Exception:
+                    pass
     raise last_err or RuntimeError("fetch failed")
 
 
@@ -3108,6 +3440,8 @@ def _batch_main(args: argparse.Namespace) -> int:
                 retries=args.retries,
                 best_effort=True,
                 progress_callback=img_progress,
+                redact_urls=args.redact_url,
+                max_image_bytes=args.max_image_bytes,
             )
             
             print(f"  图片下载完成：{len(url_to_local)} 张成功")
@@ -3141,6 +3475,7 @@ def _batch_main(args: argparse.Namespace) -> int:
             source_url=final_source_url,
             rewrite_links=args.rewrite_links,
             show_source_summary=not args.no_source_summary,
+            redact_urls=args.redact_url,
         )
         
         with open(output_file, "w", encoding="utf-8") as f:
@@ -3185,6 +3520,7 @@ def _batch_main(args: argparse.Namespace) -> int:
             results=results,
             output_dir=args.output_dir,
             include_frontmatter=args.frontmatter,
+            redact_urls=args.redact_url,
         )
         
         # 生成索引文件
@@ -3242,6 +3578,35 @@ urls.txt 文件格式：
     ap.add_argument("--best-effort-images", action="store_true", help="图片下载失败时仅警告并跳过（默认失败即退出）")
     ap.add_argument("--overwrite", action="store_true", help="允许覆盖已存在的 md 文件")
     ap.add_argument("--validate", action="store_true", help="生成后执行校验并输出结果")
+    ap.add_argument(
+        "--max-image-bytes",
+        type=int,
+        default=_DEFAULT_MAX_IMAGE_BYTES,
+        help="单张图片最大允许字节数（默认 25MB；设为 0 表示不限制）",
+    )
+    ap.add_argument(
+        "--redact-url",
+        dest="redact_url",
+        action="store_true",
+        default=True,
+        help="输出文件中对 URL 脱敏（默认启用）：仅保留 scheme://host/path，移除 query/fragment",
+    )
+    ap.add_argument(
+        "--no-redact-url",
+        dest="redact_url",
+        action="store_false",
+        help="关闭 URL 脱敏（保留完整 URL，包括 query/fragment）",
+    )
+    ap.add_argument(
+        "--no-map-json",
+        action="store_true",
+        help="不生成 *.assets.json URL→本地映射文件（避免泄露图片 URL）",
+    )
+    ap.add_argument(
+        "--pdf-allow-file-access",
+        action="store_true",
+        help="生成 PDF 时允许 file:// 访问其他本地文件（可能有安全风险；默认关闭）",
+    )
     # Frontmatter 支持
     ap.add_argument("--frontmatter", action="store_true", default=True,
                     help="生成 YAML Frontmatter 元数据头（默认启用）")
@@ -3380,6 +3745,9 @@ urls.txt 文件格式：
         timeout_s=args.timeout,
         retries=args.retries,
         best_effort=bool(args.best_effort_images),
+        page_url=url,
+        redact_urls=args.redact_url,
+        max_image_bytes=args.max_image_bytes,
     )
 
     # 提取标题（微信模式下优先使用专用提取函数）
@@ -3407,20 +3775,35 @@ urls.txt 文件格式：
     if args.tags:
         tags = [t.strip() for t in args.tags.split(",") if t.strip()]
 
+    display_url = redact_url(url) if args.redact_url else url
+
     with open(out_md, "w", encoding="utf-8") as f:
         if args.frontmatter:
-            f.write(generate_frontmatter(title, url, tags))
+            f.write(generate_frontmatter(title, display_url, tags))
         # 保持正文可读性：无论是否启用 frontmatter，都写入可见标题与来源行。
         f.write(f"# {title}\n\n")
-        f.write(f"- Source: {url}\n\n")
+        f.write(f"- Source: {display_url}\n\n")
         f.write(md_body)
 
-    with open(map_json, "w", encoding="utf-8") as f:
-        json.dump(url_to_local, f, ensure_ascii=False, indent=2)
+    wrote_map_json = False
+    if not args.no_map_json:
+        with open(map_json, "w", encoding="utf-8") as f:
+            map_payload = _redact_url_to_local_map(url_to_local) if args.redact_url else url_to_local
+            json.dump(map_payload, f, ensure_ascii=False, indent=2)
+        wrote_map_json = True
+    else:
+        # Bug fix: --no-map-json 时删除旧的映射文件，避免遗留未脱敏的历史 URL
+        if os.path.exists(map_json):
+            try:
+                os.remove(map_json)
+                print(f"已删除旧映射文件：{map_json}")
+            except OSError as e:
+                print(f"警告：无法删除旧映射文件 {map_json}: {e}", file=sys.stderr)
 
     print(f"已生成：{out_md}")
     print(f"图片目录：{assets_dir}")
-    print(f"映射文件：{map_json}")
+    if wrote_map_json:
+        print(f"映射文件：{map_json}")
 
     if args.with_pdf:
         out_pdf = os.path.splitext(out_md)[0] + ".pdf"
@@ -3430,7 +3813,7 @@ urls.txt 文件格式：
             print(f"生成 PDF：{out_pdf}")
             if args.frontmatter:
                 # md 文件保留 frontmatter；但 PDF 渲染时剥离元数据块，并补一个可见标题/来源行。
-                pdf_md = f"# {title}\n\n- Source: {url}\n\n{md_body}"
+                pdf_md = f"# {title}\n\n- Source: {display_url}\n\n{md_body}"
                 md_dir_abs = os.path.dirname(os.path.abspath(out_md)) or "."
                 tmp = None
                 try:
@@ -3443,7 +3826,7 @@ urls.txt 文件格式：
                     ) as tf:
                         tf.write(strip_yaml_frontmatter(pdf_md))
                         tmp = tf.name
-                    generate_pdf_from_markdown(md_path=tmp, pdf_path=out_pdf)
+                    generate_pdf_from_markdown(md_path=tmp, pdf_path=out_pdf, allow_file_access=args.pdf_allow_file_access)
                 finally:
                     if tmp and os.path.isfile(tmp):
                         try:
@@ -3451,7 +3834,7 @@ urls.txt 文件格式：
                         except OSError:
                             pass
             else:
-                generate_pdf_from_markdown(md_path=out_md, pdf_path=out_pdf)
+                generate_pdf_from_markdown(md_path=out_md, pdf_path=out_pdf, allow_file_access=args.pdf_allow_file_access)
 
     if args.validate:
         result = validate_markdown(out_md, assets_dir)
