@@ -179,3 +179,27 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+
+# =========================
+# Project-specific ignores
+# =========================
+
+# Output assets directories (generated images)
+*.assets/
+
+# URL-to-local mapping files
+*.md.assets.json
+
+# Generated PDF files
+# *.pdf
+
+# Test output files
+test_output/
+output/
+
+# Temporary HTML files (used during PDF generation)
+*.no_frontmatter.md
+
+# Cookie files (may contain sensitive data)
+cookies.txt
+*.cookies.txt
