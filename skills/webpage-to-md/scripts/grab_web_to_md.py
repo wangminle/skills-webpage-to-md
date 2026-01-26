@@ -1848,6 +1848,205 @@ class BatchConfig:
     target_class: Optional[str] = None
     clean_wiki_noise: bool = False  # 清理 Wiki 系统噪音（编辑按钮、导航链接等）
     download_images: bool = False  # 是否下载图片到本地
+    wechat: bool = False  # 微信公众号文章模式
+
+
+# ============================================================================
+# 微信公众号文章支持
+# ============================================================================
+
+
+def is_wechat_article_url(url: str) -> bool:
+    """
+    检测 URL 是否为微信公众号文章链接
+    
+    支持的格式：
+    - https://mp.weixin.qq.com/s/xxx
+    - https://mp.weixin.qq.com/s?__biz=xxx
+    - http://mp.weixin.qq.com/s/xxx
+    """
+    if not url:
+        return False
+    parsed = urlparse(url)
+    return parsed.netloc in ("mp.weixin.qq.com", "weixin.qq.com")
+
+
+def is_wechat_article_html(html: str) -> bool:
+    """
+    检测 HTML 内容是否具有微信公众号文章特征
+    
+    检测以下特征：
+    - 包含 rich_media_content class
+    - 包含 js_article_data
+    - 包含微信特有的 meta 标签
+    """
+    if not html:
+        return False
+    
+    # 检测微信公众号特有的 class 和标识
+    wechat_markers = [
+        'class="rich_media_content"',
+        "class='rich_media_content'",
+        'id="js_article"',
+        'data-mptype="article"',
+        'var biz =',
+        '__biz',
+        'mp.weixin.qq.com',
+    ]
+    
+    html_lower = html.lower()
+    return any(marker.lower() in html_lower for marker in wechat_markers)
+
+
+def extract_wechat_title(html: str) -> Optional[str]:
+    """
+    从微信公众号 HTML 中提取文章标题
+    
+    微信公众号标题通常在以下位置：
+    - <h1 class="rich_media_title">标题</h1>
+    - <meta property="og:title" content="标题">
+    - <title>标题</title>
+    """
+    if not html:
+        return None
+    
+    # 方法1：从 rich_media_title 提取
+    m = re.search(
+        r'<h1[^>]*class=["\'][^"\']*rich_media_title[^"\']*["\'][^>]*>(.*?)</h1>',
+        html,
+        re.IGNORECASE | re.DOTALL
+    )
+    if m:
+        title = re.sub(r'<[^>]+>', '', m.group(1))  # 移除内部标签
+        title = re.sub(r'\s+', ' ', htmllib.unescape(title)).strip()
+        if title:
+            return title
+    
+    # 方法2：从 og:title meta 标签提取
+    m = re.search(
+        r'<meta[^>]*property=["\']og:title["\'][^>]*content=["\']([^"\']+)["\']',
+        html,
+        re.IGNORECASE
+    )
+    if m:
+        title = htmllib.unescape(m.group(1)).strip()
+        if title:
+            return title
+    
+    # 方法3：从 twitter:title meta 标签提取
+    m = re.search(
+        r'<meta[^>]*name=["\']twitter:title["\'][^>]*content=["\']([^"\']+)["\']',
+        html,
+        re.IGNORECASE
+    )
+    if m:
+        title = htmllib.unescape(m.group(1)).strip()
+        if title:
+            return title
+    
+    return None
+
+
+def clean_wechat_noise(md_content: str) -> str:
+    """
+    清理微信公众号文章中的噪音内容，包括：
+    - 点赞、在看、分享等交互按钮文字
+    - 小程序卡片提示
+    - 扫码关注提示
+    - 阅读原文链接噪音
+    - 其他微信特有的 UI 元素
+    
+    Args:
+        md_content: 原始 Markdown 内容
+    
+    Returns:
+        清理后的 Markdown 内容
+    """
+    result = md_content
+    
+    # 1. 清理微信交互按钮文字
+    # 如：Video Mini Program Like ，轻点两下取消赞 Wow ，轻点两下取消在看
+    result = re.sub(
+        r'[,，\s]*(?:Video|Mini Program|Like|Wow|Share|Comment|Favorite|听过)\s*[,，]?\s*',
+        '',
+        result,
+        flags=re.IGNORECASE
+    )
+    result = re.sub(
+        r'[,，\s]*轻点两下取消(?:赞|在看)\s*',
+        '',
+        result
+    )
+    
+    # 2. 清理小程序/扫码提示
+    result = re.sub(
+        r'(?:Scan to Follow|Scan with Weixin to\s*use this Mini Program|微信扫一扫可打开此内容.*?使用完整服务)\s*',
+        '',
+        result,
+        flags=re.IGNORECASE | re.DOTALL
+    )
+    
+    # 3. 清理 Cancel/Allow 按钮文字
+    result = re.sub(
+        r'\[(?:Cancel|Allow|Got It)\]\(javascript:[^)]*\)\s*',
+        '',
+        result,
+        flags=re.IGNORECASE
+    )
+    
+    # 4. 清理 javascript:void(0) 链接
+    result = re.sub(
+        r'\[([^\]]*)\]\(javascript:(?:void\(0\)|;)\)\s*',
+        r'\1',
+        result,
+        flags=re.IGNORECASE
+    )
+    
+    # 5. 清理"继续滑动看下一个"等提示
+    result = re.sub(
+        r'(?:继续滑动看下一个|向上滑动看下一个|预览时标签不可点)\s*',
+        '',
+        result
+    )
+    
+    # 6. 清理"在小说阅读器中沉浸阅读"等提示
+    result = re.sub(
+        r'(?:\*{2,}\s*)?在小说阅读器中沉浸阅读\s*',
+        '',
+        result
+    )
+    
+    # 7. 清理微信特有的符号噪音行
+    # 如：: ， ， ， ， ， ， ， ， ， ， ， ，.
+    result = re.sub(
+        r'^[\s:,，。\.]+$',
+        '',
+        result,
+        flags=re.MULTILINE
+    )
+    
+    # 8. 清理"作者头像"等图片说明
+    result = re.sub(
+        r'!\[作者头像\]\([^)]+\)',
+        '',
+        result
+    )
+    
+    # 9. 清理文末连续的交互元素残留
+    # 匹配文末可能出现的多余空白和符号
+    result = re.sub(
+        r'\n[\s:,，。\.\*]*$',
+        '',
+        result
+    )
+    
+    # 10. 清理连续的空行（清理后可能产生多余空行）
+    result = re.sub(r'\n{3,}', '\n\n', result)
+    
+    # 11. 清理行首行尾多余空格
+    result = re.sub(r'\n[ \t]+\n', '\n\n', result)
+    
+    return result.strip()
 
 
 def clean_wiki_noise(md_content: str) -> str:
@@ -2088,20 +2287,40 @@ def process_single_url(
             retries=config.retries,
         )
         
+        # 微信公众号文章自动检测
+        is_wechat = config.wechat
+        if not is_wechat and is_wechat_article_url(url):
+            is_wechat = True
+        elif not is_wechat and is_wechat_article_html(page_html):
+            is_wechat = True
+        
+        # 确定正文提取策略
+        target_id = config.target_id
+        target_class = config.target_class
+        
+        # 微信模式下，如果未指定 target，自动使用 rich_media_content
+        if is_wechat and not target_id and not target_class:
+            target_class = "rich_media_content"
+        
         # 提取正文
-        if config.target_id or config.target_class:
+        if target_id or target_class:
             article_html = extract_target_html(
                 page_html, 
-                target_id=config.target_id, 
-                target_class=config.target_class
+                target_id=target_id, 
+                target_class=target_class
             ) or ""
             if not article_html:
                 article_html = extract_main_html(page_html)
         else:
             article_html = extract_main_html(page_html)
         
-        # 提取标题
-        title = custom_title or extract_h1(article_html) or extract_title(page_html) or "Untitled"
+        # 提取标题（微信模式下优先使用专用提取函数）
+        if custom_title:
+            title = custom_title
+        elif is_wechat:
+            title = extract_wechat_title(page_html) or extract_h1(article_html) or extract_title(page_html) or "Untitled"
+        else:
+            title = extract_h1(article_html) or extract_title(page_html) or "Untitled"
         
         # 收集图片 URL（如果需要下载图片）
         image_urls: List[str] = []
@@ -2119,7 +2338,9 @@ def process_single_url(
         )
         md_body = strip_duplicate_h1(md_body, title)
         
-        # 清理 Wiki 系统噪音（编辑按钮、导航链接等）
+        # 清理噪音内容
+        if is_wechat:
+            md_body = clean_wechat_noise(md_body)
         if config.clean_wiki_noise:
             md_body = clean_wiki_noise(md_body)
         
@@ -2828,6 +3049,7 @@ def _batch_main(args: argparse.Namespace) -> int:
         target_class=args.target_class,
         clean_wiki_noise=args.clean_wiki_noise,
         download_images=args.download_images,
+        wechat=args.wechat,
     )
     
     # 进度回调
@@ -3045,6 +3267,10 @@ urls.txt 文件格式：
     # Wiki 噪音清理
     ap.add_argument("--clean-wiki-noise", action="store_true",
                     help="清理 Wiki 系统噪音（编辑按钮、导航链接、返回顶部等），适用于 PukiWiki/MediaWiki 等站点")
+    # 微信公众号文章支持
+    ap.add_argument("--wechat", action="store_true",
+                    help="微信公众号文章模式：自动提取 rich_media_content 正文并清理交互按钮噪音。"
+                         "如不指定，脚本会自动检测 mp.weixin.qq.com 链接并启用此模式")
     
     # ========== 批量处理参数 ==========
     batch_group = ap.add_argument_group("批量处理参数")
@@ -3107,10 +3333,28 @@ urls.txt 文件格式：
     print(f"下载页面：{url}")
     page_html = fetch_html(session=session, url=url, timeout_s=args.timeout, retries=args.retries)
 
-    if args.target_id or args.target_class:
-        article_html = extract_target_html(page_html, target_id=args.target_id, target_class=args.target_class) or ""
+    # 微信公众号文章自动检测
+    is_wechat = args.wechat
+    if not is_wechat and is_wechat_article_url(url):
+        is_wechat = True
+        print("检测到微信公众号文章，自动启用微信模式")
+    elif not is_wechat and is_wechat_article_html(page_html):
+        is_wechat = True
+        print("检测到微信公众号文章特征，自动启用微信模式")
+
+    # 确定正文提取策略
+    target_id = args.target_id
+    target_class = args.target_class
+    
+    # 微信模式下，如果未指定 target，自动使用 rich_media_content
+    if is_wechat and not target_id and not target_class:
+        target_class = "rich_media_content"
+        print("使用微信正文区域：rich_media_content")
+
+    if target_id or target_class:
+        article_html = extract_target_html(page_html, target_id=target_id, target_class=target_class) or ""
         if not article_html:
-            print("警告：未找到指定的目标区域（--target-id/--target-class），将回退到自动抽取。", file=sys.stderr)
+            print("警告：未找到指定的目标区域，将回退到自动抽取。", file=sys.stderr)
             article_html = extract_main_html(page_html)
     else:
         article_html = extract_main_html(page_html)
@@ -3138,7 +3382,13 @@ urls.txt 文件格式：
         best_effort=bool(args.best_effort_images),
     )
 
-    title = args.title or extract_h1(article_html) or extract_title(page_html) or "Untitled"
+    # 提取标题（微信模式下优先使用专用提取函数）
+    if args.title:
+        title = args.title
+    elif is_wechat:
+        title = extract_wechat_title(page_html) or extract_h1(article_html) or extract_title(page_html) or "Untitled"
+    else:
+        title = extract_h1(article_html) or extract_title(page_html) or "Untitled"
     md_body = html_to_markdown(
         article_html=article_html,
         base_url=url,
@@ -3146,6 +3396,11 @@ urls.txt 文件格式：
         keep_html=args.keep_html,
     )
     md_body = strip_duplicate_h1(md_body, title)
+
+    # 清理噪音内容
+    if is_wechat:
+        md_body = clean_wechat_noise(md_body)
+        print("已清理微信公众号 UI 噪音")
 
     # 解析 tags 参数
     tags: Optional[List[str]] = None
