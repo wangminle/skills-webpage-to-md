@@ -1,6 +1,6 @@
 ---
 name: webpage-to-md
-description: Web scraping and Markdown conversion toolkit for extracting web content with images. Use when Claude needs to: (1) Save web articles/blogs as Markdown files, (2) Export WeChat articles (mp.weixin.qq.com), (3) Batch crawl Wiki sites and merge into single document, (4) Download webpage images locally, (5) Convert HTML tables/code blocks to Markdown format.
+description: "Web scraping and Markdown conversion toolkit for extracting web content with images. Use when Claude needs to: (1) Save web articles/blogs as Markdown files, (2) Export WeChat articles (mp.weixin.qq.com), (3) Batch crawl Wiki sites and merge into single document, (4) Download webpage images locally, (5) Convert HTML tables/code blocks to Markdown format."
 ---
 
 # Web to Markdown Grabber
@@ -104,6 +104,23 @@ python SKILL_DIR/scripts/grab_web_to_md.py "https://wiki.example.com/index" \
 | `--delay` | 1.0 | Request interval (seconds) |
 | `--skip-errors` | False | Continue on failures |
 | `--download-images` | False | Download images locally |
+
+## Security Parameters
+
+| Parameter | Default | Purpose |
+|-----------|---------|---------|
+| `--redact-url` | True | Remove query/fragment from URLs in output (default ON) |
+| `--no-redact-url` | - | Keep full URLs including query params |
+| `--no-map-json` | False | Skip generating *.assets.json mapping file (and remove existing one) |
+| `--max-image-bytes` | 25MB | Max size per image (0=unlimited) |
+| `--pdf-allow-file-access` | False | Allow file:// access when generating PDF |
+
+**Security features (always active)**:
+- Cross-origin image downloads use clean session (no Cookie/Auth leak), including redirect chains
+- Redirects back to same host switch back to credentialed session when needed
+- Clean session inherits proxy/cert/adapters from the base session (still no sensitive headers)
+- HTML attributes sanitized (removes `on*` events, `javascript:` URLs)
+- Streaming download prevents OOM on large images
 
 ## Anti-Scraping Support
 

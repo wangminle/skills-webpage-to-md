@@ -11,6 +11,25 @@
 - ✅ **特定站点**：微信公众号（自动检测）、Wiki 噪音清理
 - ✅ **反爬支持**：Cookie/Header/UA 定制
 - ✅ **YAML Frontmatter**：兼容 Obsidian/Hugo/Jekyll
+- ✅ **数据安全**：URL 脱敏、跨域凭据隔离、流式下载防 OOM
+
+## 安装到 Claude Code
+
+将 `skills/webpage-to-md/` 文件夹复制到 `~/.claude/skills/` 目录即可：
+
+```bash
+cp -r skills/webpage-to-md ~/.claude/skills/
+```
+
+安装后，在 Claude Code 中使用以下方式触发：
+
+| 触发方式 | 示例 |
+|---------|------|
+| 斜杠命令 | `/webpage-to-md 帮我保存这个网页` |
+| 自然语言 | "帮我把这个微信文章保存为 Markdown" |
+| 直接描述 | "导出这个 Wiki 站点的所有页面" |
+
+Claude Code 会自动识别并调用此 Skill 完成网页抓取任务。
 
 ## 快速开始
 
@@ -52,6 +71,45 @@ python skills/webpage-to-md/scripts/grab_web_to_md.py "https://wiki.example.com/
 | `--download-images` | 下载图片到本地 |
 | `--clean-wiki-noise` | 清理 Wiki 系统噪音 |
 | `--rewrite-links` | 站内链接改写为锚点 |
+
+## 数据安全
+
+本工具在设计时充分考虑了数据安全和隐私保护：
+
+### 🔒 默认安全策略
+
+| 安全措施 | 说明 | 相关参数 |
+|---------|------|---------|
+| **URL 脱敏** | 输出文件中默认移除 URL 的 query/fragment 参数，避免泄露 token/签名等敏感信息 | `--no-redact-url` 可关闭 |
+| **跨域凭据隔离** | 下载图片时，仅同域名请求携带 Cookie/Authorization；跨域（含 30x 重定向到 CDN）使用"干净 session" | 自动生效 |
+| **流式下载** | 图片采用流式写入，避免大图导致内存溢出（OOM） | 自动生效 |
+| **单图大小限制** | 默认限制单张图片 25MB，防止恶意/超大响应 | `--max-image-bytes` |
+| **映射文件可选** | 可选择不生成 `*.assets.json` 映射文件（并清理已存在的旧映射文件） | `--no-map-json` |
+| **PDF 本地访问** | 生成 PDF 时默认关闭 `--allow-file-access-from-files` | `--pdf-allow-file-access` 可开启 |
+| **HTML 属性净化** | 保留 HTML 时自动过滤 `on*` 事件属性和 `javascript:` 协议 | 自动生效 |
+
+### 安全相关参数
+
+```bash
+# 保留完整 URL（含 query 参数）
+python grab_web_to_md.py URL --no-redact-url
+
+# 不生成图片 URL 映射文件
+python grab_web_to_md.py URL --no-map-json
+
+# 调整单图大小限制（0 表示不限制）
+python grab_web_to_md.py URL --max-image-bytes 52428800  # 50MB
+
+# 生成 PDF 时允许访问本地文件（有安全风险）
+python grab_web_to_md.py URL --with-pdf --pdf-allow-file-access
+```
+
+### 典型场景
+
+- **分享导出文件给他人**：默认行为即可，URL 中的 token/签名会被自动移除
+- **需要完整 URL 用于调试**：添加 `--no-redact-url`
+- **处理付费内容/需登录页面**：Cookie 仅用于页面抓取，不会泄露到第三方图片域名
+- **避免旧映射残留**：启用 `--no-map-json` 会自动删除已存在的 `<out>.assets.json`
 
 ## 项目结构
 
