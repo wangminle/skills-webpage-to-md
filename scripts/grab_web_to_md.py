@@ -32,10 +32,12 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
-from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
 from html.parser import HTMLParser
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Callable
 from urllib.parse import urljoin, urlparse, unquote
 
 import requests
@@ -840,6 +842,24 @@ class HTMLToMarkdown(HTMLParser):
                 self.table_in_a = True
                 self.table_a_href = attrs.get("href")
                 self.table_a_text = []
+            elif tag == "img" and self.in_cell:
+                # 表格单元格内的图片
+                src = (
+                    attrs.get("src")
+                    or attrs.get("data-src")
+                    or attrs.get("data-original")
+                    or attrs.get("data-lazy-src")
+                )
+                if (not src) and attrs.get("srcset"):
+                    src = attrs["srcset"].split(",")[0].strip().split(" ")[0]
+                if src:
+                    img_url = urljoin(self.base_url, htmllib.unescape(src))
+                    if not is_probable_icon(img_url):
+                        alt = (attrs.get("alt") or "").strip()
+                        # 清理 alt 中的方括号，避免生成 ![[xxx]] 这种非标准语法
+                        alt = alt.replace("[", "").replace("]", "")
+                        local = self.url_to_local.get(img_url, img_url)
+                        self.cell_buf.append(f"![{alt}]({local})")
             return
 
         # block-ish tags
@@ -909,6 +929,8 @@ class HTMLToMarkdown(HTMLParser):
             if is_probable_icon(img_url):
                 return
             alt = (attrs.get("alt") or "").strip()
+            # 清理 alt 中的方括号，避免生成 ![[xxx]] 这种非标准语法
+            alt = alt.replace("[", "").replace("]", "")
             local = self.url_to_local.get(img_url, img_url)
             self._ensure_blank_line()
             self.out.append(f"![{alt}]({local})\n")
@@ -1795,6 +1817,818 @@ def validate_markdown(md_path: str, assets_dir: str) -> ValidationResult:
     )
 
 
+# ============================================================================
+# 批量 URL 处理功能
+# ============================================================================
+
+
+@dataclass
+class BatchPageResult:
+    """单个页面的处理结果"""
+    url: str
+    title: str
+    md_content: str
+    success: bool
+    error: Optional[str] = None
+    order: int = 0  # 用于保持原始顺序
+    image_urls: List[str] = field(default_factory=list)  # 收集到的图片 URL
+
+
+@dataclass
+class BatchConfig:
+    """批量处理配置"""
+    max_workers: int = 3
+    delay: float = 1.0
+    skip_errors: bool = False
+    timeout: int = 60
+    retries: int = 3
+    best_effort_images: bool = True
+    keep_html: bool = False
+    target_id: Optional[str] = None
+    target_class: Optional[str] = None
+    clean_wiki_noise: bool = False  # 清理 Wiki 系统噪音（编辑按钮、导航链接等）
+    download_images: bool = False  # 是否下载图片到本地
+
+
+def clean_wiki_noise(md_content: str) -> str:
+    """
+    清理 Wiki 系统产生的噪音内容，包括：
+    - PukiWiki/MediaWiki 编辑图标和链接
+    - 返回顶部导航链接
+    - 标题中的锚点链接
+    - 其他常见 Wiki UI 元素
+    
+    Args:
+        md_content: 原始 Markdown 内容
+    
+    Returns:
+        清理后的 Markdown 内容
+    """
+    result = md_content
+    
+    # 1. 清理编辑图标图片：![Edit](xxx/paraedit.png) 或类似的编辑图标
+    # 匹配各种编辑图标：paraedit.png, edit.png, pencil.png 等
+    result = re.sub(
+        r'!\[(?:Edit|edit|編集|编辑)?\]\([^)]*(?:paraedit|edit|pencil|secedit)[^)]*\)\s*\n?',
+        '',
+        result,
+        flags=re.IGNORECASE
+    )
+    
+    # 2. 清理编辑链接：[https://xxx/cmd=secedit...](xxx) 或 [编辑](xxx?cmd=edit...)
+    # 这种格式是链接文本就是 URL 的情况
+    result = re.sub(
+        r'\[https?://[^\]]*(?:cmd=(?:sec)?edit|action=edit)[^\]]*\]\([^)]+\)\s*\n?',
+        '',
+        result,
+        flags=re.IGNORECASE
+    )
+    # 普通编辑链接
+    result = re.sub(
+        r'\[(?:編集|编辑|Edit|edit)\]\([^)]*(?:cmd=(?:sec)?edit|action=edit)[^)]*\)\s*\n?',
+        '',
+        result,
+        flags=re.IGNORECASE
+    )
+    
+    # 3. 清理返回顶部链接：[↑](xxx#navigator) 或 [↑](xxx#top)
+    result = re.sub(
+        r'\[↑\]\([^)]*#(?:navigator|top|head|pagetop)[^)]*\)\s*\n?',
+        '',
+        result,
+        flags=re.IGNORECASE
+    )
+    
+    # 4. 清理标题中的锚点链接：## 标题 [†](xxx#anchor) 或 [¶](xxx)
+    # 保留标题文本，只移除锚点链接部分
+    result = re.sub(
+        r'(\#{1,6}\s+[^\n\[]+)\s*\[(?:†|¶|#)\]\([^)]+\)',
+        r'\1',
+        result
+    )
+    
+    # 5. 清理独立的锚点符号链接（不在标题中的）
+    result = re.sub(
+        r'\s*\[(?:†|¶)\]\([^)]+\)',
+        '',
+        result
+    )
+    
+    # 5.5. 清理评论区编辑链接：[?](xxx?cmd=edit...) 或类似的问号链接
+    result = re.sub(
+        r'\[\?\]\([^)]*(?:cmd=edit|action=edit)[^)]*\)',
+        '',
+        result,
+        flags=re.IGNORECASE
+    )
+    
+    # 6. 清理 PukiWiki 特有的导航/工具栏链接块
+    # 如：[ [トップ](xxx) ] 这种格式
+    result = re.sub(
+        r'\[\s*\[[^\]]+\]\([^)]+\)\s*\]\s*',
+        '',
+        result
+    )
+    
+    # 7. 清理连续的空行（清理后可能产生多余空行）
+    result = re.sub(r'\n{3,}', '\n\n', result)
+    
+    # 8. 清理行首多余空格（某些清理后可能留下）
+    result = re.sub(r'\n[ \t]+\n', '\n\n', result)
+    
+    return result.strip()
+
+
+class LinkExtractor(HTMLParser):
+    """从 HTML 中提取链接"""
+    
+    def __init__(self, base_url: str, pattern: Optional[str] = None, same_domain: bool = True):
+        super().__init__(convert_charrefs=True)
+        self.base_url = base_url
+        self.base_domain = urlparse(base_url).netloc
+        self.pattern = re.compile(pattern) if pattern else None
+        self.same_domain = same_domain
+        self.links: List[Tuple[str, str]] = []  # (url, text)
+        self._in_a = False
+        self._current_href: Optional[str] = None
+        self._current_text: List[str] = []
+    
+    def handle_starttag(self, tag: str, attrs_list: Sequence[Tuple[str, Optional[str]]]) -> None:
+        if tag.lower() == "a":
+            attrs = dict(attrs_list)
+            href = attrs.get("href")
+            if href:
+                self._in_a = True
+                self._current_href = href
+                self._current_text = []
+    
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() == "a" and self._in_a:
+            if self._current_href:
+                full_url = urljoin(self.base_url, self._current_href)
+                text = "".join(self._current_text).strip()
+                
+                # 检查域名
+                if self.same_domain:
+                    link_domain = urlparse(full_url).netloc
+                    if link_domain != self.base_domain:
+                        self._in_a = False
+                        self._current_href = None
+                        self._current_text = []
+                        return
+                
+                # 检查模式匹配
+                if self.pattern:
+                    if not self.pattern.search(full_url):
+                        self._in_a = False
+                        self._current_href = None
+                        self._current_text = []
+                        return
+                
+                # 跳过锚点链接和编辑链接
+                if (self._current_href.startswith("#") or 
+                    "cmd=edit" in full_url or 
+                    "cmd=secedit" in full_url):
+                    self._in_a = False
+                    self._current_href = None
+                    self._current_text = []
+                    return
+                
+                self.links.append((full_url, text or full_url))
+            
+            self._in_a = False
+            self._current_href = None
+            self._current_text = []
+    
+    def handle_data(self, data: str) -> None:
+        if self._in_a and data:
+            self._current_text.append(data)
+
+
+def extract_links_from_html(
+    html: str,
+    base_url: str,
+    pattern: Optional[str] = None,
+    same_domain: bool = True
+) -> List[Tuple[str, str]]:
+    """从 HTML 中提取链接列表"""
+    parser = LinkExtractor(base_url, pattern, same_domain)
+    parser.feed(html)
+    # 去重并保持顺序
+    seen = set()
+    unique_links = []
+    for url, text in parser.links:
+        if url not in seen:
+            seen.add(url)
+            unique_links.append((url, text))
+    return unique_links
+
+
+def read_urls_file(filepath: str) -> List[Tuple[str, Optional[str]]]:
+    """
+    读取 URL 列表文件
+    
+    支持格式：
+    - 每行一个 URL
+    - # 开头为注释
+    - URL | 标题  格式指定自定义标题
+    - 空行忽略
+    """
+    urls: List[Tuple[str, Optional[str]]] = []
+    with open(filepath, "r", encoding="utf-8") as f:
+        for line_num, line in enumerate(f, 1):
+            line = line.strip()
+            # 跳过空行和注释
+            if not line or line.startswith("#"):
+                continue
+            
+            # 支持 URL | 标题 格式
+            if "|" in line:
+                parts = line.split("|", 1)
+                url = parts[0].strip()
+                title = parts[1].strip() if len(parts) > 1 else None
+            else:
+                url = line
+                title = None
+            
+            # 验证 URL 格式
+            if not url.startswith(("http://", "https://")):
+                print(f"警告：第 {line_num} 行不是有效的 URL，已跳过：{url}", file=sys.stderr)
+                continue
+            
+            urls.append((url, title))
+    
+    return urls
+
+
+def _make_anchor_id(text: str) -> str:
+    """生成 Markdown 锚点 ID"""
+    # 转小写，移除特殊字符，空格转连字符
+    anchor = text.lower()
+    anchor = re.sub(r"[^\w\s\u4e00-\u9fff-]", "", anchor)  # 保留中日韩字符
+    anchor = re.sub(r"\s+", "-", anchor)
+    anchor = re.sub(r"-+", "-", anchor)
+    return anchor.strip("-") or "section"
+
+
+def process_single_url(
+    session: requests.Session,
+    url: str,
+    config: BatchConfig,
+    custom_title: Optional[str] = None,
+    order: int = 0,
+) -> BatchPageResult:
+    """处理单个 URL，返回结果"""
+    try:
+        # 获取页面
+        page_html = fetch_html(
+            session=session,
+            url=url,
+            timeout_s=config.timeout,
+            retries=config.retries,
+        )
+        
+        # 提取正文
+        if config.target_id or config.target_class:
+            article_html = extract_target_html(
+                page_html, 
+                target_id=config.target_id, 
+                target_class=config.target_class
+            ) or ""
+            if not article_html:
+                article_html = extract_main_html(page_html)
+        else:
+            article_html = extract_main_html(page_html)
+        
+        # 提取标题
+        title = custom_title or extract_h1(article_html) or extract_title(page_html) or "Untitled"
+        
+        # 收集图片 URL（如果需要下载图片）
+        image_urls: List[str] = []
+        if config.download_images:
+            collector = ImageURLCollector(base_url=url)
+            collector.feed(article_html)
+            image_urls = uniq_preserve_order(collector.image_urls)
+        
+        # 转换为 Markdown（批量模式先不替换图片路径，后续统一处理）
+        md_body = html_to_markdown(
+            article_html=article_html,
+            base_url=url,
+            url_to_local={},  # 先不替换图片路径
+            keep_html=config.keep_html,
+        )
+        md_body = strip_duplicate_h1(md_body, title)
+        
+        # 清理 Wiki 系统噪音（编辑按钮、导航链接等）
+        if config.clean_wiki_noise:
+            md_body = clean_wiki_noise(md_body)
+        
+        return BatchPageResult(
+            url=url,
+            title=title,
+            md_content=md_body,
+            success=True,
+            order=order,
+            image_urls=image_urls,
+        )
+    
+    except Exception as e:
+        return BatchPageResult(
+            url=url,
+            title=custom_title or url,
+            md_content="",
+            success=False,
+            error=str(e),
+            order=order,
+        )
+
+
+def batch_process_urls(
+    session: requests.Session,
+    urls: List[Tuple[str, Optional[str]]],
+    config: BatchConfig,
+    progress_callback: Optional[Callable[[int, int, str], None]] = None,
+) -> List[BatchPageResult]:
+    """
+    批量处理 URL 列表
+    
+    Args:
+        session: requests.Session
+        urls: [(url, custom_title), ...]
+        config: 批量处理配置
+        progress_callback: 进度回调函数 (current, total, url)
+    
+    Returns:
+        处理结果列表
+    """
+    results: List[BatchPageResult] = []
+    total = len(urls)
+    lock = threading.Lock()
+    last_request_time = [0.0]  # 使用列表以便在闭包中修改
+    
+    def process_with_delay(args: Tuple[int, str, Optional[str]]) -> BatchPageResult:
+        idx, url, custom_title = args
+        
+        # 控制请求间隔
+        with lock:
+            now = time.time()
+            elapsed = now - last_request_time[0]
+            if elapsed < config.delay:
+                time.sleep(config.delay - elapsed)
+            last_request_time[0] = time.time()
+        
+        if progress_callback:
+            progress_callback(idx + 1, total, url)
+        
+        return process_single_url(
+            session=session,
+            url=url,
+            config=config,
+            custom_title=custom_title,
+            order=idx,
+        )
+    
+    # 使用线程池并发处理
+    with ThreadPoolExecutor(max_workers=config.max_workers) as executor:
+        args_list = [(i, url, title) for i, (url, title) in enumerate(urls)]
+        futures = {executor.submit(process_with_delay, args): args for args in args_list}
+        
+        for future in as_completed(futures):
+            result = future.result()
+            results.append(result)
+            
+            if not result.success and not config.skip_errors:
+                # 取消剩余任务
+                for f in futures:
+                    f.cancel()
+                raise RuntimeError(f"处理失败：{result.url}\n错误：{result.error}")
+    
+    # 按原始顺序排序
+    results.sort(key=lambda r: r.order)
+    return results
+
+
+def batch_download_images(
+    session: requests.Session,
+    results: List[BatchPageResult],
+    assets_dir: str,
+    md_dir: str,
+    timeout_s: int = 60,
+    retries: int = 3,
+    best_effort: bool = True,
+    progress_callback: Optional[Callable[[int, int, str], None]] = None,
+) -> Dict[str, str]:
+    """
+    批量下载所有页面的图片到统一的 assets 目录
+    
+    Args:
+        session: requests.Session
+        results: 批量处理结果列表
+        assets_dir: 图片保存目录
+        md_dir: Markdown 文件所在目录（用于计算相对路径）
+        timeout_s: 请求超时
+        retries: 重试次数
+        best_effort: 失败时是否继续
+        progress_callback: 进度回调 (current, total, url)
+    
+    Returns:
+        URL 到本地相对路径的映射字典
+    """
+    # 收集所有唯一的图片 URL
+    all_image_urls: List[str] = []
+    seen: set = set()
+    for result in results:
+        if result.success:
+            for url in result.image_urls:
+                if url not in seen:
+                    all_image_urls.append(url)
+                    seen.add(url)
+    
+    if not all_image_urls:
+        return {}
+    
+    os.makedirs(assets_dir, exist_ok=True)
+    url_to_local: Dict[str, str] = {}
+    total = len(all_image_urls)
+    
+    for idx, img_url in enumerate(all_image_urls, start=1):
+        if progress_callback:
+            progress_callback(idx, total, img_url)
+        
+        last_err: Optional[Exception] = None
+        r: Optional[requests.Response] = None
+        content: Optional[bytes] = None
+        
+        for attempt in range(1, retries + 1):
+            try:
+                r = session.get(img_url, timeout=timeout_s, stream=True, headers={"Connection": "close"})
+                r.raise_for_status()
+                content = b"".join(r.iter_content(chunk_size=1024 * 64))
+                break
+            except Exception as e:
+                last_err = e
+                if attempt >= retries:
+                    break
+                time.sleep(min(2.0, 0.4 * attempt))
+        
+        if content is None or r is None:
+            if best_effort:
+                print(f"  警告：图片下载失败，已跳过：{img_url[:60]}...", file=sys.stderr)
+                continue
+            raise last_err or RuntimeError("image download failed")
+        
+        # 生成本地文件名
+        parsed = urlparse(img_url)
+        base = os.path.basename(parsed.path.rstrip("/"))
+        base = unquote(base) or f"image-{idx}"
+        name_root, name_ext = os.path.splitext(base)
+        
+        # 已知图片扩展名列表
+        known_image_exts = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".avif", ".bmp", ".ico"}
+        
+        # 如果没有扩展名，或者扩展名不是已知图片格式，从 Content-Type 或文件内容检测
+        if not name_ext or name_ext.lower() not in known_image_exts:
+            detected_ext = (
+                ext_from_content_type(r.headers.get("Content-Type") if r else None)
+                or sniff_ext(content or b"")
+            )
+            if detected_ext:
+                name_ext = detected_ext
+            elif not name_ext:
+                name_ext = ".bin"
+        
+        safe_root = _sanitize_filename_part(name_root)
+        filename = f"{idx:03d}-{safe_root}{name_ext}"
+        filename = _safe_path_length(assets_dir, filename)
+        local_path = os.path.join(assets_dir, filename)
+        
+        with open(local_path, "wb") as f:
+            f.write(content or b"")
+        
+        # 计算相对路径
+        local_abs = os.path.abspath(local_path)
+        md_dir_abs = os.path.abspath(md_dir or ".")
+        rel = os.path.relpath(local_abs, start=md_dir_abs)
+        url_to_local[img_url] = rel.replace("\\", "/")
+    
+    return url_to_local
+
+
+def replace_image_urls_in_markdown(md_content: str, url_to_local: Dict[str, str]) -> str:
+    """
+    替换 Markdown 内容中的图片 URL 为本地路径
+    
+    Args:
+        md_content: Markdown 内容
+        url_to_local: URL 到本地路径的映射
+    
+    Returns:
+        替换后的 Markdown 内容
+    """
+    result = md_content
+    for url, local_path in url_to_local.items():
+        # 方法1：直接字符串替换（最可靠）
+        # 匹配 ](url) 模式，将 url 替换为本地路径
+        result = result.replace(f"]({url})", f"]({local_path})")
+        
+        # 方法2：也替换可能的 URL 编码变体
+        from urllib.parse import quote, unquote
+        # 尝试替换 URL 编码版本
+        encoded_url = quote(url, safe=':/?&=#')
+        if encoded_url != url:
+            result = result.replace(f"]({encoded_url})", f"]({local_path})")
+        # 尝试替换解码版本
+        decoded_url = unquote(url)
+        if decoded_url != url:
+            result = result.replace(f"]({decoded_url})", f"]({local_path})")
+    
+    return result
+
+
+def build_url_to_anchor_map(results: List[BatchPageResult]) -> Dict[str, str]:
+    """
+    构建 URL 到锚点 ID 的映射表
+    
+    Args:
+        results: 批量处理结果列表
+    
+    Returns:
+        URL -> 锚点 ID 的映射字典
+    """
+    url_to_anchor: Dict[str, str] = {}
+    for result in results:
+        if result.success:
+            anchor = _make_anchor_id(result.title)
+            # 添加原始 URL
+            url_to_anchor[result.url] = anchor
+            # 添加常见的 URL 变体（带/不带端口、编码变体等）
+            parsed = urlparse(result.url)
+            # 不带端口的版本
+            if parsed.port:
+                no_port_url = f"{parsed.scheme}://{parsed.hostname}{parsed.path}"
+                if parsed.query:
+                    no_port_url += f"?{parsed.query}"
+                url_to_anchor[no_port_url] = anchor
+            # 带默认端口的版本
+            if parsed.scheme == "https" and not parsed.port:
+                with_port = f"{parsed.scheme}://{parsed.hostname}:443{parsed.path}"
+                if parsed.query:
+                    with_port += f"?{parsed.query}"
+                url_to_anchor[with_port] = anchor
+            elif parsed.scheme == "http" and not parsed.port:
+                with_port = f"{parsed.scheme}://{parsed.hostname}:80{parsed.path}"
+                if parsed.query:
+                    with_port += f"?{parsed.query}"
+                url_to_anchor[with_port] = anchor
+    return url_to_anchor
+
+
+def rewrite_internal_links(md_content: str, url_to_anchor: Dict[str, str]) -> Tuple[str, int]:
+    """
+    将 Markdown 中的外部链接改写为内部锚点链接
+    
+    Args:
+        md_content: Markdown 内容
+        url_to_anchor: URL 到锚点的映射
+    
+    Returns:
+        (改写后的内容, 改写的链接数量)
+    """
+    if not url_to_anchor:
+        return md_content, 0
+    
+    rewrite_count = 0
+    result = md_content
+    
+    # 匹配 Markdown 链接语法：[text](url)
+    # 但不匹配图片语法 ![alt](url)
+    link_pattern = re.compile(r'(?<!!)\[([^\]]+)\]\(([^)]+)\)')
+    
+    def replace_link(match: re.Match) -> str:
+        nonlocal rewrite_count
+        text = match.group(1)
+        url = match.group(2)
+        
+        # 检查 URL 是否在映射表中
+        anchor = url_to_anchor.get(url)
+        if anchor:
+            rewrite_count += 1
+            return f"[{text}](#{anchor})"
+        
+        # 尝试 URL 解码后匹配
+        try:
+            decoded_url = unquote(url)
+            anchor = url_to_anchor.get(decoded_url)
+            if anchor:
+                rewrite_count += 1
+                return f"[{text}](#{anchor})"
+        except Exception:
+            pass
+        
+        return match.group(0)  # 保持原样
+    
+    result = link_pattern.sub(replace_link, result)
+    return result, rewrite_count
+
+
+def generate_merged_markdown(
+    results: List[BatchPageResult],
+    include_toc: bool = True,
+    main_title: Optional[str] = None,
+    source_url: Optional[str] = None,
+    rewrite_links: bool = False,
+    show_source_summary: bool = True,
+) -> str:
+    """
+    将多个页面结果合并为单个 Markdown 文档
+    
+    Args:
+        results: 处理结果列表
+        include_toc: 是否包含目录
+        main_title: 文档主标题
+        source_url: 来源 URL（用于 frontmatter）
+        rewrite_links: 是否将站内链接改写为锚点
+        show_source_summary: 是否显示来源信息汇总
+    
+    Returns:
+        合并后的 Markdown 内容
+    """
+    parts: List[str] = []
+    
+    # 构建 URL 到锚点的映射（用于链接改写）
+    url_to_anchor: Dict[str, str] = {}
+    total_rewrite_count = 0
+    if rewrite_links:
+        url_to_anchor = build_url_to_anchor_map(results)
+    
+    # 生成 frontmatter
+    date_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    title = main_title or "批量导出文档"
+    parts.append("---")
+    parts.append(f'title: "{title}"')
+    if source_url:
+        parts.append(f'source: "{source_url}"')
+    parts.append(f'date: "{date_str}"')
+    parts.append(f'pages: {len([r for r in results if r.success])}')
+    parts.append("---")
+    parts.append("")
+    
+    # 主标题
+    parts.append(f"# {title}")
+    parts.append("")
+    
+    # 来源信息汇总（Phase 4）
+    if show_source_summary:
+        success_results = [r for r in results if r.success]
+        if success_results:
+            parts.append("## 文档信息")
+            parts.append("")
+            parts.append(f"- **导出时间**：{date_str}")
+            parts.append(f"- **页面数量**：{len(success_results)} 页")
+            if source_url:
+                parts.append(f"- **来源站点**：{source_url}")
+            else:
+                # 从第一个 URL 提取域名
+                first_url = success_results[0].url
+                parsed = urlparse(first_url)
+                parts.append(f"- **来源站点**：{parsed.scheme}://{parsed.netloc}")
+            parts.append("")
+            parts.append("---")
+            parts.append("")
+    
+    # 生成目录
+    if include_toc:
+        parts.append("## 目录")
+        parts.append("")
+        for i, result in enumerate(results, 1):
+            if result.success:
+                anchor = _make_anchor_id(result.title)
+                parts.append(f"{i}. [{result.title}](#{anchor})")
+            else:
+                parts.append(f"{i}. ~~{result.title}~~ (获取失败)")
+        parts.append("")
+        parts.append("---")
+        parts.append("")
+    
+    # 添加各页面内容
+    for result in results:
+        if not result.success:
+            parts.append(f"## {result.title}")
+            parts.append("")
+            parts.append(f"> ⚠️ 获取失败：{result.error}")
+            parts.append("")
+            parts.append(f"- 原始链接：{result.url}")
+            parts.append("")
+            parts.append("---")
+            parts.append("")
+            continue
+        
+        # 页面标题（使用 ## 作为二级标题）
+        anchor = _make_anchor_id(result.title)
+        parts.append(f'<a id="{anchor}"></a>')
+        parts.append("")
+        parts.append(f"## {result.title}")
+        parts.append("")
+        parts.append(f"- 来源：{result.url}")
+        parts.append("")
+        
+        # 页面内容（调整标题级别：# -> ###, ## -> ####, etc.）
+        content = result.md_content
+        # 将原内容中的标题级别下调两级
+        content = re.sub(r"^(#{1,4})\s+", lambda m: "#" * (len(m.group(1)) + 2) + " ", content, flags=re.MULTILINE)
+        
+        # 站内链接改写（Phase 3）
+        if rewrite_links and url_to_anchor:
+            content, count = rewrite_internal_links(content, url_to_anchor)
+            total_rewrite_count += count
+        
+        parts.append(content)
+        parts.append("")
+        parts.append("---")
+        parts.append("")
+    
+    # 如果启用了链接改写，在文档末尾添加统计信息
+    if rewrite_links and total_rewrite_count > 0:
+        parts.append("")
+        parts.append(f"<!-- 站内链接改写：共 {total_rewrite_count} 处 -->")
+    
+    return "\n".join(parts)
+
+
+def generate_index_markdown(
+    results: List[BatchPageResult],
+    output_dir: str,
+    main_title: Optional[str] = None,
+) -> str:
+    """生成索引文件内容"""
+    parts: List[str] = []
+    
+    title = main_title or "批量导出索引"
+    date_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    parts.append(f"# {title}")
+    parts.append("")
+    parts.append(f"生成时间：{date_str}")
+    parts.append("")
+    parts.append(f"共 {len(results)} 个页面，成功 {len([r for r in results if r.success])} 个")
+    parts.append("")
+    parts.append("## 页面列表")
+    parts.append("")
+    
+    for i, result in enumerate(results, 1):
+        if result.success:
+            filename = _sanitize_filename_part(result.title)[:50] + ".md"
+            parts.append(f"{i}. [{result.title}](./{filename})")
+        else:
+            parts.append(f"{i}. ~~{result.title}~~ (获取失败: {result.error})")
+    
+    parts.append("")
+    return "\n".join(parts)
+
+
+def batch_save_individual(
+    results: List[BatchPageResult],
+    output_dir: str,
+    include_frontmatter: bool = True,
+) -> List[str]:
+    """
+    将结果保存为独立的 MD 文件
+    
+    Returns:
+        生成的文件路径列表
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    saved_files: List[str] = []
+    
+    for result in results:
+        if not result.success:
+            continue
+        
+        # 生成文件名
+        filename = _sanitize_filename_part(result.title)[:50]
+        filename = _safe_path_length(output_dir, filename + ".md")
+        filepath = os.path.join(output_dir, filename)
+        
+        # 避免重名
+        base, ext = os.path.splitext(filepath)
+        counter = 1
+        while os.path.exists(filepath):
+            filepath = f"{base}_{counter}{ext}"
+            counter += 1
+        
+        # 写入文件
+        with open(filepath, "w", encoding="utf-8") as f:
+            if include_frontmatter:
+                f.write(generate_frontmatter(result.title, result.url))
+            f.write(f"# {result.title}\n\n")
+            f.write(f"- Source: {result.url}\n\n")
+            f.write(result.md_content)
+        
+        saved_files.append(filepath)
+    
+    return saved_files
+
+
 def fetch_html(
     session: requests.Session,
     url: str,
@@ -1866,57 +2700,8 @@ def _apply_header_lines(headers: Dict[str, str], header_lines: Sequence[str]) ->
         headers[k] = v
 
 
-def main(argv: Optional[Sequence[str]] = None) -> int:
-    ap = argparse.ArgumentParser(description="抓取网页正文与图片，保存为 Markdown + assets。")
-    ap.add_argument("url", help="要抓取的网页 URL")
-    ap.add_argument("--out", help="输出 md 文件名（默认根据 URL 自动生成）")
-    ap.add_argument("--assets-dir", help="图片目录名（默认 <out>.assets）")
-    ap.add_argument("--title", help="Markdown 顶部标题（默认从 <title> 提取）")
-    ap.add_argument("--with-pdf", action="store_true", help="同时生成同名 PDF（需要本机 Edge/Chrome）")
-    ap.add_argument("--timeout", type=int, default=60, help="请求超时（秒），默认 60")
-    ap.add_argument("--retries", type=int, default=3, help="网络重试次数，默认 3")
-    ap.add_argument("--best-effort-images", action="store_true", help="图片下载失败时仅警告并跳过（默认失败即退出）")
-    ap.add_argument("--overwrite", action="store_true", help="允许覆盖已存在的 md 文件")
-    ap.add_argument("--validate", action="store_true", help="生成后执行校验并输出结果")
-    # 新增：Frontmatter 支持
-    ap.add_argument("--frontmatter", action="store_true", default=True,
-                    help="生成 YAML Frontmatter 元数据头（默认启用）")
-    ap.add_argument("--no-frontmatter", action="store_false", dest="frontmatter",
-                    help="禁用 YAML Frontmatter")
-    ap.add_argument("--tags", help="Frontmatter 中的标签，逗号分隔，如 'tech,ai,tutorial'")
-    # 新增：Cookie/Header 支持
-    ap.add_argument("--cookie", help="Cookie 字符串，如 'session=abc; token=xyz'")
-    ap.add_argument("--cookies-file", help="Netscape 格式的 cookies.txt 文件路径")
-    ap.add_argument("--headers", help="自定义请求头，JSON 格式，如 '{\"Authorization\": \"Bearer xxx\"}'")
-    ap.add_argument("--header", action="append", default=[], help="追加请求头（可重复），如 'Authorization: Bearer xxx'")
-    # 新增：UA 可配置
-    ap.add_argument("--ua-preset", choices=sorted(UA_PRESETS.keys()), default="chrome-win", help="User-Agent 预设（默认 chrome-win）")
-    ap.add_argument("--user-agent", "--ua", dest="user_agent", help="自定义 User-Agent（优先于 --ua-preset）")
-    # 新增：复杂表格保留 HTML
-    ap.add_argument("--keep-html", action="store_true",
-                    help="对复杂表格（含 colspan/rowspan）保留原始 HTML 而非强转 Markdown")
-    # 新增：手动指定正文区域
-    ap.add_argument("--target-id", help="手动指定正文容器 id（如 content / post-content），优先级高于自动抽取")
-    ap.add_argument("--target-class", help="手动指定正文容器 class（如 post-body），优先级高于自动抽取")
-    # 新增：SPA 页面提示
-    ap.add_argument("--spa-warn-len", type=int, default=500, help="正文文本长度低于该值时提示可能为 SPA 动态渲染，默认 500；设为 0 可关闭")
-    args = ap.parse_args(argv)
-
-    url = args.url
-    base = args.out or (_default_basename(url) + ".md")
-    out_md = base
-    # 检查输出文件路径长度
-    md_dir = os.path.dirname(out_md) or "."
-    out_md_name = os.path.basename(out_md)
-    out_md_name = _safe_path_length(md_dir, out_md_name)
-    out_md = os.path.join(md_dir, out_md_name) if md_dir != "." else out_md_name
-    assets_dir = args.assets_dir or (os.path.splitext(out_md)[0] + ".assets")
-    map_json = out_md + ".assets.json"
-
-    if os.path.exists(out_md) and not args.overwrite:
-        print(f"文件已存在：{out_md}（如需覆盖请加 --overwrite）", file=sys.stderr)
-        return 2
-
+def _create_session(args: argparse.Namespace, referer_url: Optional[str] = None) -> requests.Session:
+    """创建并配置 requests.Session"""
     session = requests.Session()
     session.headers.update(
         {
@@ -1925,7 +2710,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "Accept-Language": "en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7",
         }
     )
-    session.headers.setdefault("Referer", url)
+    if referer_url:
+        session.headers.setdefault("Referer", referer_url)
 
     # 处理 Cookie
     if args.cookies_file:
@@ -1953,8 +2739,370 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         try:
             _apply_header_lines(session.headers, args.header)
             print(f"已加载追加 Header（{len(args.header)} 个）")
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             print(f"警告：无法解析 --header：{e}", file=sys.stderr)
+
+    return session
+
+
+def _batch_main(args: argparse.Namespace) -> int:
+    """批量处理模式的主函数"""
+    
+    # 创建 Session
+    session = _create_session(args, referer_url=args.url)
+    
+    # 收集要处理的 URL 列表
+    urls: List[Tuple[str, Optional[str]]] = []
+    source_url: Optional[str] = None
+    
+    if args.urls_file:
+        # 从文件读取 URL
+        if not os.path.isfile(args.urls_file):
+            print(f"错误：URL 列表文件不存在：{args.urls_file}", file=sys.stderr)
+            return 1
+        urls = read_urls_file(args.urls_file)
+        print(f"从文件加载了 {len(urls)} 个 URL")
+    
+    if args.crawl:
+        # 从索引页爬取链接
+        if not args.url:
+            print("错误：爬取模式需要提供索引页 URL", file=sys.stderr)
+            return 1
+        
+        source_url = args.url
+        print(f"正在从索引页提取链接：{args.url}")
+        
+        try:
+            index_html = fetch_html(
+                session=session,
+                url=args.url,
+                timeout_s=args.timeout,
+                retries=args.retries,
+            )
+        except Exception as e:
+            print(f"错误：无法获取索引页：{e}", file=sys.stderr)
+            return 1
+        
+        # 提取链接
+        links = extract_links_from_html(
+            html=index_html,
+            base_url=args.url,
+            pattern=args.crawl_pattern,
+            same_domain=args.same_domain,
+        )
+        
+        # 添加到 URL 列表（避免重复）
+        existing_urls = {u for u, _ in urls}
+        for link_url, link_text in links:
+            if link_url not in existing_urls:
+                urls.append((link_url, link_text))
+                existing_urls.add(link_url)
+        
+        print(f"从索引页提取了 {len(links)} 个链接，总计 {len(urls)} 个 URL")
+    
+    if not urls:
+        print("错误：没有要处理的 URL", file=sys.stderr)
+        return 1
+    
+    # 显示 URL 列表预览
+    print("\n即将处理的 URL 列表：")
+    for i, (url, title) in enumerate(urls[:10], 1):
+        display = f"  {i}. {title or url}"
+        if len(display) > 80:
+            display = display[:77] + "..."
+        print(display)
+    if len(urls) > 10:
+        print(f"  ... 共 {len(urls)} 个")
+    print()
+    
+    # 配置批量处理
+    config = BatchConfig(
+        max_workers=args.max_workers,
+        delay=args.delay,
+        skip_errors=args.skip_errors,
+        timeout=args.timeout,
+        retries=args.retries,
+        best_effort_images=True,
+        keep_html=args.keep_html,
+        target_id=args.target_id,
+        target_class=args.target_class,
+        clean_wiki_noise=args.clean_wiki_noise,
+        download_images=args.download_images,
+    )
+    
+    # 进度回调
+    def progress_callback(current: int, total: int, url: str) -> None:
+        short_url = url if len(url) <= 50 else url[:47] + "..."
+        print(f"[{current}/{total}] 处理中：{short_url}")
+    
+    # 执行批量处理
+    print(f"开始批量处理（并发数：{config.max_workers}，间隔：{config.delay}s）...\n")
+    
+    try:
+        results = batch_process_urls(
+            session=session,
+            urls=urls,
+            config=config,
+            progress_callback=progress_callback,
+        )
+    except RuntimeError as e:
+        print(f"\n错误：{e}", file=sys.stderr)
+        return 1
+    
+    # 统计结果
+    success_count = len([r for r in results if r.success])
+    fail_count = len(results) - success_count
+    print(f"\n处理完成：成功 {success_count}，失败 {fail_count}")
+    
+    # 下载图片（如果启用）
+    url_to_local: Dict[str, str] = {}
+    if args.download_images:
+        # 统计图片数量
+        total_images = sum(len(r.image_urls) for r in results if r.success)
+        unique_images = len(set(url for r in results if r.success for url in r.image_urls))
+        
+        if unique_images > 0:
+            # 确定 assets 目录
+            if args.merge:
+                output_file = args.merge_output or "merged.md"
+                assets_dir = os.path.splitext(output_file)[0] + ".assets"
+                md_dir = os.path.dirname(output_file) or "."
+            else:
+                assets_dir = os.path.join(args.output_dir, "assets")
+                md_dir = args.output_dir
+            
+            print(f"\n发现 {unique_images} 张图片（去重后），开始下载到：{assets_dir}")
+            
+            def img_progress(current: int, total: int, url: str) -> None:
+                short_url = url if len(url) <= 50 else url[:47] + "..."
+                print(f"  [{current}/{total}] 下载：{short_url}")
+            
+            url_to_local = batch_download_images(
+                session=session,
+                results=results,
+                assets_dir=assets_dir,
+                md_dir=md_dir,
+                timeout_s=args.timeout,
+                retries=args.retries,
+                best_effort=True,
+                progress_callback=img_progress,
+            )
+            
+            print(f"  图片下载完成：{len(url_to_local)} 张成功")
+            
+            # 更新结果中的 Markdown 内容，替换图片 URL
+            for result in results:
+                if result.success and result.md_content:
+                    result.md_content = replace_image_urls_in_markdown(
+                        result.md_content, url_to_local
+                    )
+        else:
+            print("\n未发现需要下载的图片")
+    
+    # 输出结果
+    if args.merge:
+        # 合并输出模式
+        output_file = args.merge_output or "merged.md"
+        
+        # 检查是否已存在
+        if os.path.exists(output_file) and not args.overwrite:
+            print(f"文件已存在：{output_file}（如需覆盖请加 --overwrite）", file=sys.stderr)
+            return 2
+        
+        # 来源 URL 优先级：--source-url > 爬取模式的索引页 > None（提取域名）
+        final_source_url = args.source_url or source_url
+        
+        merged_content = generate_merged_markdown(
+            results=results,
+            include_toc=args.toc,
+            main_title=args.merge_title or args.title,
+            source_url=final_source_url,
+            rewrite_links=args.rewrite_links,
+            show_source_summary=not args.no_source_summary,
+        )
+        
+        with open(output_file, "w", encoding="utf-8") as f:
+            f.write(merged_content)
+        
+        print(f"\n已生成合并文档：{output_file}")
+        print(f"文档大小：{len(merged_content):,} 字符")
+        if url_to_local:
+            assets_dir = os.path.splitext(output_file)[0] + ".assets"
+            # 清理未引用的图片文件
+            if os.path.isdir(assets_dir):
+                used_files = set()
+                for local_path in url_to_local.values():
+                    # 检查文件是否在最终内容中被引用
+                    if local_path in merged_content:
+                        used_files.add(os.path.basename(local_path))
+                
+                # 删除未引用的文件
+                removed_count = 0
+                for filename in os.listdir(assets_dir):
+                    if filename not in used_files:
+                        file_path = os.path.join(assets_dir, filename)
+                        try:
+                            os.remove(file_path)
+                            removed_count += 1
+                        except Exception:
+                            pass
+                
+                actual_count = len([f for f in os.listdir(assets_dir) if os.path.isfile(os.path.join(assets_dir, f))])
+                if removed_count > 0:
+                    print(f"图片目录：{assets_dir}（{actual_count} 张图片，已清理 {removed_count} 张未引用）")
+                else:
+                    print(f"图片目录：{assets_dir}（{actual_count} 张图片）")
+            else:
+                print(f"图片目录：{assets_dir}（{len(url_to_local)} 张图片）")
+        
+    else:
+        # 独立文件输出模式
+        os.makedirs(args.output_dir, exist_ok=True)
+        
+        saved_files = batch_save_individual(
+            results=results,
+            output_dir=args.output_dir,
+            include_frontmatter=args.frontmatter,
+        )
+        
+        # 生成索引文件
+        index_content = generate_index_markdown(
+            results=results,
+            output_dir=args.output_dir,
+            main_title=args.merge_title or args.title,
+        )
+        index_path = os.path.join(args.output_dir, "INDEX.md")
+        with open(index_path, "w", encoding="utf-8") as f:
+            f.write(index_content)
+        
+        print(f"\n已生成 {len(saved_files)} 个文件到：{args.output_dir}")
+        print(f"索引文件：{index_path}")
+    
+    # 显示失败列表
+    if fail_count > 0:
+        print("\n失败的 URL：")
+        for result in results:
+            if not result.success:
+                print(f"  - {result.url}")
+                print(f"    错误：{result.error}")
+    
+    return 0
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    ap = argparse.ArgumentParser(
+        description="抓取网页正文与图片，保存为 Markdown + assets。支持单页和批量模式。",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+批量处理示例：
+  # 从文件读取 URL 列表，合并为单个文档
+  python grab_web_to_md.py --urls-file urls.txt --merge --merge-output output.md
+
+  # 从索引页爬取链接并批量导出
+  python grab_web_to_md.py https://example.com/index --crawl --merge --toc
+
+  # 批量导出为独立文件
+  python grab_web_to_md.py --urls-file urls.txt --output-dir ./docs
+
+urls.txt 文件格式：
+  # 这是注释
+  https://example.com/page1
+  https://example.com/page2 | 自定义标题
+""",
+    )
+    ap.add_argument("url", nargs="?", help="要抓取的网页 URL（单页模式必需，批量模式可选）")
+    ap.add_argument("--out", help="输出 md 文件名（默认根据 URL 自动生成）")
+    ap.add_argument("--assets-dir", help="图片目录名（默认 <out>.assets）")
+    ap.add_argument("--title", help="Markdown 顶部标题（默认从 <title> 提取）")
+    ap.add_argument("--with-pdf", action="store_true", help="同时生成同名 PDF（需要本机 Edge/Chrome）")
+    ap.add_argument("--timeout", type=int, default=60, help="请求超时（秒），默认 60")
+    ap.add_argument("--retries", type=int, default=3, help="网络重试次数，默认 3")
+    ap.add_argument("--best-effort-images", action="store_true", help="图片下载失败时仅警告并跳过（默认失败即退出）")
+    ap.add_argument("--overwrite", action="store_true", help="允许覆盖已存在的 md 文件")
+    ap.add_argument("--validate", action="store_true", help="生成后执行校验并输出结果")
+    # Frontmatter 支持
+    ap.add_argument("--frontmatter", action="store_true", default=True,
+                    help="生成 YAML Frontmatter 元数据头（默认启用）")
+    ap.add_argument("--no-frontmatter", action="store_false", dest="frontmatter",
+                    help="禁用 YAML Frontmatter")
+    ap.add_argument("--tags", help="Frontmatter 中的标签，逗号分隔，如 'tech,ai,tutorial'")
+    # Cookie/Header 支持
+    ap.add_argument("--cookie", help="Cookie 字符串，如 'session=abc; token=xyz'")
+    ap.add_argument("--cookies-file", help="Netscape 格式的 cookies.txt 文件路径")
+    ap.add_argument("--headers", help="自定义请求头，JSON 格式，如 '{\"Authorization\": \"Bearer xxx\"}'")
+    ap.add_argument("--header", action="append", default=[], help="追加请求头（可重复），如 'Authorization: Bearer xxx'")
+    # UA 可配置
+    ap.add_argument("--ua-preset", choices=sorted(UA_PRESETS.keys()), default="chrome-win", help="User-Agent 预设（默认 chrome-win）")
+    ap.add_argument("--user-agent", "--ua", dest="user_agent", help="自定义 User-Agent（优先于 --ua-preset）")
+    # 复杂表格保留 HTML
+    ap.add_argument("--keep-html", action="store_true",
+                    help="对复杂表格（含 colspan/rowspan）保留原始 HTML 而非强转 Markdown")
+    # 手动指定正文区域
+    ap.add_argument("--target-id", help="手动指定正文容器 id（如 content / post-content），优先级高于自动抽取")
+    ap.add_argument("--target-class", help="手动指定正文容器 class（如 post-body），优先级高于自动抽取")
+    # SPA 页面提示
+    ap.add_argument("--spa-warn-len", type=int, default=500, help="正文文本长度低于该值时提示可能为 SPA 动态渲染，默认 500；设为 0 可关闭")
+    # Wiki 噪音清理
+    ap.add_argument("--clean-wiki-noise", action="store_true",
+                    help="清理 Wiki 系统噪音（编辑按钮、导航链接、返回顶部等），适用于 PukiWiki/MediaWiki 等站点")
+    
+    # ========== 批量处理参数 ==========
+    batch_group = ap.add_argument_group("批量处理参数")
+    batch_group.add_argument("--urls-file", help="从文件读取 URL 列表（每行一个，支持 # 注释和 URL|标题 格式）")
+    batch_group.add_argument("--output-dir", default="./batch_output", help="批量输出目录（默认 ./batch_output）")
+    batch_group.add_argument("--max-workers", type=int, default=3, help="并发线程数（默认 3，建议不超过 5）")
+    batch_group.add_argument("--delay", type=float, default=1.0, help="请求间隔秒数（默认 1.0，避免被封）")
+    batch_group.add_argument("--skip-errors", action="store_true", help="跳过失败的 URL 继续处理")
+    batch_group.add_argument("--download-images", action="store_true", 
+                             help="下载图片到本地 assets 目录（默认不下载，保留原始 URL）")
+    
+    # 合并输出参数
+    merge_group = ap.add_argument_group("合并输出参数")
+    merge_group.add_argument("--merge", action="store_true", help="合并所有页面为单个 MD 文件")
+    merge_group.add_argument("--merge-output", help="合并输出文件名（默认 merged.md）")
+    merge_group.add_argument("--toc", action="store_true", help="在合并文件开头生成目录")
+    merge_group.add_argument("--merge-title", help="合并文档的主标题")
+    merge_group.add_argument("--source-url", help="来源站点 URL（显示在文档信息中）")
+    merge_group.add_argument("--rewrite-links", action="store_true",
+                             help="将站内链接改写为文档内锚点（仅合并模式有效）")
+    merge_group.add_argument("--no-source-summary", action="store_true",
+                             help="不在文档开头显示来源信息汇总")
+    
+    # 爬取模式参数
+    crawl_group = ap.add_argument_group("爬取模式参数")
+    crawl_group.add_argument("--crawl", action="store_true", help="从索引页提取链接并批量抓取")
+    crawl_group.add_argument("--crawl-pattern", help="链接匹配正则表达式（如 'index\\.php\\?MMR'）")
+    crawl_group.add_argument("--same-domain", action="store_true", default=True, help="仅抓取同域名链接（默认启用）")
+    crawl_group.add_argument("--no-same-domain", action="store_false", dest="same_domain", help="允许抓取跨域链接")
+    
+    args = ap.parse_args(argv)
+    
+    # ========== 批量处理模式 ==========
+    is_batch_mode = bool(args.urls_file or args.crawl)
+    
+    if is_batch_mode:
+        return _batch_main(args)
+    
+    # ========== 单页处理模式（原有逻辑） ==========
+    if not args.url:
+        ap.error("单页模式必须提供 URL 参数，或使用 --urls-file / --crawl 进入批量模式")
+
+    url = args.url
+    base = args.out or (_default_basename(url) + ".md")
+    out_md = base
+    # 检查输出文件路径长度
+    md_dir = os.path.dirname(out_md) or "."
+    out_md_name = os.path.basename(out_md)
+    out_md_name = _safe_path_length(md_dir, out_md_name)
+    out_md = os.path.join(md_dir, out_md_name) if md_dir != "." else out_md_name
+    assets_dir = args.assets_dir or (os.path.splitext(out_md)[0] + ".assets")
+    map_json = out_md + ".assets.json"
+
+    if os.path.exists(out_md) and not args.overwrite:
+        print(f"文件已存在：{out_md}（如需覆盖请加 --overwrite）", file=sys.stderr)
+        return 2
+
+    session = _create_session(args, referer_url=url)
 
     print(f"下载页面：{url}")
     page_html = fetch_html(session=session, url=url, timeout_s=args.timeout, retries=args.retries)
