@@ -4292,25 +4292,82 @@ def generate_index_markdown(
     results: List[BatchPageResult],
     output_dir: str,
     main_title: Optional[str] = None,
+    source_url: Optional[str] = None,
+    saved_files: Optional[List[str]] = None,
+    redact_urls: bool = True,
 ) -> str:
-    """生成索引文件内容"""
+    """
+    生成索引文件内容（Phase 3-B2 增强版）
+    
+    Args:
+        results: 处理结果列表
+        output_dir: 输出目录
+        main_title: 主标题
+        source_url: 来源站点 URL
+        saved_files: 已保存的文件路径列表（用于准确链接）
+        redact_urls: 是否脱敏 URL
+    """
     parts: List[str] = []
     
     title = main_title or "批量导出索引"
     date_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     
+    # YAML Frontmatter（转义特殊字符，与 generate_frontmatter 保持一致）
+    safe_title = title.replace('"', '\\"').replace("\n", " ")
+    safe_source_url = redact_url(source_url) if (redact_urls and source_url) else source_url
+    if safe_source_url:
+        safe_source_url = safe_source_url.replace('"', '\\"').replace("\n", " ")
+    
+    parts.append("---")
+    parts.append(f'title: "{safe_title}"')
+    if safe_source_url:
+        parts.append(f'source: "{safe_source_url}"')
+    parts.append(f'date: "{date_str}"')
+    success_count = len([r for r in results if r.success])
+    parts.append(f'pages: {success_count}')
+    parts.append("---")
+    parts.append("")
+    
+    # 主标题
     parts.append(f"# {title}")
     parts.append("")
-    parts.append(f"生成时间：{date_str}")
+    
+    # 文档信息
+    parts.append("## 文档信息")
     parts.append("")
-    parts.append(f"共 {len(results)} 个页面，成功 {len([r for r in results if r.success])} 个")
+    parts.append(f"- **导出时间**：{date_str}")
+    parts.append(f"- **页面数量**：{success_count} 页")
+    if safe_source_url:
+        parts.append(f"- **来源站点**：{safe_source_url}")
+    elif results and results[0].url:
+        # 从第一个 URL 提取域名
+        parsed = urlparse(results[0].url)
+        parts.append(f"- **来源站点**：{parsed.scheme}://{parsed.netloc}")
     parts.append("")
+    parts.append("---")
+    parts.append("")
+    
+    # 页面列表
     parts.append("## 页面列表")
     parts.append("")
     
+    # 构建文件名映射（如果提供了 saved_files）
+    # saved_files 按顺序对应 results 中成功的项目
+    filename_map: Dict[int, str] = {}
+    if saved_files:
+        saved_idx = 0
+        for i, r in enumerate(results):
+            if r.success and saved_idx < len(saved_files):
+                filename_map[i] = os.path.basename(saved_files[saved_idx])
+                saved_idx += 1
+    
     for i, result in enumerate(results, 1):
         if result.success:
-            filename = _sanitize_filename_part(result.title)[:50] + ".md"
+            # 优先使用实际生成的文件名
+            if (i - 1) in filename_map:
+                filename = filename_map[i - 1]
+            else:
+                filename = _sanitize_filename_part(result.title)[:50] + ".md"
             parts.append(f"{i}. [{result.title}](./{filename})")
         else:
             parts.append(f"{i}. ~~{result.title}~~ (获取失败: {result.error})")
@@ -4324,9 +4381,17 @@ def batch_save_individual(
     output_dir: str,
     include_frontmatter: bool = True,
     redact_urls: bool = True,
+    shared_assets_dir: Optional[str] = None,
 ) -> List[str]:
     """
-    将结果保存为独立的 MD 文件
+    将结果保存为独立的 MD 文件（Phase 3-B2 增强版）
+    
+    Args:
+        results: 处理结果列表
+        output_dir: 输出目录
+        include_frontmatter: 是否包含 frontmatter
+        redact_urls: 是否脱敏 URL
+        shared_assets_dir: 共享 assets 目录（用于双版本输出时调整图片路径）
     
     Returns:
         生成的文件路径列表
@@ -4350,6 +4415,30 @@ def batch_save_individual(
             filepath = f"{base}_{counter}{ext}"
             counter += 1
         
+        # 处理内容中的图片路径
+        content = result.md_content
+        if shared_assets_dir:
+            # 计算从 output_dir 到 shared_assets_dir 的相对路径
+            try:
+                rel_assets_path = os.path.relpath(shared_assets_dir, output_dir)
+                # 统一使用正斜杠（Windows 上 relpath 可能返回反斜杠）
+                rel_assets_path = rel_assets_path.replace("\\", "/")
+                # 替换图片路径：将 xxx.assets/ 替换为相对路径
+                # 匹配 ![...](xxx.assets/...) 或 <img src="xxx.assets/..."
+                content = re.sub(
+                    r'(\!\[[^\]]*\]\()([^/)]+\.assets/)([^)]+\))',
+                    lambda m: m.group(1) + rel_assets_path + '/' + m.group(3),
+                    content
+                )
+                content = re.sub(
+                    r'(<img[^>]+src=["\'])([^"\'/]+\.assets/)([^"\']+)',
+                    lambda m: m.group(1) + rel_assets_path + '/' + m.group(3),
+                    content
+                )
+            except ValueError:
+                # 如果无法计算相对路径（跨驱动器等），保持原样
+                pass
+        
         # 写入文件
         with open(filepath, "w", encoding="utf-8") as f:
             page_url = redact_url(result.url) if redact_urls else result.url
@@ -4357,7 +4446,7 @@ def batch_save_individual(
                 f.write(generate_frontmatter(result.title, page_url))
             f.write(f"# {result.title}\n\n")
             f.write(f"- Source: {page_url}\n\n")
-            f.write(result.md_content)
+            f.write(content)
         
         saved_files.append(filepath)
     
@@ -4706,6 +4795,11 @@ def _batch_main(args: argparse.Namespace) -> int:
         # 合并输出模式
         output_file = args.merge_output or "merged.md"
         
+        # 确保输出目录存在
+        output_dir = os.path.dirname(output_file)
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+        
         # 检查是否已存在
         if os.path.exists(output_file) and not args.overwrite:
             print(f"文件已存在：{output_file}（如需覆盖请加 --overwrite）", file=sys.stderr)
@@ -4765,6 +4859,44 @@ def _batch_main(args: argparse.Namespace) -> int:
             else:
                 print(f"图片目录：{assets_dir}（{len(url_to_local)} 张图片）")
         
+        # Phase 3-B1: 双版本输出（同时生成分文件版本）
+        if hasattr(args, 'split_output') and args.split_output:
+            split_dir = args.split_output
+            os.makedirs(split_dir, exist_ok=True)
+            
+            # 确定共享的 assets 目录（使用合并版本的 assets）
+            shared_assets = os.path.splitext(output_file)[0] + ".assets" if url_to_local else None
+            
+            # 生成分文件
+            saved_files = batch_save_individual(
+                results=results,
+                output_dir=split_dir,
+                include_frontmatter=args.frontmatter,
+                redact_urls=args.redact_url,
+                shared_assets_dir=shared_assets,
+            )
+            
+            # 生成索引文件
+            index_content = generate_index_markdown(
+                results=results,
+                output_dir=split_dir,
+                main_title=args.merge_title or args.title,
+                source_url=final_source_url,
+                saved_files=saved_files,
+                redact_urls=args.redact_url,
+            )
+            index_path = os.path.join(split_dir, "INDEX.md")
+            with open(index_path, "w", encoding="utf-8") as f:
+                f.write(index_content)
+            
+            print(f"\n📂 已同时生成分文件版本：")
+            print(f"  • 目录：{split_dir}")
+            print(f"  • 文件数：{len(saved_files)} 个")
+            print(f"  • 索引：{index_path}")
+            if shared_assets:
+                rel_assets = os.path.relpath(shared_assets, split_dir)
+                print(f"  • 共享 assets：{rel_assets}")
+        
     else:
         # 独立文件输出模式
         os.makedirs(args.output_dir, exist_ok=True)
@@ -4774,13 +4906,20 @@ def _batch_main(args: argparse.Namespace) -> int:
             output_dir=args.output_dir,
             include_frontmatter=args.frontmatter,
             redact_urls=args.redact_url,
+            shared_assets_dir=None,
         )
         
-        # 生成索引文件
+        # 来源 URL 优先级：--source-url > 爬取模式的索引页 > None（提取域名）
+        final_source_url = args.source_url or source_url
+        
+        # 生成索引文件（使用增强版）
         index_content = generate_index_markdown(
             results=results,
             output_dir=args.output_dir,
             main_title=args.merge_title or args.title,
+            source_url=final_source_url,
+            saved_files=saved_files,
+            redact_urls=args.redact_url,
         )
         index_path = os.path.join(args.output_dir, "INDEX.md")
         with open(index_path, "w", encoding="utf-8") as f:
@@ -4938,6 +5077,8 @@ urls.txt 文件格式：
                              help="不在文档开头显示来源信息汇总")
     merge_group.add_argument("--warn-anchor-collisions", action="store_true",
                              help="显示锚点冲突详情（同名标题自动添加后缀 -2, -3...）")
+    merge_group.add_argument("--split-output", metavar="DIR",
+                             help="同时输出分文件版本到指定目录（与 --merge 配合使用，生成双版本）")
     
     # 爬取模式参数
     crawl_group = ap.add_argument_group("爬取模式参数")

@@ -125,6 +125,8 @@ pip install requests
 | `--source-url` | 来源 URL | 自动提取 |
 | `--rewrite-links` | 链接改写为锚点 | `False` |
 | `--no-source-summary` | 不显示来源信息 | `False` |
+| `--split-output DIR` | 同时输出分文件版本（双版本模式） | - |
+| `--warn-anchor-collisions` | 显示锚点冲突详情 | `False` |
 
 ### 爬取模式参数
 
@@ -259,6 +261,14 @@ python scripts/grab_web_to_md.py "https://docs.example.com/" \
   --merge-output docs.md \
   --download-images
 
+# 双版本输出：同时生成合并版和分文件版（Phase 3-B）
+python scripts/grab_web_to_md.py "https://docs.example.com/" \
+  --crawl --merge --toc \
+  --docs-preset mintlify \
+  --merge-output output/merged.md \
+  --split-output output/pages/ \
+  --download-images
+
 # 手动配置导航剥离
 python scripts/grab_web_to_md.py "https://docs.example.com/" \
   --crawl \
@@ -284,6 +294,12 @@ python scripts/grab_web_to_md.py --list-presets
 - 自动排除导航选择器
 - 自动启用锚点列表剥离（阈值=10）
 - 对 docs 站点可减少 50%+ 输出大小
+
+**双版本输出优势**（`--split-output`）：
+- 同时生成 merged.md 和独立页面文件
+- 共享 assets 目录（图片只下载一次）
+- 生成 INDEX.md 索引文件
+- 适配 Obsidian、检索工具、协作编辑等场景
 
 ### 场景 7：数据安全与隐私
 
@@ -382,6 +398,17 @@ output_dir/
 merged.md  # 含目录
 ```
 
+**双版本输出**（`--split-output`）：
+```
+output/
+├── merged.md               # 合并版（单文件，带全局目录）
+├── merged.assets/          # 图片目录（共享）
+└── pages/                  # 分文件版
+    ├── INDEX.md            # 结构索引
+    ├── Page-Title-1.md
+    └── Page-Title-2.md
+```
+
 ---
 
 ## 技术细节
@@ -402,6 +429,17 @@ merged.md  # 含目录
 ---
 
 ## 更新日志
+
+### v1.6.0 (2026-02-02)
+- ✨ **双版本输出**（Phase 3-B）：
+  - 新增 `--split-output DIR` 同时输出分文件版本
+  - 合并版和分文件版共享 assets 目录
+  - 生成增强版 INDEX.md（含 Frontmatter 和文档信息）
+  - 自动调整分文件中的图片相对路径
+- 🐛 **Bug 修复**：
+  - 修复 INDEX.md 链接映射可能错链的问题（相似标题场景）
+  - 修复 INDEX.md YAML frontmatter 未转义特殊字符的问题
+  - 修复 Windows 上图片相对路径使用反斜杠的问题
 
 ### v1.5.0 (2026-02-02)
 - ✨ **导航剥离功能**：

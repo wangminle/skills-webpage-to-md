@@ -14,6 +14,7 @@
 - ✅ **数据安全**：URL 脱敏、跨域凭据隔离、流式下载防 OOM
 - ✅ **导航剥离**：自动移除侧边栏/页内目录，支持 8 种文档框架预设
 - ✅ **框架识别**：自动检测 Docusaurus/Mintlify/GitBook 等站点模板
+- ✅ **双版本输出**：同时生成合并版和分文件版，共享 assets 目录
 
 ## 安装到 Claude Code
 
@@ -70,6 +71,14 @@ python skills/webpage-to-md/scripts/grab_web_to_md.py "https://docs.example.com/
   --docs-preset mintlify \
   --merge-output docs-export.md
 
+# 双版本输出：同时生成合并版和分文件版
+python skills/webpage-to-md/scripts/grab_web_to_md.py "https://docs.example.com/" \
+  --crawl --merge --toc \
+  --docs-preset mintlify \
+  --merge-output output/merged.md \
+  --split-output output/pages/ \
+  --download-images
+
 # 支持的预设：mintlify, docusaurus, gitbook, vuepress, mkdocs, readthedocs, sphinx, generic
 python skills/webpage-to-md/scripts/grab_web_to_md.py --list-presets
 ```
@@ -89,6 +98,7 @@ python skills/webpage-to-md/scripts/grab_web_to_md.py --list-presets
 | `--clean-wiki-noise` | 清理 Wiki 系统噪音 |
 | `--rewrite-links` | 站内链接改写为锚点 |
 | `--docs-preset` | 文档框架预设（mintlify/docusaurus/gitbook 等） |
+| `--split-output DIR` | 同时输出分文件版本（与 --merge 配合使用） |
 | `--strip-nav` | 移除导航元素（侧边栏等） |
 | `--strip-page-toc` | 移除页内目录 |
 
