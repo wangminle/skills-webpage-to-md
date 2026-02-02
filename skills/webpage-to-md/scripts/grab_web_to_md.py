@@ -43,6 +43,16 @@ from urllib.parse import urljoin, urlparse, unquote
 import requests
 
 
+# ============================================================================
+# 退出码定义
+# ============================================================================
+EXIT_SUCCESS = 0
+EXIT_ERROR = 1
+EXIT_FILE_EXISTS = 2
+EXIT_VALIDATION_FAILED = 3
+EXIT_JS_CHALLENGE = 4  # 检测到 JS 反爬保护，无法获取内容
+
+
 UA_PRESETS: Dict[str, str] = {
     # 兼容旧行为（但部分站点会拦截“工具 UA”）
     "tool": "Mozilla/5.0 (compatible; grab_web_to_md/1.0)",
@@ -409,6 +419,775 @@ def extract_target_html(page_html: str, *, target_id: Optional[str], target_clas
     parser.feed(page_html or "")
     out = "".join(parser.buf).strip()
     return out or None
+
+
+def extract_target_html_multi(
+    page_html: str,
+    *,
+    target_ids: Optional[str] = None,
+    target_classes: Optional[str] = None,
+) -> Tuple[Optional[str], Optional[str]]:
+    """
+    支持多值的正文提取（T2.1）
+    
+    Args:
+        page_html: HTML 内容
+        target_ids: 逗号分隔的 ID 列表，按优先级依次尝试
+        target_classes: 逗号分隔的 class 列表，按优先级依次尝试
+    
+    Returns:
+        (提取的 HTML, 匹配的选择器描述) 或 (None, None)
+    """
+    # 解析多值
+    ids = [s.strip() for s in (target_ids or "").split(",") if s.strip()]
+    classes = [s.strip() for s in (target_classes or "").split(",") if s.strip()]
+    
+    # 优先尝试 ID
+    for tid in ids:
+        result = extract_target_html(page_html, target_id=tid, target_class=None)
+        if result:
+            return result, f"id={tid}"
+    
+    # 然后尝试 class
+    for tcls in classes:
+        result = extract_target_html(page_html, target_id=None, target_class=tcls)
+        if result:
+            return result, f"class={tcls}"
+    
+    return None, None
+
+
+# ============================================================================
+# Phase 2: 智能正文容器定位（T2.1 - T2.4）
+# ============================================================================
+
+@dataclass
+class DocsPreset:
+    """文档框架预设配置（T2.2）"""
+    name: str
+    description: str
+    # 检测特征（任一匹配即可）
+    detect_patterns: List[str]  # HTML 中的关键字符串
+    detect_classes: List[str]   # 检测的 class 名
+    detect_meta: List[str]      # meta 标签内容
+    # 提取配置
+    target_ids: List[str]       # 正文容器 ID（按优先级）
+    target_classes: List[str]   # 正文容器 class（按优先级）
+    exclude_selectors: List[str]  # 需要排除的选择器
+
+
+# 框架预设配置
+DOCS_PRESETS: Dict[str, DocsPreset] = {
+    "docusaurus": DocsPreset(
+        name="docusaurus",
+        description="Docusaurus (Meta/Facebook)",
+        detect_patterns=["docusaurus", "__docusaurus"],
+        detect_classes=["docusaurus-wrapper", "theme-doc-markdown"],
+        detect_meta=["generator.*docusaurus"],
+        target_ids=["__docusaurus_skipToContent_fallback"],
+        target_classes=["theme-doc-markdown", "markdown", "docMainContainer"],
+        exclude_selectors=[
+            ".theme-doc-sidebar-container",
+            ".pagination-nav",
+            ".theme-doc-toc-mobile",
+            ".theme-doc-toc-desktop",
+            ".theme-doc-breadcrumbs",
+            "nav",
+            "aside",
+            ".table-of-contents",
+        ],
+    ),
+    "mintlify": DocsPreset(
+        name="mintlify",
+        description="Mintlify",
+        detect_patterns=["mintlify", "mintcdn.com"],
+        detect_classes=["mintlify"],
+        detect_meta=[],
+        target_ids=["content-area"],
+        target_classes=["prose", "article-content", "markdown-body"],
+        exclude_selectors=[
+            "nav",
+            "aside",
+            ".sidebar",
+            ".on-this-page",
+            ".page-navigation",
+            "[data-testid='sidebar']",
+        ],
+    ),
+    "gitbook": DocsPreset(
+        name="gitbook",
+        description="GitBook",
+        detect_patterns=["gitbook", "app.gitbook.com"],
+        detect_classes=["gb-root", "gitbook-root"],
+        detect_meta=["generator.*gitbook"],
+        target_ids=[],
+        target_classes=["markdown-section", "page-inner", "book-body"],
+        exclude_selectors=[
+            ".book-summary",
+            ".navigation",
+            "nav",
+            ".page-toc",
+        ],
+    ),
+    "vuepress": DocsPreset(
+        name="vuepress",
+        description="VuePress",
+        detect_patterns=["vuepress", "VuePress"],
+        detect_classes=["theme-default-content", "vuepress"],
+        detect_meta=["generator.*vuepress"],
+        target_ids=[],
+        target_classes=["theme-default-content", "page", "content__default"],
+        exclude_selectors=[
+            ".sidebar",
+            ".page-nav",
+            ".page-edit",
+            "nav",
+            ".table-of-contents",
+        ],
+    ),
+    "mkdocs": DocsPreset(
+        name="mkdocs",
+        description="MkDocs / Material for MkDocs",
+        detect_patterns=["mkdocs", "MkDocs"],
+        detect_classes=["md-content", "md-main"],
+        detect_meta=["generator.*mkdocs"],
+        target_ids=["content"],
+        target_classes=["md-content__inner", "md-typeset", "rst-content"],
+        exclude_selectors=[
+            ".md-sidebar",
+            ".md-nav",
+            ".md-footer",
+            ".md-header",
+            "nav",
+        ],
+    ),
+    "readthedocs": DocsPreset(
+        name="readthedocs",
+        description="Read the Docs / Sphinx",
+        detect_patterns=["readthedocs", "sphinx", "Read the Docs"],
+        detect_classes=["rst-content", "wy-nav-content"],
+        detect_meta=["generator.*sphinx"],
+        target_ids=[],
+        target_classes=["rst-content", "document", "body"],
+        exclude_selectors=[
+            ".wy-nav-side",
+            ".wy-side-nav-search",
+            ".rst-versions",
+            "nav",
+            ".toctree-wrapper",
+        ],
+    ),
+    "notion": DocsPreset(
+        name="notion",
+        description="Notion (exported or public pages)",
+        detect_patterns=["notion.so", "notion-static"],
+        detect_classes=["notion-page-content", "notion-app"],
+        detect_meta=[],
+        target_ids=[],
+        target_classes=["notion-page-content", "notion-scroller"],
+        exclude_selectors=[
+            ".notion-sidebar",
+            ".notion-topbar",
+            "nav",
+        ],
+    ),
+    "confluence": DocsPreset(
+        name="confluence",
+        description="Atlassian Confluence",
+        detect_patterns=["confluence", "atlassian"],
+        detect_classes=["wiki-content", "confluence-content"],
+        detect_meta=[],
+        target_ids=["main-content", "content"],
+        target_classes=["wiki-content", "confluence-content-body"],
+        exclude_selectors=[
+            "#navigation",
+            ".aui-sidebar",
+            ".page-metadata",
+            "nav",
+        ],
+    ),
+}
+
+
+def detect_docs_framework(page_html: str) -> Tuple[Optional[str], float, List[str]]:
+    """
+    自动检测文档框架类型（T2.3）
+    
+    Args:
+        page_html: HTML 内容
+    
+    Returns:
+        (框架名称, 置信度 0-1, 匹配的特征列表) 或 (None, 0, [])
+    """
+    if not page_html:
+        return None, 0.0, []
+    
+    html_lower = page_html.lower()
+    best_match: Optional[str] = None
+    best_score = 0.0
+    best_signals: List[str] = []
+    
+    for name, preset in DOCS_PRESETS.items():
+        signals: List[str] = []
+        score = 0.0
+        
+        # 检测关键字符串
+        for pattern in preset.detect_patterns:
+            if pattern.lower() in html_lower:
+                signals.append(f"pattern:{pattern}")
+                score += 0.3
+        
+        # 检测 class
+        for cls in preset.detect_classes:
+            if f'class="{cls}"' in page_html or f"class='{cls}'" in page_html or f' {cls}' in page_html:
+                signals.append(f"class:{cls}")
+                score += 0.25
+        
+        # 检测 meta（正则）
+        for meta_pattern in preset.detect_meta:
+            if re.search(meta_pattern, page_html, re.IGNORECASE):
+                signals.append(f"meta:{meta_pattern}")
+                score += 0.35
+        
+        # 归一化分数（最高 1.0）
+        score = min(1.0, score)
+        
+        if score > best_score:
+            best_score = score
+            best_match = name
+            best_signals = signals
+    
+    # 置信度阈值
+    if best_score < 0.2:
+        return None, 0.0, []
+    
+    return best_match, best_score, best_signals
+
+
+def calculate_link_density(md_content: str) -> Tuple[float, int, int]:
+    """
+    计算内容的链接密度（T2.4）
+    
+    Args:
+        md_content: Markdown 内容
+    
+    Returns:
+        (链接密度比例, 链接数量, 总字符数)
+    """
+    if not md_content:
+        return 0.0, 0, 0
+    
+    # 统计 Markdown 链接数量
+    link_pattern = r'\[[^\]]+\]\([^)]+\)'
+    links = re.findall(link_pattern, md_content)
+    link_count = len(links)
+    
+    # 计算链接占用的字符数
+    link_chars = sum(len(link) for link in links)
+    
+    total_chars = len(md_content)
+    if total_chars == 0:
+        return 0.0, 0, 0
+    
+    density = link_chars / total_chars
+    return density, link_count, total_chars
+
+
+def check_content_quality(
+    md_content: str,
+    url: str,
+    density_threshold: float = 0.5,
+) -> List[str]:
+    """
+    检查内容质量并生成警告（T2.4）
+    
+    Args:
+        md_content: Markdown 内容
+        url: 来源 URL
+        density_threshold: 链接密度阈值
+    
+    Returns:
+        警告消息列表
+    """
+    warnings: List[str] = []
+    
+    density, link_count, total_chars = calculate_link_density(md_content)
+    
+    if density > density_threshold:
+        warnings.append(
+            f"⚠️ 链接密度过高 ({density:.1%})：可能包含未移除的导航菜单。"
+            f"建议使用 --strip-nav 或 --docs-preset"
+        )
+    
+    # 检测连续链接列表
+    consecutive_links = re.findall(
+        r'(?:^[ \t]*[-*]\s*\[[^\]]+\]\([^)]+\)\s*\n){10,}',
+        md_content,
+        re.MULTILINE
+    )
+    if consecutive_links:
+        warnings.append(
+            f"⚠️ 检测到 {len(consecutive_links)} 个长链接列表块。"
+            f"建议使用 --anchor-list-threshold 降低阈值"
+        )
+    
+    return warnings
+
+
+def apply_docs_preset(
+    preset_name: str,
+) -> Tuple[Optional[str], Optional[str], List[str]]:
+    """
+    应用文档框架预设
+    
+    Args:
+        preset_name: 预设名称
+    
+    Returns:
+        (target_ids, target_classes, exclude_selectors)
+    """
+    preset = DOCS_PRESETS.get(preset_name.lower())
+    if not preset:
+        return None, None, []
+    
+    target_ids = ",".join(preset.target_ids) if preset.target_ids else None
+    target_classes = ",".join(preset.target_classes) if preset.target_classes else None
+    exclude_selectors = preset.exclude_selectors
+    
+    return target_ids, target_classes, exclude_selectors
+
+
+def get_available_presets() -> List[str]:
+    """获取所有可用的预设名称"""
+    return list(DOCS_PRESETS.keys())
+
+
+# ============================================================================
+# Phase 1: 导航/目录剥离功能（T1.1 - T1.5）
+# ============================================================================
+
+@dataclass
+class NavStripStats:
+    """导航剥离统计信息（T1.5 可观测性）"""
+    elements_removed: int = 0
+    chars_before: int = 0
+    chars_after: int = 0
+    rules_matched: Dict[str, int] = field(default_factory=dict)
+    anchor_lists_removed: int = 0
+    anchor_lines_removed: int = 0
+    
+    @property
+    def chars_saved(self) -> int:
+        return self.chars_before - self.chars_after
+    
+    def add_rule_match(self, rule: str, count: int = 1) -> None:
+        self.rules_matched[rule] = self.rules_matched.get(rule, 0) + count
+    
+    def print_summary(self, file=None) -> None:
+        """打印统计摘要"""
+        if file is None:
+            file = sys.stderr
+        if self.elements_removed == 0 and self.anchor_lists_removed == 0:
+            return
+        print(f"\n📊 导航剥离统计：", file=file)
+        if self.elements_removed > 0:
+            print(f"  • HTML 元素移除：{self.elements_removed} 个", file=file)
+        if self.anchor_lists_removed > 0:
+            print(f"  • 锚点列表移除：{self.anchor_lists_removed} 块（共 {self.anchor_lines_removed} 行）", file=file)
+        if self.chars_saved > 0:
+            print(f"  • 节省字符数：{self.chars_saved:,} 字符", file=file)
+        if self.rules_matched:
+            print(f"  • 命中规则：", file=file)
+            for rule, count in sorted(self.rules_matched.items(), key=lambda x: -x[1]):
+                print(f"    - {rule}: {count} 次", file=file)
+
+
+# 默认导航元素选择器（--strip-nav）
+DEFAULT_NAV_SELECTORS = [
+    "nav",                      # <nav> 标签
+    "aside",                    # <aside> 标签
+    "[role=navigation]",        # role="navigation"
+    "[role=complementary]",     # role="complementary"（侧边栏）
+    ".sidebar",                 # 常见侧边栏类名
+    ".side-bar",
+    ".sidenav",
+    ".side-nav",
+    ".nav-sidebar",
+    ".menu",
+    ".navigation",
+    ".site-nav",
+    ".doc-sidebar",
+    ".theme-doc-sidebar-container",  # Docusaurus
+    ".pagination-nav",               # Docusaurus 分页
+]
+
+# 默认页内目录选择器（--strip-page-toc）
+DEFAULT_TOC_SELECTORS = [
+    ".toc",
+    ".table-of-contents",
+    ".on-this-page",
+    ".page-toc",
+    ".article-toc",
+    ".contents",
+    "[data-toc]",
+    ".theme-doc-toc-mobile",    # Docusaurus
+    ".theme-doc-toc-desktop",   # Docusaurus
+]
+
+
+class _SimpleSelectorMatcher:
+    """
+    简化选择器匹配器（T1.3）
+    
+    支持的选择器语法：
+    - tag: 匹配标签名（如 nav, aside）
+    - .class: 匹配类名（如 .sidebar）
+    - #id: 匹配 ID（如 #navigation）
+    - [attr]: 匹配属性存在（如 [data-toc]）
+    - [attr=val]: 匹配属性值（如 [role=navigation]）
+    - [attr*=val]: 匹配属性包含值（如 [class*=sidebar]）
+    """
+    
+    def __init__(self, selector: str):
+        self.selector = selector.strip()
+        self.tag: Optional[str] = None
+        self.class_name: Optional[str] = None
+        self.id_name: Optional[str] = None
+        self.attr_name: Optional[str] = None
+        self.attr_value: Optional[str] = None
+        self.attr_contains: bool = False
+        
+        self._parse()
+    
+    def _parse(self) -> None:
+        s = self.selector
+        if not s:
+            return
+        
+        if s.startswith("."):
+            # .class
+            self.class_name = s[1:]
+        elif s.startswith("#"):
+            # #id
+            self.id_name = s[1:]
+        elif s.startswith("[") and s.endswith("]"):
+            # [attr], [attr=val], [attr*=val]
+            inner = s[1:-1]
+            if "*=" in inner:
+                self.attr_name, self.attr_value = inner.split("*=", 1)
+                self.attr_contains = True
+            elif "=" in inner:
+                self.attr_name, self.attr_value = inner.split("=", 1)
+            else:
+                self.attr_name = inner
+        else:
+            # tag name
+            self.tag = s.lower()
+    
+    def matches(self, tag: str, attrs: Dict[str, Optional[str]]) -> bool:
+        """检查是否匹配"""
+        tag = tag.lower()
+        
+        # 标签匹配
+        if self.tag and self.tag != tag:
+            return False
+        if self.tag and self.tag == tag:
+            return True
+        
+        # 类名匹配
+        if self.class_name:
+            classes = _class_list(attrs)
+            if self.class_name not in classes:
+                return False
+            return True
+        
+        # ID 匹配
+        if self.id_name:
+            elem_id = (attrs.get("id") or "").strip()
+            if elem_id != self.id_name:
+                return False
+            return True
+        
+        # 属性匹配
+        if self.attr_name:
+            attr_val = attrs.get(self.attr_name)
+            if attr_val is None:
+                return False
+            if self.attr_value is None:
+                return True  # 仅检查属性存在
+            if self.attr_contains:
+                return self.attr_value in attr_val
+            return attr_val == self.attr_value
+        
+        return False
+    
+    def __repr__(self) -> str:
+        return f"Selector({self.selector!r})"
+
+
+class _HTMLElementStripper(HTMLParser):
+    """
+    HTML 元素移除器（T1.1, T1.2）
+    
+    移除匹配指定选择器的 HTML 元素及其内容。
+    """
+    
+    def __init__(self, selectors: List[str]):
+        super().__init__(convert_charrefs=True)
+        self.matchers = [_SimpleSelectorMatcher(s) for s in selectors if s.strip()]
+        self.buf: List[str] = []
+        self.skip_depth = 0
+        self.skip_tag: Optional[str] = None
+        self.stats = NavStripStats()
+    
+    def _should_skip(self, tag: str, attrs: Dict[str, Optional[str]]) -> Optional[str]:
+        """检查是否应该跳过该元素，返回匹配的选择器"""
+        for matcher in self.matchers:
+            if matcher.matches(tag, attrs):
+                return matcher.selector
+        return None
+    
+    @staticmethod
+    def _attrs_to_str(attrs_list: Sequence[Tuple[str, Optional[str]]]) -> str:
+        parts = []
+        for name, value in attrs_list:
+            if value is None:
+                parts.append(name)
+            else:
+                escaped = htmllib.escape(str(value), quote=True)
+                parts.append(f'{name}="{escaped}"')
+        return " ".join(parts)
+    
+    def handle_starttag(self, tag: str, attrs_list: Sequence[Tuple[str, Optional[str]]]) -> None:
+        tag = tag.lower()
+        attrs = dict(attrs_list)
+        
+        if self.skip_depth > 0:
+            # 已经在跳过的元素内部
+            self.skip_depth += 1
+            return
+        
+        matched = self._should_skip(tag, attrs)
+        if matched:
+            # 开始跳过
+            self.skip_depth = 1
+            self.skip_tag = tag
+            self.stats.elements_removed += 1
+            self.stats.add_rule_match(matched)
+            return
+        
+        # 正常输出
+        attr_str = self._attrs_to_str(attrs_list)
+        if attr_str:
+            self.buf.append(f"<{tag} {attr_str}>")
+        else:
+            self.buf.append(f"<{tag}>")
+    
+    def handle_startendtag(self, tag: str, attrs_list: Sequence[Tuple[str, Optional[str]]]) -> None:
+        tag = tag.lower()
+        attrs = dict(attrs_list)
+        
+        if self.skip_depth > 0:
+            return
+        
+        matched = self._should_skip(tag, attrs)
+        if matched:
+            self.stats.elements_removed += 1
+            self.stats.add_rule_match(matched)
+            return
+        
+        attr_str = self._attrs_to_str(attrs_list)
+        if attr_str:
+            self.buf.append(f"<{tag} {attr_str}/>")
+        else:
+            self.buf.append(f"<{tag}/>")
+    
+    def handle_endtag(self, tag: str) -> None:
+        tag = tag.lower()
+        
+        if self.skip_depth > 0:
+            self.skip_depth -= 1
+            if self.skip_depth == 0:
+                self.skip_tag = None
+            return
+        
+        self.buf.append(f"</{tag}>")
+    
+    def handle_data(self, data: str) -> None:
+        if self.skip_depth > 0:
+            return
+        self.buf.append(htmllib.escape(data, quote=False))
+    
+    def handle_comment(self, data: str) -> None:
+        if self.skip_depth > 0:
+            return
+        self.buf.append(f"<!--{data}-->")
+    
+    def handle_decl(self, decl: str) -> None:
+        if self.skip_depth > 0:
+            return
+        self.buf.append(f"<!{decl}>")
+    
+    def get_result(self) -> str:
+        return "".join(self.buf)
+
+
+def strip_html_elements(
+    html_content: str,
+    selectors: List[str],
+    stats: Optional[NavStripStats] = None,
+) -> Tuple[str, NavStripStats]:
+    """
+    从 HTML 中移除匹配指定选择器的元素
+    
+    Args:
+        html_content: HTML 内容
+        selectors: 选择器列表
+        stats: 可选的统计对象（用于累计统计）
+    
+    Returns:
+        (处理后的 HTML, 统计信息)
+    """
+    if not selectors or not html_content:
+        return html_content, stats or NavStripStats()
+    
+    if stats is None:
+        stats = NavStripStats()
+    
+    stats.chars_before = len(html_content)
+    
+    stripper = _HTMLElementStripper(selectors)
+    stripper.feed(html_content)
+    result = stripper.get_result()
+    
+    # 合并统计
+    stats.elements_removed += stripper.stats.elements_removed
+    for rule, count in stripper.stats.rules_matched.items():
+        stats.add_rule_match(rule, count)
+    
+    stats.chars_after = len(result)
+    
+    return result, stats
+
+
+def strip_anchor_lists(
+    md_content: str,
+    threshold: int = 20,
+    stats: Optional[NavStripStats] = None,
+) -> Tuple[str, NavStripStats]:
+    """
+    移除高链接密度的目录块（T1.4）
+    
+    检测连续的链接列表，超过阈值时移除。支持：
+    - 内部锚点：`- [text](#anchor)`
+    - 外部链接：`- [text](https://...)`
+    - 带标题的导航区块（标题 + 链接列表总行数超过阈值时）
+    
+    Args:
+        md_content: Markdown 内容
+        threshold: 连续链接行数阈值（默认 20），设为 0 关闭此功能
+        stats: 可选的统计对象
+    
+    Returns:
+        (处理后的 Markdown, 统计信息)
+    """
+    if stats is None:
+        stats = NavStripStats()
+    
+    if threshold <= 0 or not md_content:
+        return md_content, stats
+    
+    removed_count = 0
+    removed_lines = 0
+    result = md_content
+    
+    # 模式 1: 移除带标题的导航区块（如 "##### Start Here" 后跟链接列表）
+    # 关键修复：nav_section_pattern 现在也受 threshold 控制
+    # 标题占 1 行，所以链接列表至少需要 (threshold - 1) 行
+    nav_min_links = max(3, threshold - 1)  # 至少 3 行，避免误删短列表
+    nav_section_pattern = (
+        r'(#{3,6}\s+[^\n]+\n\n?'  # 标题行（##### 等）
+        r'(?:[ \t]*[-*]\s*\[[^\]]+\]\([^)]+\)\s*\n){' + str(nav_min_links) + r',})'
+    )
+    
+    def replace_nav_section(match: re.Match) -> str:
+        nonlocal removed_count, removed_lines
+        block = match.group(0)
+        lines = block.count('\n')
+        removed_count += 1
+        removed_lines += lines
+        return ''  # 完全移除，不留注释
+    
+    result = re.sub(nav_section_pattern, replace_nav_section, result, flags=re.MULTILINE)
+    
+    # 模式 2: 移除独立的长链接列表（超过阈值）
+    list_pattern = r'((?:^[ \t]*(?:[-*]|\d+\.)\s*\[[^\]]+\]\([^)]+\)\s*\n){' + str(threshold) + r',})'
+    
+    def replace_list(match: re.Match) -> str:
+        nonlocal removed_count, removed_lines
+        block = match.group(0)
+        lines = block.count('\n')
+        removed_count += 1
+        removed_lines += lines
+        return ''  # 完全移除
+    
+    result = re.sub(list_pattern, replace_list, result, flags=re.MULTILINE)
+    
+    # 模式 3: 清理孤立的标题（标题后面只有空行或另一个标题）
+    # 仅在移除了导航区块后才执行，避免误删正常标题
+    if removed_count > 0:
+        orphan_title_pattern = r'#{3,6}\s+[^\n]+\n\n(?=#{3,6}\s+|$|\n*---)'
+        result = re.sub(orphan_title_pattern, '', result, flags=re.MULTILINE)
+    
+    # 模式 4: 清理连续的空行（超过 2 个）
+    result = re.sub(r'\n{4,}', '\n\n\n', result)
+    
+    stats.anchor_lists_removed += removed_count
+    stats.anchor_lines_removed += removed_lines
+    if removed_count > 0:
+        stats.add_rule_match(f"nav-block-strip", removed_count)
+    
+    return result, stats
+
+
+def get_strip_selectors(
+    strip_nav: bool = False,
+    strip_page_toc: bool = False,
+    exclude_selectors: Optional[str] = None,
+) -> List[str]:
+    """
+    根据参数组合生成选择器列表
+    
+    Args:
+        strip_nav: 是否移除导航元素
+        strip_page_toc: 是否移除页内目录
+        exclude_selectors: 自定义选择器（逗号分隔）
+    
+    Returns:
+        选择器列表
+    """
+    selectors: List[str] = []
+    
+    if strip_nav:
+        selectors.extend(DEFAULT_NAV_SELECTORS)
+    
+    if strip_page_toc:
+        selectors.extend(DEFAULT_TOC_SELECTORS)
+    
+    if exclude_selectors:
+        # 解析逗号分隔的自定义选择器
+        custom = [s.strip() for s in exclude_selectors.split(",") if s.strip()]
+        selectors.extend(custom)
+    
+    # 去重但保持顺序
+    seen = set()
+    unique = []
+    for s in selectors:
+        if s not in seen:
+            seen.add(s)
+            unique.append(s)
+    
+    return unique
 
 
 class _TextLenExtractor(HTMLParser):
@@ -1996,6 +2775,162 @@ def extract_title(page_html: str) -> Optional[str]:
     return title or None
 
 
+# ============================================================================
+# JS 反爬检测
+# ============================================================================
+
+@dataclass
+class JSChallengeResult:
+    """JS 反爬检测结果"""
+    is_challenge: bool  # 是否为 JS 挑战页面
+    confidence: str  # "high", "medium", "low"
+    signals: List[str]  # 检测到的信号
+    
+    def get_suggestions(self, url: str) -> List[str]:
+        """根据检测结果生成建议"""
+        return [
+            "1. 在浏览器中打开该 URL，等待页面完全加载",
+            "2. 右键点击页面 → 「另存为」或「存储为」→ 保存为 .html 文件",
+            "3. 使用 --local-html 参数处理本地文件：",
+            f"   python grab_web_to_md.py --local-html saved.html --base-url \"{url}\" --out output.md",
+        ]
+
+
+def detect_js_challenge(html: str, title: Optional[str] = None) -> JSChallengeResult:
+    """
+    检测页面是否为 JS 反爬挑战页面（如 Cloudflare、Akamai 等）。
+    
+    返回 JSChallengeResult，包含是否为挑战页面、置信度和检测到的信号。
+    """
+    signals: List[str] = []
+    
+    # 提取标题（如果未提供）
+    if title is None:
+        title = extract_title(html) or ""
+    title_lower = title.lower()
+    
+    # ------------------------------------------------------------------
+    # 高置信度信号
+    # ------------------------------------------------------------------
+    
+    # Cloudflare 特征
+    if "__cf_chl_opt" in html or "cf-browser-verification" in html:
+        signals.append("发现 Cloudflare 验证特征 (__cf_chl_opt / cf-browser-verification)")
+    
+    if "challenges.cloudflare.com" in html:
+        signals.append("发现 Cloudflare 挑战域名引用")
+    
+    # 标题特征
+    challenge_titles = [
+        ("challenge", "标题包含 'Challenge'"),
+        ("just a moment", "标题包含 'Just a moment'"),
+        ("checking your browser", "标题包含 'Checking your browser'"),
+        ("please wait", "标题包含 'Please wait'"),
+        ("attention required", "标题包含 'Attention Required'"),
+        ("ddos protection", "标题包含 'DDoS Protection'"),
+    ]
+    for keyword, desc in challenge_titles:
+        if keyword in title_lower:
+            signals.append(desc)
+            break
+    
+    # JavaScript 必需提示
+    js_required_patterns = [
+        (r"javascript\s+is\s+(disabled|required)", "页面提示 JavaScript 必需/被禁用"),
+        (r"please\s+(enable|turn\s+on)\s+javascript", "页面提示请启用 JavaScript"),
+        (r"browser.*does\s+not\s+support.*javascript", "页面提示浏览器不支持 JavaScript"),
+    ]
+    html_lower = html.lower()
+    for pattern, desc in js_required_patterns:
+        if re.search(pattern, html_lower):
+            signals.append(desc)
+            break
+    
+    # Akamai Bot Manager
+    if "akamai" in html_lower and ("bot" in html_lower or "challenge" in html_lower):
+        signals.append("发现 Akamai Bot Manager 特征")
+    
+    # PerimeterX
+    if "_pxhd" in html or "perimeterx" in html_lower:
+        signals.append("发现 PerimeterX 反爬特征")
+    
+    # ------------------------------------------------------------------
+    # 中置信度信号：内容极短 + 包含特定关键词
+    # ------------------------------------------------------------------
+    
+    # 计算正文长度（去除 script/style/注释）
+    body_text = re.sub(r"<script[^>]*>.*?</script>", "", html, flags=re.IGNORECASE | re.DOTALL)
+    body_text = re.sub(r"<style[^>]*>.*?</style>", "", body_text, flags=re.IGNORECASE | re.DOTALL)
+    body_text = re.sub(r"<!--.*?-->", "", body_text, flags=re.DOTALL)
+    body_text = re.sub(r"<[^>]+>", " ", body_text)
+    body_text = re.sub(r"\s+", " ", body_text).strip()
+    
+    if len(body_text) < 200:
+        # 内容很短，检查是否有反爬相关词汇
+        short_content_keywords = ["browser", "javascript", "enable", "loading", "redirect", "verify"]
+        found_keywords = [kw for kw in short_content_keywords if kw in body_text.lower()]
+        if found_keywords:
+            signals.append(f"页面正文极短（{len(body_text)} 字符）且包含关键词: {', '.join(found_keywords)}")
+    
+    # <noscript> 中的警告
+    noscript_match = re.search(r"<noscript[^>]*>(.*?)</noscript>", html, re.IGNORECASE | re.DOTALL)
+    if noscript_match:
+        noscript_content = noscript_match.group(1).lower()
+        if "javascript" in noscript_content or "enable" in noscript_content:
+            signals.append("发现 <noscript> 中的 JavaScript 警告")
+    
+    # ------------------------------------------------------------------
+    # 判定结果
+    # ------------------------------------------------------------------
+    
+    if not signals:
+        return JSChallengeResult(is_challenge=False, confidence="none", signals=[])
+    
+    # 根据信号数量和类型判断置信度
+    high_confidence_keywords = ["cloudflare", "akamai", "perimeterx", "challenge", "just a moment"]
+    has_high_signal = any(
+        any(kw in sig.lower() for kw in high_confidence_keywords) 
+        for sig in signals
+    )
+    
+    if has_high_signal or len(signals) >= 2:
+        confidence = "high"
+    elif len(signals) == 1:
+        confidence = "medium"
+    else:
+        confidence = "low"
+    
+    return JSChallengeResult(is_challenge=True, confidence=confidence, signals=signals)
+
+
+def print_js_challenge_warning(result: JSChallengeResult, url: str) -> None:
+    """打印 JS 反爬检测警告信息"""
+    confidence_map = {"high": "高", "medium": "中", "low": "低"}
+    
+    print(file=sys.stderr)
+    print("=" * 70, file=sys.stderr)
+    print(f"⚠️  检测到 JavaScript 反爬保护（置信度：{confidence_map.get(result.confidence, result.confidence)}）", file=sys.stderr)
+    print("=" * 70, file=sys.stderr)
+    print(file=sys.stderr)
+    print("检测到的信号：", file=sys.stderr)
+    for sig in result.signals:
+        print(f"  • {sig}", file=sys.stderr)
+    print(file=sys.stderr)
+    print("说明：", file=sys.stderr)
+    print("  该网站使用了 JavaScript 反爬机制（如 Cloudflare）来验证访问者。", file=sys.stderr)
+    print("  纯 HTTP 请求无法通过此验证，需要浏览器环境执行 JavaScript。", file=sys.stderr)
+    print("  这超出了本工具（仅依赖 requests）的能力范围。", file=sys.stderr)
+    print(file=sys.stderr)
+    print("建议操作：", file=sys.stderr)
+    for suggestion in result.get_suggestions(url):
+        print(f"  {suggestion}", file=sys.stderr)
+    print(file=sys.stderr)
+    print("如果您确定要强制处理当前获取到的内容（可能为空或不完整），", file=sys.stderr)
+    print("请添加 --force 参数。", file=sys.stderr)
+    print("=" * 70, file=sys.stderr)
+    print(file=sys.stderr)
+
+
 class _H1Extractor(HTMLParser):
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
@@ -2100,6 +3035,14 @@ class BatchConfig:
     clean_wiki_noise: bool = False  # 清理 Wiki 系统噪音（编辑按钮、导航链接等）
     download_images: bool = False  # 是否下载图片到本地
     wechat: bool = False  # 微信公众号文章模式
+    # Phase 1: 导航剥离参数
+    strip_nav: bool = False  # 移除导航元素
+    strip_page_toc: bool = False  # 移除页内目录
+    exclude_selectors: Optional[str] = None  # 自定义移除选择器
+    anchor_list_threshold: int = 0  # 连续锚点列表移除阈值，默认 0（关闭）
+    # Phase 2: 智能正文定位参数
+    docs_preset: Optional[str] = None  # 文档框架预设
+    auto_detect: bool = False  # 自动检测框架
 
 
 # ============================================================================
@@ -2553,17 +3496,47 @@ def process_single_url(
         if is_wechat and not target_id and not target_class:
             target_class = "rich_media_content"
         
-        # 提取正文
+        # Phase 2: 自动检测文档框架
+        detected_preset: Optional[str] = None
+        if config.auto_detect and not config.docs_preset:
+            detected_preset, confidence, signals = detect_docs_framework(page_html)
+            if detected_preset and confidence >= 0.5:
+                preset = DOCS_PRESETS.get(detected_preset)
+                if preset:
+                    # 高置信度时应用预设
+                    if not target_id and preset.target_ids:
+                        target_id = ",".join(preset.target_ids)
+                    if not target_class and preset.target_classes:
+                        target_class = ",".join(preset.target_classes)
+        
+        # 提取正文（支持多值 target，T2.1）
         if target_id or target_class:
-            article_html = extract_target_html(
+            # 使用多值提取
+            article_html, matched = extract_target_html_multi(
                 page_html, 
-                target_id=target_id, 
-                target_class=target_class
-            ) or ""
+                target_ids=target_id, 
+                target_classes=target_class
+            )
+            if not article_html:
+                # 回退到单值提取（兼容旧逻辑）
+                article_html = extract_target_html(
+                    page_html,
+                    target_id=target_id.split(",")[0] if target_id else None,
+                    target_class=target_class.split(",")[0] if target_class else None,
+                ) or ""
             if not article_html:
                 article_html = extract_main_html(page_html)
         else:
             article_html = extract_main_html(page_html)
+        
+        # Phase 1: HTML 导航元素剥离（在提取正文后、转换 Markdown 前）
+        strip_selectors = get_strip_selectors(
+            strip_nav=config.strip_nav,
+            strip_page_toc=config.strip_page_toc,
+            exclude_selectors=config.exclude_selectors,
+        )
+        if strip_selectors:
+            article_html, _ = strip_html_elements(article_html, strip_selectors)
         
         # 提取标题（微信模式下优先使用专用提取函数）
         if custom_title:
@@ -2594,6 +3567,10 @@ def process_single_url(
             md_body = clean_wechat_noise(md_body)
         if config.clean_wiki_noise:
             md_body = clean_wiki_noise(md_body)
+        
+        # Phase 1: Markdown 锚点列表剥离
+        if config.anchor_list_threshold > 0:
+            md_body, _ = strip_anchor_lists(md_body, config.anchor_list_threshold)
         
         return BatchPageResult(
             url=url,
@@ -3312,7 +4289,7 @@ def _batch_main(args: argparse.Namespace) -> int:
         # 从文件读取 URL
         if not os.path.isfile(args.urls_file):
             print(f"错误：URL 列表文件不存在：{args.urls_file}", file=sys.stderr)
-            return 1
+            return EXIT_ERROR
         urls = read_urls_file(args.urls_file)
         print(f"从文件加载了 {len(urls)} 个 URL")
     
@@ -3320,7 +4297,7 @@ def _batch_main(args: argparse.Namespace) -> int:
         # 从索引页爬取链接
         if not args.url:
             print("错误：爬取模式需要提供索引页 URL", file=sys.stderr)
-            return 1
+            return EXIT_ERROR
         
         source_url = args.url
         print(f"正在从索引页提取链接：{args.url}")
@@ -3334,7 +4311,7 @@ def _batch_main(args: argparse.Namespace) -> int:
             )
         except Exception as e:
             print(f"错误：无法获取索引页：{e}", file=sys.stderr)
-            return 1
+            return EXIT_ERROR
         
         # 提取链接
         links = extract_links_from_html(
@@ -3355,7 +4332,7 @@ def _batch_main(args: argparse.Namespace) -> int:
     
     if not urls:
         print("错误：没有要处理的 URL", file=sys.stderr)
-        return 1
+        return EXIT_ERROR
     
     # 显示 URL 列表预览
     print("\n即将处理的 URL 列表：")
@@ -3382,7 +4359,50 @@ def _batch_main(args: argparse.Namespace) -> int:
         clean_wiki_noise=args.clean_wiki_noise,
         download_images=args.download_images,
         wechat=args.wechat,
+        # Phase 1: 导航剥离参数
+        strip_nav=args.strip_nav,
+        strip_page_toc=args.strip_page_toc,
+        exclude_selectors=args.exclude_selectors,
+        anchor_list_threshold=args.anchor_list_threshold,
+        # Phase 2: 智能正文定位参数
+        docs_preset=args.docs_preset,
+        auto_detect=args.auto_detect,
     )
+    
+    # Phase 2: 应用文档框架预设
+    if args.docs_preset:
+        preset = DOCS_PRESETS.get(args.docs_preset)
+        if preset:
+            print(f"\n📦 使用文档框架预设：{preset.name} ({preset.description})")
+            # 应用预设的 target 配置
+            if not config.target_id and preset.target_ids:
+                config.target_id = ",".join(preset.target_ids)
+            if not config.target_class and preset.target_classes:
+                config.target_class = ",".join(preset.target_classes)
+            # 合并预设的 exclude_selectors
+            preset_excludes = ",".join(preset.exclude_selectors)
+            if config.exclude_selectors:
+                config.exclude_selectors = f"{config.exclude_selectors},{preset_excludes}"
+            else:
+                config.exclude_selectors = preset_excludes
+            # 自动启用导航剥离
+            config.strip_nav = True
+            config.strip_page_toc = True
+            # 预设模式下，如果用户未显式设置 anchor_list_threshold，则自动启用（默认 10）
+            if args.anchor_list_threshold == 0:
+                config.anchor_list_threshold = 10
+            print(f"  • 正文容器 ID：{config.target_id or '(未设置)'}")
+            print(f"  • 正文容器 class：{config.target_class or '(未设置)'}")
+            print(f"  • 排除选择器：{len(preset.exclude_selectors)} 个")
+            if config.anchor_list_threshold > 0:
+                print(f"  • 锚点列表阈值：{config.anchor_list_threshold} 行")
+    
+    # Phase 1: 打印导航剥离配置
+    if args.strip_nav or args.strip_page_toc or args.exclude_selectors:
+        selectors = get_strip_selectors(args.strip_nav, args.strip_page_toc, args.exclude_selectors)
+        print(f"启用导航剥离：{len(selectors)} 个选择器")
+        if args.anchor_list_threshold > 0:
+            print(f"锚点列表移除阈值：{args.anchor_list_threshold} 行")
     
     # 进度回调
     def progress_callback(current: int, total: int, url: str) -> None:
@@ -3401,12 +4421,26 @@ def _batch_main(args: argparse.Namespace) -> int:
         )
     except RuntimeError as e:
         print(f"\n错误：{e}", file=sys.stderr)
-        return 1
+        return EXIT_ERROR
     
     # 统计结果
     success_count = len([r for r in results if r.success])
     fail_count = len(results) - success_count
     print(f"\n处理完成：成功 {success_count}，失败 {fail_count}")
+    
+    # Phase 1: 导航剥离统计（T1.5 可观测性）
+    if args.strip_nav or args.strip_page_toc or args.exclude_selectors:
+        selectors = get_strip_selectors(args.strip_nav, args.strip_page_toc, args.exclude_selectors)
+        print(f"\n📊 导航剥离已生效：")
+        print(f"  • 应用选择器：{len(selectors)} 个")
+        if args.strip_nav:
+            print(f"  • --strip-nav: 移除导航元素（nav/aside/.sidebar 等）")
+        if args.strip_page_toc:
+            print(f"  • --strip-page-toc: 移除页内目录（.toc/.on-this-page 等）")
+        if args.exclude_selectors:
+            print(f"  • --exclude-selectors: {args.exclude_selectors}")
+        if args.anchor_list_threshold > 0:
+            print(f"  • 锚点列表阈值：>{args.anchor_list_threshold} 行自动移除")
     
     # 下载图片（如果启用）
     url_to_local: Dict[str, str] = {}
@@ -3463,7 +4497,7 @@ def _batch_main(args: argparse.Namespace) -> int:
         # 检查是否已存在
         if os.path.exists(output_file) and not args.overwrite:
             print(f"文件已存在：{output_file}（如需覆盖请加 --overwrite）", file=sys.stderr)
-            return 2
+            return EXIT_FILE_EXISTS
         
         # 来源 URL 优先级：--source-url > 爬取模式的索引页 > None（提取域名）
         final_source_url = args.source_url or source_url
@@ -3544,7 +4578,7 @@ def _batch_main(args: argparse.Namespace) -> int:
                 print(f"  - {result.url}")
                 print(f"    错误：{result.error}")
     
-    return 0
+    return EXIT_SUCCESS
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -3578,6 +4612,10 @@ urls.txt 文件格式：
     ap.add_argument("--best-effort-images", action="store_true", help="图片下载失败时仅警告并跳过（默认失败即退出）")
     ap.add_argument("--overwrite", action="store_true", help="允许覆盖已存在的 md 文件")
     ap.add_argument("--validate", action="store_true", help="生成后执行校验并输出结果")
+    # JS 反爬处理
+    ap.add_argument("--local-html", metavar="FILE", help="从本地 HTML 文件读取内容（跳过网络请求，用于处理浏览器保存的页面）")
+    ap.add_argument("--base-url", help="配合 --local-html 使用，指定图片下载的基准 URL")
+    ap.add_argument("--force", action="store_true", help="检测到 JS 反爬时仍强制继续处理（内容可能为空或不完整）")
     ap.add_argument(
         "--max-image-bytes",
         type=int,
@@ -3637,6 +4675,27 @@ urls.txt 文件格式：
                     help="微信公众号文章模式：自动提取 rich_media_content 正文并清理交互按钮噪音。"
                          "如不指定，脚本会自动检测 mp.weixin.qq.com 链接并启用此模式")
     
+    # ========== 导航/目录剥离参数（Phase 1）==========
+    nav_group = ap.add_argument_group("导航剥离参数（Docs/Wiki 站点优化）")
+    nav_group.add_argument("--strip-nav", action="store_true",
+                           help="移除导航元素（nav/aside/.sidebar 等），适用于 docs 站点批量导出")
+    nav_group.add_argument("--strip-page-toc", action="store_true",
+                           help="移除页内目录（.toc/.on-this-page 等）")
+    nav_group.add_argument("--exclude-selectors",
+                           help="自定义移除的元素选择器（逗号分隔），支持：tag/.class/#id/[attr=val]")
+    nav_group.add_argument("--anchor-list-threshold", type=int, default=0,
+                           help="连续锚点列表移除阈值（默认 0 关闭），建议与 --strip-nav 配合使用，推荐值 10-20")
+    
+    # ========== 智能正文定位参数（Phase 2）==========
+    smart_group = ap.add_argument_group("智能正文定位参数（Phase 2）")
+    smart_group.add_argument("--docs-preset", choices=get_available_presets(),
+                             help="使用文档框架预设（自动配置 target 和 exclude）：" + 
+                                  ", ".join(get_available_presets()))
+    smart_group.add_argument("--auto-detect", action="store_true",
+                             help="自动检测文档框架并应用预设（高置信度时）")
+    smart_group.add_argument("--list-presets", action="store_true",
+                             help="列出所有可用的文档框架预设")
+    
     # ========== 批量处理参数 ==========
     batch_group = ap.add_argument_group("批量处理参数")
     batch_group.add_argument("--urls-file", help="从文件读取 URL 列表（每行一个，支持 # 注释和 URL|标题 格式）")
@@ -3668,6 +4727,18 @@ urls.txt 文件格式：
     
     args = ap.parse_args(argv)
     
+    # ========== 列出预设 ==========
+    if args.list_presets:
+        print("\n📦 可用的文档框架预设：\n")
+        for name, preset in DOCS_PRESETS.items():
+            print(f"  {name:15} - {preset.description}")
+            print(f"                   正文 ID: {', '.join(preset.target_ids) or '(无)'}")
+            print(f"                   正文 class: {', '.join(preset.target_classes[:3]) or '(无)'}{'...' if len(preset.target_classes) > 3 else ''}")
+            print(f"                   排除选择器: {len(preset.exclude_selectors)} 个")
+            print()
+        print("使用示例：python grab_web_to_md.py URL --docs-preset mintlify")
+        return EXIT_SUCCESS
+    
     # ========== 批量处理模式 ==========
     is_batch_mode = bool(args.urls_file or args.crawl)
     
@@ -3675,11 +4746,35 @@ urls.txt 文件格式：
         return _batch_main(args)
     
     # ========== 单页处理模式（原有逻辑） ==========
-    if not args.url:
-        ap.error("单页模式必须提供 URL 参数，或使用 --urls-file / --crawl 进入批量模式")
-
-    url = args.url
-    base = args.out or (_default_basename(url) + ".md")
+    
+    # 支持 --local-html 模式（从本地文件读取，跳过网络请求）
+    if args.local_html:
+        if not os.path.isfile(args.local_html):
+            print(f"错误：本地 HTML 文件不存在：{args.local_html}", file=sys.stderr)
+            return EXIT_ERROR
+        
+        # --local-html 模式下，url 参数可选，用于图片下载；优先使用 --base-url
+        url = args.base_url or args.url or ""
+        if not url:
+            print("警告：未指定 --base-url 或 url，图片将无法下载（仅保留原始引用）", file=sys.stderr)
+        
+        with open(args.local_html, "r", encoding="utf-8", errors="replace") as f:
+            page_html = f.read()
+        print(f"从本地文件读取：{args.local_html}")
+        
+        # 输出文件名
+        if args.out:
+            base = args.out
+        else:
+            base = os.path.splitext(os.path.basename(args.local_html))[0] + ".md"
+    else:
+        # 网络模式：必须提供 URL
+        if not args.url:
+            ap.error("单页模式必须提供 URL 参数，或使用 --urls-file / --crawl 进入批量模式，或使用 --local-html 读取本地文件")
+        
+        url = args.url
+        base = args.out or (_default_basename(url) + ".md")
+    
     out_md = base
     # 检查输出文件路径长度
     md_dir = os.path.dirname(out_md) or "."
@@ -3691,16 +4786,26 @@ urls.txt 文件格式：
 
     if os.path.exists(out_md) and not args.overwrite:
         print(f"文件已存在：{out_md}（如需覆盖请加 --overwrite）", file=sys.stderr)
-        return 2
+        return EXIT_FILE_EXISTS
 
     session = _create_session(args, referer_url=url)
 
-    print(f"下载页面：{url}")
-    page_html = fetch_html(session=session, url=url, timeout_s=args.timeout, retries=args.retries)
+    # 网络模式下下载页面
+    if not args.local_html:
+        print(f"下载页面：{url}")
+        page_html = fetch_html(session=session, url=url, timeout_s=args.timeout, retries=args.retries)
+        
+        # ====== JS 反爬检测 ======
+        js_detection = detect_js_challenge(page_html)
+        if js_detection.is_challenge:
+            print_js_challenge_warning(js_detection, url)
+            if not args.force:
+                return EXIT_JS_CHALLENGE
+            print("已添加 --force 参数，强制继续处理...", file=sys.stderr)
 
     # 微信公众号文章自动检测
     is_wechat = args.wechat
-    if not is_wechat and is_wechat_article_url(url):
+    if url and not is_wechat and is_wechat_article_url(url):
         is_wechat = True
         print("检测到微信公众号文章，自动启用微信模式")
     elif not is_wechat and is_wechat_article_html(page_html):
@@ -3723,6 +4828,17 @@ urls.txt 文件格式：
             article_html = extract_main_html(page_html)
     else:
         article_html = extract_main_html(page_html)
+
+    # 单页模式：应用导航剥离（Phase 1）
+    strip_selectors = get_strip_selectors(
+        strip_nav=args.strip_nav,
+        strip_page_toc=args.strip_page_toc,
+        exclude_selectors=args.exclude_selectors,
+    )
+    if strip_selectors:
+        article_html, strip_stats = strip_html_elements(article_html, strip_selectors)
+        if strip_stats.elements_removed > 0:
+            print(f"已移除 {strip_stats.elements_removed} 个导航元素")
 
     if args.spa_warn_len and html_text_len(article_html) < args.spa_warn_len:
         print(
@@ -3769,6 +4885,12 @@ urls.txt 文件格式：
     if is_wechat:
         md_body = clean_wechat_noise(md_body)
         print("已清理微信公众号 UI 噪音")
+
+    # 单页模式：锚点列表剥离（Phase 1）
+    if args.anchor_list_threshold > 0:
+        md_body, anchor_stats = strip_anchor_lists(md_body, args.anchor_list_threshold)
+        if anchor_stats.anchor_lists_removed > 0:
+            print(f"已移除 {anchor_stats.anchor_lists_removed} 个锚点列表块（共 {anchor_stats.anchor_lines_removed} 行）")
 
     # 解析 tags 参数
     tags: Optional[List[str]] = None
@@ -3846,11 +4968,11 @@ urls.txt 文件格式：
             print("- 缺失文件：")
             for m in result.missing_files:
                 print(f"  - {m}")
-            return 3
+            return EXIT_VALIDATION_FAILED
         else:
             print("- 缺失文件：0")
 
-    return 0
+    return EXIT_SUCCESS
 
 
 if __name__ == "__main__":

@@ -71,12 +71,37 @@ pip install requests
 
 | 参数 | 说明 | 默认值 |
 |------|------|--------|
-| `--target-id` | 正文容器 id | - |
-| `--target-class` | 正文容器 class | - |
+| `--target-id` | 正文容器 id（支持逗号分隔多值，按优先级尝试） | - |
+| `--target-class` | 正文容器 class（支持逗号分隔多值） | - |
 | `--keep-html` | 复杂表格保留 HTML | `False` |
 | `--spa-warn-len` | SPA 警告阈值 | `500` |
 | `--clean-wiki-noise` | 清理 Wiki 噪音 | `False` |
 | `--wechat` | 微信模式 | 自动 |
+
+### 导航剥离参数（Docs/Wiki 站点优化）
+
+| 参数 | 说明 | 默认值 |
+|------|------|--------|
+| `--strip-nav` | 移除导航元素（nav/aside/.sidebar 等） | `False` |
+| `--strip-page-toc` | 移除页内目录（.toc/.on-this-page 等） | `False` |
+| `--exclude-selectors` | 自定义移除选择器（逗号分隔，简化 CSS 语法） | - |
+| `--anchor-list-threshold` | 连续锚点列表移除阈值（默认 0 关闭，预设模式自动 10） | `0` |
+| `--docs-preset` | 文档框架预设（见下表） | - |
+| `--auto-detect` | 自动检测框架并应用预设 | `False` |
+| `--list-presets` | 列出所有可用预设 | - |
+
+**支持的文档框架预设**：
+
+| 预设名称 | 适用站点 |
+|----------|----------|
+| `mintlify` | Mintlify 文档（如 OpenClaw） |
+| `docusaurus` | Docusaurus 文档 |
+| `gitbook` | GitBook 文档 |
+| `vuepress` | VuePress 文档 |
+| `mkdocs` | MkDocs / Material for MkDocs |
+| `readthedocs` | Read the Docs |
+| `sphinx` | Sphinx 文档 |
+| `generic` | 通用文档站点 |
 
 ### 批量处理参数
 
@@ -223,6 +248,43 @@ python scripts/grab_web_to_md.py "URL" --wechat
 
 **自动处理**：提取 `rich_media_content`、标题从 `og:title` 获取、清理交互按钮
 
+### 场景 8：Docs 站点导出（新增）
+
+```bash
+# 使用预设导出 Mintlify 文档
+python scripts/grab_web_to_md.py "https://docs.example.com/" \
+  --crawl \
+  --merge --toc \
+  --docs-preset mintlify \
+  --merge-output docs.md \
+  --download-images
+
+# 手动配置导航剥离
+python scripts/grab_web_to_md.py "https://docs.example.com/" \
+  --crawl \
+  --merge --toc \
+  --strip-nav \
+  --strip-page-toc \
+  --anchor-list-threshold 15 \
+  --merge-output docs.md
+
+# 自动检测框架
+python scripts/grab_web_to_md.py "https://docs.example.com/" \
+  --crawl \
+  --merge --toc \
+  --auto-detect \
+  --merge-output docs.md
+
+# 查看可用预设
+python scripts/grab_web_to_md.py --list-presets
+```
+
+**预设优势**：
+- 自动配置正文容器（如 `article`、`main`）
+- 自动排除导航选择器
+- 自动启用锚点列表剥离（阈值=10）
+- 对 docs 站点可减少 50%+ 输出大小
+
 ### 场景 7：数据安全与隐私
 
 ```bash
@@ -340,6 +402,22 @@ merged.md  # 含目录
 ---
 
 ## 更新日志
+
+### v1.5.0 (2026-02-02)
+- ✨ **导航剥离功能**：
+  - 新增 `--strip-nav` 移除侧边栏/导航元素
+  - 新增 `--strip-page-toc` 移除页内目录
+  - 新增 `--exclude-selectors` 自定义移除选择器
+  - 新增 `--anchor-list-threshold` 连续链接列表移除
+- ✨ **文档框架预设**：
+  - 新增 `--docs-preset` 支持 8 种框架（mintlify/docusaurus/gitbook 等）
+  - 新增 `--auto-detect` 自动检测框架
+  - 新增 `--list-presets` 列出可用预设
+- ✨ **多值 target 支持**：`--target-id/--target-class` 支持逗号分隔多值
+- 🐛 **Bug 修复**：
+  - 修复单页模式 `--strip-nav` 等参数不生效的问题
+  - 修复 `--anchor-list-threshold` 阈值语义不一致的问题
+  - 批量模式默认不再启用锚点剥离（需显式启用或使用预设）
 
 ### v1.4.0 (2026-01-26)
 - 🔒 **安全加固**：

@@ -12,6 +12,8 @@
 - ✅ **反爬支持**：Cookie/Header/UA 定制
 - ✅ **YAML Frontmatter**：兼容 Obsidian/Hugo/Jekyll
 - ✅ **数据安全**：URL 脱敏、跨域凭据隔离、流式下载防 OOM
+- ✅ **导航剥离**：自动移除侧边栏/页内目录，支持 8 种文档框架预设
+- ✅ **框架识别**：自动检测 Docusaurus/Mintlify/GitBook 等站点模板
 
 ## 安装到 Claude Code
 
@@ -49,13 +51,28 @@ python skills/webpage-to-md/scripts/grab_web_to_md.py "https://wiki.example.com/
   --merge --toc --merge-output wiki.md
 ```
 
-## 三种典型使用场景
+## 四种典型使用场景
 
 | 场景 | 说明 |
 |------|------|
 | **微信公众号** | 自动检测 mp.weixin.qq.com，清理交互按钮噪音 |
 | **技术博客** | `--keep-html --tags` 保留代码块和复杂表格 |
 | **Wiki 批量** | `--crawl --merge --clean-wiki-noise` 爬取合并 |
+| **Docs 站点** | `--docs-preset mintlify` 一键导出，自动剥离导航 |
+
+### Docs 站点导出示例
+
+```bash
+# 使用预设导出 Mintlify 文档站点（如 OpenClaw）
+python skills/webpage-to-md/scripts/grab_web_to_md.py "https://docs.example.com/" \
+  --crawl \
+  --merge --toc \
+  --docs-preset mintlify \
+  --merge-output docs-export.md
+
+# 支持的预设：mintlify, docusaurus, gitbook, vuepress, mkdocs, readthedocs, sphinx, generic
+python skills/webpage-to-md/scripts/grab_web_to_md.py --list-presets
+```
 
 ## 常用参数
 
@@ -65,12 +82,15 @@ python skills/webpage-to-md/scripts/grab_web_to_md.py "https://wiki.example.com/
 | `--validate` | 校验图片完整性 |
 | `--keep-html` | 复杂表格保留 HTML |
 | `--tags` | YAML Frontmatter 标签 |
-| `--target-id` / `--target-class` | 指定正文容器 |
+| `--target-id` / `--target-class` | 指定正文容器（支持逗号分隔多值） |
 | `--crawl` | 启用爬取模式 |
 | `--merge --toc` | 合并输出并生成目录 |
 | `--download-images` | 下载图片到本地 |
 | `--clean-wiki-noise` | 清理 Wiki 系统噪音 |
 | `--rewrite-links` | 站内链接改写为锚点 |
+| `--docs-preset` | 文档框架预设（mintlify/docusaurus/gitbook 等） |
+| `--strip-nav` | 移除导航元素（侧边栏等） |
+| `--strip-page-toc` | 移除页内目录 |
 
 ## 数据安全
 
