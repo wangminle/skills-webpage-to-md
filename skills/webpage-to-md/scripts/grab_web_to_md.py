@@ -880,6 +880,16 @@ class _SimpleSelectorMatcher:
                 self.attr_name, self.attr_value = inner.split("=", 1)
             else:
                 self.attr_name = inner
+            # Bug fix: 去除属性名和属性值两侧的空白和引号
+            if self.attr_name:
+                self.attr_name = self.attr_name.strip()
+            if self.attr_value:
+                self.attr_value = self.attr_value.strip()
+                # 去除成对的单引号或双引号
+                if len(self.attr_value) >= 2:
+                    if (self.attr_value[0] == '"' and self.attr_value[-1] == '"') or \
+                       (self.attr_value[0] == "'" and self.attr_value[-1] == "'"):
+                        self.attr_value = self.attr_value[1:-1]
         else:
             # tag name
             self.tag = s.lower()
@@ -932,6 +942,15 @@ class _HTMLElementStripper(HTMLParser):
     移除匹配指定选择器的 HTML 元素及其内容。
     """
     
+    # HTML5 void elements - 这些标签没有闭合标签
+    # https://html.spec.whatwg.org/multipage/syntax.html#void-elements
+    VOID_ELEMENTS = frozenset({
+        "area", "base", "br", "col", "embed", "hr", "img", "input",
+        "link", "meta", "param", "source", "track", "wbr",
+        # 已废弃但仍常见
+        "command", "keygen", "menuitem",
+    })
+    
     def __init__(self, selectors: List[str]):
         super().__init__(convert_charrefs=True)
         self.matchers = [_SimpleSelectorMatcher(s) for s in selectors if s.strip()]
@@ -964,12 +983,19 @@ class _HTMLElementStripper(HTMLParser):
         
         if self.skip_depth > 0:
             # 已经在跳过的元素内部
-            self.skip_depth += 1
+            # Bug fix: void 标签没有 endtag，不应递增深度计数
+            if tag not in self.VOID_ELEMENTS:
+                self.skip_depth += 1
             return
         
         matched = self._should_skip(tag, attrs)
         if matched:
             # 开始跳过
+            # Bug fix: 如果匹配的是 void 标签，直接移除不需要深度计数
+            if tag in self.VOID_ELEMENTS:
+                self.stats.elements_removed += 1
+                self.stats.add_rule_match(matched)
+                return
             self.skip_depth = 1
             self.skip_tag = tag
             self.stats.elements_removed += 1
@@ -3464,6 +3490,129 @@ def _make_anchor_id(text: str) -> str:
     return anchor.strip("-") or "section"
 
 
+# ============================================================================
+# Phase 3-A: 锚点冲突检测与修复
+# ============================================================================
+
+@dataclass
+class AnchorCollisionStats:
+    """锚点冲突统计信息"""
+    total_anchors: int = 0
+    unique_anchors: int = 0
+    collision_count: int = 0  # 发生冲突的锚点数量
+    collision_examples: List[Tuple[str, int]] = field(default_factory=list)  # (原始锚点, 重复次数)
+    
+    @property
+    def has_collisions(self) -> bool:
+        return self.collision_count > 0
+    
+    def print_summary(self, file=None, max_examples: int = 5) -> None:
+        """打印统计摘要"""
+        if file is None:
+            file = sys.stderr
+        if not self.has_collisions:
+            return
+        print(f"\n⚠️  锚点冲突检测：", file=file)
+        print(f"  • 总锚点数：{self.total_anchors}", file=file)
+        print(f"  • 唯一锚点：{self.unique_anchors}", file=file)
+        print(f"  • 冲突锚点：{self.collision_count} 个（已自动修复）", file=file)
+        if self.collision_examples:
+            print(f"  • 冲突示例（显示前 {min(len(self.collision_examples), max_examples)} 个）：", file=file)
+            for anchor, count in self.collision_examples[:max_examples]:
+                print(f"    - #{anchor} → #{anchor}, #{anchor}-2, ... #{anchor}-{count}", file=file)
+
+
+class AnchorManager:
+    """
+    锚点管理器 - 负责锚点生成、冲突检测与去重（Phase 3-A）
+    
+    使用方式：
+    1. 创建实例
+    2. 对每个标题调用 register(title) 获取去重后的锚点
+    3. 调用 get_stats() 获取冲突统计
+    
+    示例：
+        manager = AnchorManager()
+        anchor1 = manager.register("Introduction")  # -> "introduction"
+        anchor2 = manager.register("Introduction")  # -> "introduction-2"
+        anchor3 = manager.register("Introduction")  # -> "introduction-3"
+    """
+    
+    def __init__(self):
+        self._anchor_counts: Dict[str, int] = {}  # 基础锚点 -> 已使用次数
+        self._title_to_anchor: Dict[str, str] = {}  # 原始标题 -> 分配的锚点（仅第一次）
+        self._all_anchors: List[str] = []  # 所有生成的锚点（按顺序）
+        self._collisions: Dict[str, int] = {}  # 发生冲突的基础锚点 -> 总次数
+    
+    def register(self, title: str, url: Optional[str] = None) -> str:
+        """
+        注册标题并返回去重后的锚点 ID
+        
+        Args:
+            title: 标题文本
+            url: 可选的页面 URL（用于更精确的去重，暂未使用）
+        
+        Returns:
+            去重后的锚点 ID（如 "introduction" 或 "introduction-2"）
+        """
+        base_anchor = _make_anchor_id(title)
+        
+        if base_anchor not in self._anchor_counts:
+            # 首次出现，直接使用
+            self._anchor_counts[base_anchor] = 1
+            self._all_anchors.append(base_anchor)
+            return base_anchor
+        else:
+            # 已存在，需要添加后缀
+            count = self._anchor_counts[base_anchor] + 1
+            self._anchor_counts[base_anchor] = count
+            
+            # 记录冲突
+            if base_anchor not in self._collisions:
+                self._collisions[base_anchor] = 2  # 第一次冲突时，已经有 2 个
+            else:
+                self._collisions[base_anchor] = count
+            
+            unique_anchor = f"{base_anchor}-{count}"
+            self._all_anchors.append(unique_anchor)
+            return unique_anchor
+    
+    def get_anchor_for_title(self, title: str) -> Optional[str]:
+        """
+        获取已注册标题的锚点（不注册新的）
+        
+        注意：此方法用于查询，不会创建新锚点
+        """
+        base_anchor = _make_anchor_id(title)
+        if base_anchor in self._anchor_counts:
+            return base_anchor
+        return None
+    
+    def get_stats(self) -> AnchorCollisionStats:
+        """获取锚点冲突统计信息"""
+        stats = AnchorCollisionStats(
+            total_anchors=len(self._all_anchors),
+            unique_anchors=len(self._anchor_counts),
+            collision_count=len(self._collisions),
+        )
+        
+        # 按冲突次数排序，取前 10 个作为示例
+        sorted_collisions = sorted(
+            self._collisions.items(),
+            key=lambda x: -x[1]
+        )
+        stats.collision_examples = sorted_collisions[:10]
+        
+        return stats
+    
+    def reset(self) -> None:
+        """重置管理器状态"""
+        self._anchor_counts.clear()
+        self._title_to_anchor.clear()
+        self._all_anchors.clear()
+        self._collisions.clear()
+
+
 def process_single_url(
     session: requests.Session,
     url: str,
@@ -3900,6 +4049,56 @@ def build_url_to_anchor_map(results: List[BatchPageResult]) -> Dict[str, str]:
     return url_to_anchor
 
 
+def build_url_to_anchor_map_with_manager(
+    results: List[BatchPageResult],
+    result_anchors: List[Tuple[BatchPageResult, str]],
+) -> Dict[str, str]:
+    """
+    构建 URL 到锚点 ID 的映射表（使用 AnchorManager 生成的去重锚点）
+    
+    Phase 3-A: 此函数使用预先注册的去重锚点，确保链接改写时指向正确的锚点。
+    
+    Args:
+        results: 批量处理结果列表
+        result_anchors: (result, anchor) 对列表，包含去重后的锚点
+    
+    Returns:
+        URL -> 锚点 ID 的映射字典
+    """
+    url_to_anchor: Dict[str, str] = {}
+    
+    for result, anchor in result_anchors:
+        if not result.success or not anchor:
+            continue
+        
+        # 添加原始 URL
+        url_to_anchor[result.url] = anchor
+        
+        # 添加常见的 URL 变体（带/不带端口、编码变体等）
+        parsed = urlparse(result.url)
+        
+        # 不带端口的版本
+        if parsed.port:
+            no_port_url = f"{parsed.scheme}://{parsed.hostname}{parsed.path}"
+            if parsed.query:
+                no_port_url += f"?{parsed.query}"
+            url_to_anchor[no_port_url] = anchor
+        
+        # 带默认端口的版本
+        if parsed.scheme == "https" and not parsed.port:
+            with_port = f"{parsed.scheme}://{parsed.hostname}:443{parsed.path}"
+            if parsed.query:
+                with_port += f"?{parsed.query}"
+            url_to_anchor[with_port] = anchor
+        elif parsed.scheme == "http" and not parsed.port:
+            with_port = f"{parsed.scheme}://{parsed.hostname}:80{parsed.path}"
+            if parsed.query:
+                with_port += f"?{parsed.query}"
+            url_to_anchor[with_port] = anchor
+    
+    return url_to_anchor
+
+
 def rewrite_internal_links(md_content: str, url_to_anchor: Dict[str, str]) -> Tuple[str, int]:
     """
     将 Markdown 中的外部链接改写为内部锚点链接
@@ -3956,7 +4155,7 @@ def generate_merged_markdown(
     rewrite_links: bool = False,
     show_source_summary: bool = True,
     redact_urls: bool = True,
-) -> str:
+) -> Tuple[str, AnchorCollisionStats]:
     """
     将多个页面结果合并为单个 Markdown 文档
     
@@ -3969,15 +4168,27 @@ def generate_merged_markdown(
         show_source_summary: 是否显示来源信息汇总
     
     Returns:
-        合并后的 Markdown 内容
+        (合并后的 Markdown 内容, 锚点冲突统计)
     """
     parts: List[str] = []
     
-    # 构建 URL 到锚点的映射（用于链接改写）
+    # Phase 3-A: 使用 AnchorManager 进行锚点去重
+    anchor_manager = AnchorManager()
+    
+    # 先为所有结果注册锚点（确保目录和内容使用相同的锚点）
+    result_anchors: List[Tuple[BatchPageResult, str]] = []
+    for result in results:
+        if result.success:
+            anchor = anchor_manager.register(result.title, result.url)
+        else:
+            anchor = ""  # 失败的结果不需要锚点
+        result_anchors.append((result, anchor))
+    
+    # 构建 URL 到锚点的映射（用于链接改写）- 使用去重后的锚点
     url_to_anchor: Dict[str, str] = {}
     total_rewrite_count = 0
     if rewrite_links:
-        url_to_anchor = build_url_to_anchor_map(results)
+        url_to_anchor = build_url_to_anchor_map_with_manager(results, result_anchors)
     
     # 生成 frontmatter
     date_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -4015,13 +4226,12 @@ def generate_merged_markdown(
             parts.append("---")
             parts.append("")
     
-    # 生成目录
+    # 生成目录（使用预先注册的去重锚点）
     if include_toc:
         parts.append("## 目录")
         parts.append("")
-        for i, result in enumerate(results, 1):
+        for i, (result, anchor) in enumerate(result_anchors, 1):
             if result.success:
-                anchor = _make_anchor_id(result.title)
                 parts.append(f"{i}. [{result.title}](#{anchor})")
             else:
                 parts.append(f"{i}. ~~{result.title}~~ (获取失败)")
@@ -4029,8 +4239,8 @@ def generate_merged_markdown(
         parts.append("---")
         parts.append("")
     
-    # 添加各页面内容
-    for result in results:
+    # 添加各页面内容（使用预先注册的去重锚点）
+    for result, anchor in result_anchors:
         if not result.success:
             parts.append(f"## {result.title}")
             parts.append("")
@@ -4043,8 +4253,7 @@ def generate_merged_markdown(
             parts.append("")
             continue
         
-        # 页面标题（使用 ## 作为二级标题）
-        anchor = _make_anchor_id(result.title)
+        # 页面标题（使用 ## 作为二级标题）- 使用去重后的锚点
         parts.append(f'<a id="{anchor}"></a>')
         parts.append("")
         parts.append(f"## {result.title}")
@@ -4073,7 +4282,10 @@ def generate_merged_markdown(
         parts.append("")
         parts.append(f"<!-- 站内链接改写：共 {total_rewrite_count} 处 -->")
     
-    return "\n".join(parts)
+    # 获取锚点冲突统计
+    anchor_stats = anchor_manager.get_stats()
+    
+    return "\n".join(parts), anchor_stats
 
 
 def generate_index_markdown(
@@ -4352,7 +4564,7 @@ def _batch_main(args: argparse.Namespace) -> int:
         skip_errors=args.skip_errors,
         timeout=args.timeout,
         retries=args.retries,
-        best_effort_images=True,
+        best_effort_images=args.best_effort_images,  # Bug fix: 使用用户参数而非硬编码
         keep_html=args.keep_html,
         target_id=args.target_id,
         target_class=args.target_class,
@@ -4502,7 +4714,7 @@ def _batch_main(args: argparse.Namespace) -> int:
         # 来源 URL 优先级：--source-url > 爬取模式的索引页 > None（提取域名）
         final_source_url = args.source_url or source_url
         
-        merged_content = generate_merged_markdown(
+        merged_content, anchor_stats = generate_merged_markdown(
             results=results,
             include_toc=args.toc,
             main_title=args.merge_title or args.title,
@@ -4517,6 +4729,13 @@ def _batch_main(args: argparse.Namespace) -> int:
         
         print(f"\n已生成合并文档：{output_file}")
         print(f"文档大小：{len(merged_content):,} 字符")
+        
+        # Phase 3-A: 输出锚点冲突统计
+        if anchor_stats.has_collisions:
+            if hasattr(args, 'warn_anchor_collisions') and args.warn_anchor_collisions:
+                anchor_stats.print_summary()
+            else:
+                print(f"📌 锚点冲突：{anchor_stats.collision_count} 个已自动修复（使用 --warn-anchor-collisions 查看详情）")
         if url_to_local:
             assets_dir = os.path.splitext(output_file)[0] + ".assets"
             # 清理未引用的图片文件
@@ -4717,6 +4936,8 @@ urls.txt 文件格式：
                              help="将站内链接改写为文档内锚点（仅合并模式有效）")
     merge_group.add_argument("--no-source-summary", action="store_true",
                              help="不在文档开头显示来源信息汇总")
+    merge_group.add_argument("--warn-anchor-collisions", action="store_true",
+                             help="显示锚点冲突详情（同名标题自动添加后缀 -2, -3...）")
     
     # 爬取模式参数
     crawl_group = ap.add_argument_group("爬取模式参数")
@@ -4815,25 +5036,83 @@ urls.txt 文件格式：
     # 确定正文提取策略
     target_id = args.target_id
     target_class = args.target_class
+    exclude_selectors = args.exclude_selectors
+    strip_nav = args.strip_nav
+    strip_page_toc = args.strip_page_toc
+    anchor_list_threshold = args.anchor_list_threshold
+    
+    # 单页模式：应用 docs-preset（Phase 2）
+    if hasattr(args, 'docs_preset') and args.docs_preset:
+        preset = DOCS_PRESETS.get(args.docs_preset)
+        if preset:
+            print(f"📦 使用文档框架预设：{preset.name} ({preset.description})")
+            # 应用预设的 target 配置（仅当用户未指定时）
+            if not target_id and preset.target_ids:
+                target_id = ",".join(preset.target_ids)
+            if not target_class and preset.target_classes:
+                target_class = ",".join(preset.target_classes)
+            # 合并预设的 exclude_selectors
+            preset_excludes = ",".join(preset.exclude_selectors)
+            if exclude_selectors:
+                exclude_selectors = f"{exclude_selectors},{preset_excludes}"
+            else:
+                exclude_selectors = preset_excludes
+            # 自动启用导航剥离
+            strip_nav = True
+            strip_page_toc = True
+            # 预设模式下自动启用锚点列表剥离
+            if anchor_list_threshold == 0:
+                anchor_list_threshold = 10
+            print(f"  • 正文容器 ID：{target_id or '(未设置)'}")
+            print(f"  • 正文容器 class：{target_class or '(未设置)'}")
+    
+    # 单页模式：自动检测文档框架（Phase 2）
+    elif hasattr(args, 'auto_detect') and args.auto_detect:
+        framework, confidence, signals = detect_docs_framework(page_html)
+        if framework and confidence >= 0.6:
+            preset = DOCS_PRESETS.get(framework)
+            if preset:
+                print(f"🔍 自动检测到文档框架：{preset.name}（置信度：{confidence:.0%}）")
+                # 应用预设配置
+                if not target_id and preset.target_ids:
+                    target_id = ",".join(preset.target_ids)
+                if not target_class and preset.target_classes:
+                    target_class = ",".join(preset.target_classes)
+                preset_excludes = ",".join(preset.exclude_selectors)
+                if exclude_selectors:
+                    exclude_selectors = f"{exclude_selectors},{preset_excludes}"
+                else:
+                    exclude_selectors = preset_excludes
+                strip_nav = True
+                strip_page_toc = True
+                if anchor_list_threshold == 0:
+                    anchor_list_threshold = 10
+        elif framework:
+            print(f"🔍 检测到可能的文档框架：{framework}（置信度：{confidence:.0%}，未自动应用）")
     
     # 微信模式下，如果未指定 target，自动使用 rich_media_content
     if is_wechat and not target_id and not target_class:
         target_class = "rich_media_content"
         print("使用微信正文区域：rich_media_content")
 
+    # 使用多值 target 提取（Phase 2 支持逗号分隔）
     if target_id or target_class:
-        article_html = extract_target_html(page_html, target_id=target_id, target_class=target_class) or ""
+        article_html, matched_selector = extract_target_html_multi(
+            page_html, target_ids=target_id, target_classes=target_class
+        )
         if not article_html:
             print("警告：未找到指定的目标区域，将回退到自动抽取。", file=sys.stderr)
             article_html = extract_main_html(page_html)
+        elif matched_selector:
+            print(f"使用正文容器：{matched_selector}")
     else:
         article_html = extract_main_html(page_html)
 
     # 单页模式：应用导航剥离（Phase 1）
     strip_selectors = get_strip_selectors(
-        strip_nav=args.strip_nav,
-        strip_page_toc=args.strip_page_toc,
-        exclude_selectors=args.exclude_selectors,
+        strip_nav=strip_nav,
+        strip_page_toc=strip_page_toc,
+        exclude_selectors=exclude_selectors,
     )
     if strip_selectors:
         article_html, strip_stats = strip_html_elements(article_html, strip_selectors)
@@ -4887,8 +5166,9 @@ urls.txt 文件格式：
         print("已清理微信公众号 UI 噪音")
 
     # 单页模式：锚点列表剥离（Phase 1）
-    if args.anchor_list_threshold > 0:
-        md_body, anchor_stats = strip_anchor_lists(md_body, args.anchor_list_threshold)
+    # 使用局部变量 anchor_list_threshold（可能被预设修改）
+    if anchor_list_threshold > 0:
+        md_body, anchor_stats = strip_anchor_lists(md_body, anchor_list_threshold)
         if anchor_stats.anchor_lists_removed > 0:
             print(f"已移除 {anchor_stats.anchor_lists_removed} 个锚点列表块（共 {anchor_stats.anchor_lines_removed} 行）")
 
