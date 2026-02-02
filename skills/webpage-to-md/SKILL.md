@@ -106,6 +106,8 @@ python SKILL_DIR/scripts/grab_web_to_md.py "https://wiki.example.com/index" \
 | `--docs-preset NAME` | Use framework preset (mintlify/docusaurus/gitbook/vuepress/mkdocs/readthedocs/sphinx/generic) |
 | `--auto-detect` | Auto-detect docs framework and apply preset |
 | `--list-presets` | Show all available presets |
+| `--split-output DIR` | Output split files alongside merged (dual output mode) |
+| `--warn-anchor-collisions` | Show anchor collision details (auto-fixed with -2, -3 suffixes) |
 
 ### 4. Docs Site Export (NEW)
 
@@ -116,6 +118,14 @@ python SKILL_DIR/scripts/grab_web_to_md.py "https://docs.example.com/" \
   --merge --toc \
   --docs-preset mintlify \
   --merge-output docs_guide.md \
+  --download-images
+
+# Dual output: merged + split files (Phase 3-B)
+python SKILL_DIR/scripts/grab_web_to_md.py "https://docs.example.com/" \
+  --crawl --merge --toc \
+  --docs-preset mintlify \
+  --merge-output output/merged.md \
+  --split-output output/pages/ \
   --download-images
 
 # Manual stripping without preset
@@ -133,6 +143,12 @@ python SKILL_DIR/scripts/grab_web_to_md.py "https://docs.example.com/" \
 - Auto-excludes navigation selectors
 - Auto-enables anchor list stripping (threshold=10)
 - Reduces output size by 50%+ for docs sites
+
+**Dual output benefits** (`--split-output`):
+- Generates both merged.md and individual page files
+- Shared assets directory (images downloaded once)
+- INDEX.md with links to each page file
+- Compatible with Obsidian, search tools, collaborative editing
 
 ## Batch Processing Parameters
 
