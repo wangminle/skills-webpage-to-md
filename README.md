@@ -15,6 +15,7 @@
 - ✅ **导航剥离**：自动移除侧边栏/页内目录，支持 8 种文档框架预设
 - ✅ **框架识别**：自动检测 Docusaurus/Mintlify/GitBook 等站点模板
 - ✅ **双版本输出**：同时生成合并版和分文件版，共享 assets 目录
+- ✅ **智能目录管理**：自动创建同名上级目录，保持输出整洁
 
 ## 安装到 Claude Code
 
@@ -172,10 +173,22 @@ pip install requests
 
 ## 输出结构
 
-```
-article.md                # Markdown 文件
-article.assets/           # 图片目录
-article.md.assets.json    # URL→本地映射
+**自动创建同名目录**：如果只指定文件名（不含目录），会自动创建同名目录：
+
+```bash
+# 输入：--out article.md
+# 输出结构：
+article/
+├── article.md              # Markdown 文件
+├── article.assets/         # 图片目录
+└── article.md.assets.json  # URL→本地映射
+
+# 输入：--out docs/article.md（用户指定目录，保持不变）
+# 输出结构：
+docs/
+├── article.md
+├── article.assets/
+└── article.md.assets.json
 ```
 
 ## License
