@@ -255,12 +255,23 @@ When JS protection is encountered, the tool honestly reports the limitation and 
 
 ## Output Structure
 
-```
-output.md                 # Markdown file
-output.assets/            # Images directory
-  ├── 01-hero.png
-  └── 02-diagram.jpg
-output.md.assets.json     # URL→local mapping
+**Auto directory creation**: If only filename is specified (no directory), a same-name parent directory is automatically created:
+
+```bash
+# Input: --out article.md
+# Output structure:
+article/
+├── article.md              # Markdown file
+├── article.assets/         # Images directory
+│   ├── 01-hero.png
+│   └── 02-diagram.jpg
+└── article.md.assets.json  # URL→local mapping
+
+# Input: --out docs/article.md (user specified directory, unchanged)
+docs/
+├── article.md
+├── article.assets/
+└── article.md.assets.json
 ```
 
 ## Common Site Configurations

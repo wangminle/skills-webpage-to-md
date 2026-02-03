@@ -257,12 +257,47 @@ def _safe_image_get(
     raise RuntimeError(f"图片 URL 重定向次数超过 {_MAX_REDIRECTS} 次: {img_url}")
 
 
+def yaml_escape_str(s: str) -> str:
+    """
+    统一的 YAML 双引号字符串转义（Phase 3-C 增强）
+    
+    处理以下特殊字符：
+    - \\ -> \\\\  (反斜杠必须首先处理)
+    - "  -> \\"   (双引号)
+    - \\n -> 空格  (换行)
+    - \\r -> 空格  (回车)
+    - \\t -> 空格  (制表符)
+    """
+    if not s:
+        return ""
+    # 注意顺序：先处理反斜杠，避免二次转义
+    s = s.replace("\\", "\\\\")
+    s = s.replace('"', '\\"')
+    s = s.replace("\n", " ")
+    s = s.replace("\r", " ")
+    s = s.replace("\t", " ")
+    return s.strip()
+
+
+def escape_markdown_link_text(text: str) -> str:
+    """
+    转义 Markdown 链接文本中的特殊字符（Phase 3-C 增强）
+    
+    处理 [ 和 ] 字符，避免破坏链接语法：
+    - [ -> \\[
+    - ] -> \\]
+    """
+    if not text:
+        return ""
+    return text.replace("[", "\\[").replace("]", "\\]")
+
+
 def generate_frontmatter(title: str, url: str, tags: Optional[List[str]] = None) -> str:
     """生成 YAML Frontmatter 元数据头，兼容 Obsidian/Hugo/Jekyll 等工具。"""
     date_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    # 转义标题中的特殊字符
-    safe_title = title.replace('"', '\\"').replace("\n", " ")
-    safe_url = (url or "").replace('"', '\\"').replace("\n", " ").strip()
+    # 使用统一的 YAML 转义
+    safe_title = yaml_escape_str(title)
+    safe_url = yaml_escape_str(url or "")
     lines = [
         "---",
         f'title: "{safe_title}"',
@@ -270,7 +305,8 @@ def generate_frontmatter(title: str, url: str, tags: Optional[List[str]] = None)
         f'date: "{date_str}"',
     ]
     if tags:
-        tags_str = ", ".join(f'"{t}"' for t in tags)
+        # 对每个标签也进行转义
+        tags_str = ", ".join(f'"{yaml_escape_str(t)}"' for t in tags)
         lines.append(f"tags: [{tags_str}]")
     lines.append("---")
     lines.append("")
@@ -283,6 +319,37 @@ def _sanitize_filename_part(text: str) -> str:
     text = re.sub(r"[^\w.\-]+", "-", text, flags=re.UNICODE)
     text = re.sub(r"-{2,}", "-", text)
     return text.strip("-") or "untitled"
+
+
+def auto_wrap_output_dir(output_path: str) -> str:
+    """
+    自动为输出文件创建同名上级目录（如果用户未指定目录）
+    
+    规则：
+    - 如果输出路径包含目录（如 "docs/article.md"），保持不变
+    - 如果只有文件名（如 "article.md"），创建同名目录 -> "article/article.md"
+    
+    Args:
+        output_path: 原始输出路径
+    
+    Returns:
+        处理后的输出路径
+    
+    Examples:
+        >>> auto_wrap_output_dir("article.md")
+        'article/article.md'
+        >>> auto_wrap_output_dir("docs/article.md")
+        'docs/article.md'
+        >>> auto_wrap_output_dir("./output.md")
+        './output.md'
+    """
+    dirname = os.path.dirname(output_path)
+    if dirname:  # 用户指定了目录（包括 "./" 或 "../"）
+        return output_path
+    # 没有目录，创建同名目录
+    basename = os.path.basename(output_path)
+    name_without_ext = os.path.splitext(basename)[0]
+    return os.path.join(name_without_ext, basename)
 
 
 def _safe_path_length(base_dir: str, filename: str, max_total: int = 250) -> str:
@@ -822,13 +889,14 @@ DEFAULT_NAV_SELECTORS = [
 ]
 
 # 默认页内目录选择器（--strip-page-toc）
+# 注意：避免使用过于宽泛的选择器（如 .contents），可能误删主要内容
 DEFAULT_TOC_SELECTORS = [
     ".toc",
     ".table-of-contents",
     ".on-this-page",
     ".page-toc",
     ".article-toc",
-    ".contents",
+    # ".contents",  # 已移除：与 Mintlify 等框架的内容容器冲突
     "[data-toc]",
     ".theme-doc-toc-mobile",    # Docusaurus
     ".theme-doc-toc-desktop",   # Docusaurus
@@ -4190,12 +4258,15 @@ def generate_merged_markdown(
     if rewrite_links:
         url_to_anchor = build_url_to_anchor_map_with_manager(results, result_anchors)
     
-    # 生成 frontmatter
+    # 生成 frontmatter（使用统一的 YAML 转义）
     date_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     title = main_title or "批量导出文档"
-    parts.append("---")
-    parts.append(f'title: "{title}"')
+    safe_title = yaml_escape_str(title)
     safe_source_url = redact_url(source_url) if (redact_urls and source_url) else source_url
+    if safe_source_url:
+        safe_source_url = yaml_escape_str(safe_source_url)
+    parts.append("---")
+    parts.append(f'title: "{safe_title}"')
     if safe_source_url:
         parts.append(f'source: "{safe_source_url}"')
     parts.append(f'date: "{date_str}"')
@@ -4226,15 +4297,16 @@ def generate_merged_markdown(
             parts.append("---")
             parts.append("")
     
-    # 生成目录（使用预先注册的去重锚点）
+    # 生成目录（使用预先注册的去重锚点，转义 Markdown 特殊字符）
     if include_toc:
         parts.append("## 目录")
         parts.append("")
         for i, (result, anchor) in enumerate(result_anchors, 1):
+            safe_link_title = escape_markdown_link_text(result.title)
             if result.success:
-                parts.append(f"{i}. [{result.title}](#{anchor})")
+                parts.append(f"{i}. [{safe_link_title}](#{anchor})")
             else:
-                parts.append(f"{i}. ~~{result.title}~~ (获取失败)")
+                parts.append(f"{i}. ~~{safe_link_title}~~ (获取失败)")
         parts.append("")
         parts.append("---")
         parts.append("")
@@ -4253,10 +4325,10 @@ def generate_merged_markdown(
             parts.append("")
             continue
         
-        # 页面标题（使用 ## 作为二级标题）- 使用去重后的锚点
-        parts.append(f'<a id="{anchor}"></a>')
-        parts.append("")
-        parts.append(f"## {result.title}")
+        # 页面标题（使用 HTML h2 标签带 id 属性，确保锚点跳转兼容性）
+        # 转义标题中的 HTML 特殊字符，避免注入风险和渲染错误
+        safe_html_title = htmllib.escape(result.title)
+        parts.append(f'<h2 id="{anchor}">{safe_html_title}</h2>')
         parts.append("")
         page_url = redact_url(result.url) if redact_urls else result.url
         parts.append(f"- 来源：{page_url}")
@@ -4312,11 +4384,11 @@ def generate_index_markdown(
     title = main_title or "批量导出索引"
     date_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     
-    # YAML Frontmatter（转义特殊字符，与 generate_frontmatter 保持一致）
-    safe_title = title.replace('"', '\\"').replace("\n", " ")
+    # YAML Frontmatter（使用统一的 YAML 转义）
+    safe_title = yaml_escape_str(title)
     safe_source_url = redact_url(source_url) if (redact_urls and source_url) else source_url
     if safe_source_url:
-        safe_source_url = safe_source_url.replace('"', '\\"').replace("\n", " ")
+        safe_source_url = yaml_escape_str(safe_source_url)
     
     parts.append("---")
     parts.append(f'title: "{safe_title}"')
@@ -4362,15 +4434,17 @@ def generate_index_markdown(
                 saved_idx += 1
     
     for i, result in enumerate(results, 1):
+        # 转义标题中的 Markdown 特殊字符
+        safe_link_title = escape_markdown_link_text(result.title)
         if result.success:
             # 优先使用实际生成的文件名
             if (i - 1) in filename_map:
                 filename = filename_map[i - 1]
             else:
                 filename = _sanitize_filename_part(result.title)[:50] + ".md"
-            parts.append(f"{i}. [{result.title}](./{filename})")
+            parts.append(f"{i}. [{safe_link_title}](./{filename})")
         else:
-            parts.append(f"{i}. ~~{result.title}~~ (获取失败: {result.error})")
+            parts.append(f"{i}. ~~{safe_link_title}~~ (获取失败: {result.error})")
     
     parts.append("")
     return "\n".join(parts)
@@ -4754,6 +4828,8 @@ def _batch_main(args: argparse.Namespace) -> int:
             # 确定 assets 目录
             if args.merge:
                 output_file = args.merge_output or "merged.md"
+                # 自动创建同名上级目录（如果用户未指定目录）
+                output_file = auto_wrap_output_dir(output_file)
                 assets_dir = os.path.splitext(output_file)[0] + ".assets"
                 md_dir = os.path.dirname(output_file) or "."
             else:
@@ -4794,6 +4870,8 @@ def _batch_main(args: argparse.Namespace) -> int:
     if args.merge:
         # 合并输出模式
         output_file = args.merge_output or "merged.md"
+        # 自动创建同名上级目录（如果用户未指定目录）
+        output_file = auto_wrap_output_dir(output_file)
         
         # 确保输出目录存在
         output_dir = os.path.dirname(output_file)
@@ -4832,28 +4910,23 @@ def _batch_main(args: argparse.Namespace) -> int:
                 print(f"📌 锚点冲突：{anchor_stats.collision_count} 个已自动修复（使用 --warn-anchor-collisions 查看详情）")
         if url_to_local:
             assets_dir = os.path.splitext(output_file)[0] + ".assets"
-            # 清理未引用的图片文件
+            # 统计图片引用情况（非破坏性：只报告不删除）
             if os.path.isdir(assets_dir):
-                used_files = set()
-                for local_path in url_to_local.values():
-                    # 检查文件是否在最终内容中被引用
-                    if local_path in merged_content:
-                        used_files.add(os.path.basename(local_path))
+                # 统计实际文件数
+                all_files = [f for f in os.listdir(assets_dir) if os.path.isfile(os.path.join(assets_dir, f))]
+                actual_count = len(all_files)
                 
-                # 删除未引用的文件
-                removed_count = 0
-                for filename in os.listdir(assets_dir):
-                    if filename not in used_files:
-                        file_path = os.path.join(assets_dir, filename)
-                        try:
-                            os.remove(file_path)
-                            removed_count += 1
-                        except Exception:
-                            pass
+                # 统计被引用的文件（保守检测：使用文件名匹配）
+                unused_files = []
+                for filename in all_files:
+                    # 检查文件名是否在最终内容中出现
+                    if filename not in merged_content:
+                        unused_files.append(filename)
                 
-                actual_count = len([f for f in os.listdir(assets_dir) if os.path.isfile(os.path.join(assets_dir, f))])
-                if removed_count > 0:
-                    print(f"图片目录：{assets_dir}（{actual_count} 张图片，已清理 {removed_count} 张未引用）")
+                unused_count = len(unused_files)
+                if unused_count > 0:
+                    print(f"图片目录：{assets_dir}（{actual_count} 张图片，{unused_count} 张可能未引用）")
+                    print(f"  ⚠️ 未自动清理未引用图片（可能存在误判），如需清理请手动检查")
                 else:
                     print(f"图片目录：{assets_dir}（{actual_count} 张图片）")
             else:
@@ -5138,6 +5211,8 @@ urls.txt 文件格式：
         base = args.out or (_default_basename(url) + ".md")
     
     out_md = base
+    # 自动创建同名上级目录（如果用户未指定目录）
+    out_md = auto_wrap_output_dir(out_md)
     # 检查输出文件路径长度
     md_dir = os.path.dirname(out_md) or "."
     out_md_name = os.path.basename(out_md)
@@ -5145,6 +5220,10 @@ urls.txt 文件格式：
     out_md = os.path.join(md_dir, out_md_name) if md_dir != "." else out_md_name
     assets_dir = args.assets_dir or (os.path.splitext(out_md)[0] + ".assets")
     map_json = out_md + ".assets.json"
+    
+    # 确保输出目录存在
+    if md_dir != ".":
+        os.makedirs(md_dir, exist_ok=True)
 
     if os.path.exists(out_md) and not args.overwrite:
         print(f"文件已存在：{out_md}（如需覆盖请加 --overwrite）", file=sys.stderr)
