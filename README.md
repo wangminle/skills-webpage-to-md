@@ -12,7 +12,7 @@
 - ✅ **反爬支持**：Cookie/Header/UA 定制
 - ✅ **YAML Frontmatter**：兼容 Obsidian/Hugo/Jekyll
 - ✅ **数据安全**：URL 脱敏、跨域凭据隔离、流式下载防 OOM
-- ✅ **导航剥离**：自动移除侧边栏/页内目录，支持 8 种文档框架预设
+- ✅ **导航剥离**：自动移除侧边栏/页内目录，支持 10 种文档框架预设
 - ✅ **框架识别**：自动检测 Docusaurus/Mintlify/GitBook 等站点模板
 - ✅ **双版本输出**：同时生成合并版和分文件版，共享 assets 目录
 - ✅ **智能目录管理**：自动创建同名上级目录，保持输出整洁
@@ -80,7 +80,7 @@ python skills/webpage-to-md/scripts/grab_web_to_md.py "https://docs.example.com/
   --split-output output/pages/ \
   --download-images
 
-# 支持的预设：mintlify, docusaurus, gitbook, vuepress, mkdocs, readthedocs, sphinx, generic
+# 支持的预设：mintlify, docusaurus, gitbook, vuepress, mkdocs, readthedocs, sphinx, notion, confluence, generic
 python skills/webpage-to-md/scripts/grab_web_to_md.py --list-presets
 ```
 
@@ -90,6 +90,7 @@ python skills/webpage-to-md/scripts/grab_web_to_md.py --list-presets
 |------|------|
 | `--out` | 输出文件路径 |
 | `--validate` | 校验图片完整性 |
+| `--max-html-bytes` | 单页 HTML 最大字节数（默认 10MB；0 表示不限制） |
 | `--keep-html` | 复杂表格保留 HTML |
 | `--tags` | YAML Frontmatter 标签 |
 | `--target-id` / `--target-class` | 指定正文容器（支持逗号分隔多值） |
@@ -145,7 +146,7 @@ python grab_web_to_md.py URL --with-pdf --pdf-allow-file-access
 ## 项目结构
 
 ```
-skills-webpage-to-md-pdf/
+skills-webpage-to-md/
 ├── README.md                           # 本文件
 ├── skills/
 │   └── webpage-to-md/                  # Claude Skills 目录

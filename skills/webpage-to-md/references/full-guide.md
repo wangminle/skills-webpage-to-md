@@ -46,6 +46,7 @@ pip install requests
 |------|------|--------|
 | `--timeout` | 超时（秒） | `60` |
 | `--retries` | 重试次数 | `3` |
+| `--max-html-bytes` | 单页 HTML 最大字节数（0 表示不限制） | `10MB` |
 | `--best-effort-images` | 图片失败仅警告 | `False` |
 
 ### HTTP 请求定制
@@ -101,6 +102,8 @@ pip install requests
 | `mkdocs` | MkDocs / Material for MkDocs |
 | `readthedocs` | Read the Docs |
 | `sphinx` | Sphinx 文档 |
+| `notion` | Notion 公开页面 |
+| `confluence` | Atlassian Confluence |
 | `generic` | 通用文档站点 |
 
 ### 批量处理参数
@@ -250,7 +253,7 @@ python scripts/grab_web_to_md.py "URL" --wechat
 
 **自动处理**：提取 `rich_media_content`、标题从 `og:title` 获取、清理交互按钮
 
-### 场景 8：Docs 站点导出（新增）
+### 场景 7：Docs 站点导出（新增）
 
 ```bash
 # 使用预设导出 Mintlify 文档
@@ -301,7 +304,7 @@ python scripts/grab_web_to_md.py --list-presets
 - 生成 INDEX.md 索引文件
 - 适配 Obsidian、检索工具、协作编辑等场景
 
-### 场景 7：数据安全与隐私
+### 场景 8：数据安全与隐私
 
 ```bash
 # 默认行为：URL 脱敏开启，分享给他人时不会泄露 token/签名
