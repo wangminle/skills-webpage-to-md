@@ -38,7 +38,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Callable, Union
-from urllib.parse import urljoin, urlparse, unquote
+from urllib.parse import urljoin, urlparse, unquote, quote
 
 import requests
 
@@ -96,6 +96,7 @@ def _resolve_user_agent(user_agent: Optional[str], ua_preset: str) -> str:
 
 
 _DEFAULT_MAX_IMAGE_BYTES = 25 * 1024 * 1024  # 25MB/张；设为 0 表示不限制
+_DEFAULT_MAX_HTML_BYTES = 10 * 1024 * 1024  # 10MB/页；设为 0 表示不限制
 
 
 def redact_url(url: str) -> str:
@@ -132,6 +133,42 @@ def _redact_url_to_local_map(url_to_local: Dict[str, str]) -> Dict[str, Union[st
                     out[key] = [prev, local_path]
         else:
             out[key] = local_path
+    return out
+
+
+_MD_HTTP_LINK_DEST_RE = re.compile(
+    r"\]\(\s*(?P<langle><)?(?P<url>https?://[^)\s>]+)(?P<rangle>>)?(?P<title>\s+\"[^\"]*\")?\s*\)"
+)
+_HTML_HTTP_ATTR_RE = re.compile(r"(?P<prefix>\b(?:src|href)=['\"])(?P<url>https?://[^'\"]+)(?P<suffix>['\"])")
+
+
+def redact_urls_in_markdown(md_text: str) -> str:
+    """
+    对 Markdown 正文中的 http/https URL 做脱敏（移除 query/fragment）。
+
+    注意：
+    - 仅处理脚本自身生成/常见的两类形式：
+      1) 行内链接/图片：...](https://...) 或 ...](<https://...>)
+      2) HTML 属性：src="https://..." / href="https://..."
+    - 不处理纯文本裸 URL、srcset 等复杂场景（避免误伤）。
+    """
+    if not md_text:
+        return md_text
+
+    def _md_repl(m: re.Match[str]) -> str:
+        url = m.group("url")
+        safe = redact_url(url)
+        langle = m.group("langle") or ""
+        rangle = m.group("rangle") or ""
+        title = m.group("title") or ""
+        return f"]({langle}{safe}{rangle}{title})"
+
+    def _html_repl(m: re.Match[str]) -> str:
+        url = m.group("url")
+        return f"{m.group('prefix')}{redact_url(url)}{m.group('suffix')}"
+
+    out = _MD_HTTP_LINK_DEST_RE.sub(_md_repl, md_text)
+    out = _HTML_HTTP_ATTR_RE.sub(_html_repl, out)
     return out
 
 
@@ -671,6 +708,39 @@ DOCS_PRESETS: Dict[str, DocsPreset] = {
             ".aui-sidebar",
             ".page-metadata",
             "nav",
+        ],
+    ),
+    "sphinx": DocsPreset(
+        name="sphinx",
+        description="Sphinx documentation",
+        detect_patterns=["sphinx", "Sphinx"],
+        detect_classes=["sphinxsidebar", "document"],
+        detect_meta=["generator.*sphinx"],
+        target_ids=["content", "main-content"],
+        target_classes=["document", "body", "rst-content"],
+        exclude_selectors=[
+            ".sphinxsidebar",
+            ".sphinxsidebarwrapper",
+            ".related",
+            "nav",
+            ".toctree-wrapper",
+        ],
+    ),
+    "generic": DocsPreset(
+        name="generic",
+        description="Generic documentation site",
+        detect_patterns=[],
+        detect_classes=[],
+        detect_meta=[],
+        target_ids=["content", "main-content", "main"],
+        target_classes=["content", "main-content", "article-content", "markdown-body"],
+        exclude_selectors=[
+            "nav",
+            "aside",
+            ".sidebar",
+            ".navigation",
+            ".toc",
+            ".table-of-contents",
         ],
     ),
 }
@@ -1775,7 +1845,7 @@ class HTMLToMarkdown(HTMLParser):
         # 避免把两个“词”粘在一起
         if self.out:
             prev = self._tail()[-1:]
-            if prev and prev not in ("\n", " ", "(", "[") and text[:1] not in (" ", "\n", ".", ",", ":", ";", ")", "]"):
+            if prev and prev not in ("\n", " ", "(", "[", "*", "`", "_") and text[:1] not in (" ", "\n", ".", ",", ":", ";", ")", "]"):
                 self.out.append(" ")
         self.out.append(text)
 
@@ -3122,6 +3192,7 @@ class BatchConfig:
     skip_errors: bool = False
     timeout: int = 60
     retries: int = 3
+    max_html_bytes: int = _DEFAULT_MAX_HTML_BYTES
     best_effort_images: bool = True
     keep_html: bool = False
     target_id: Optional[str] = None
@@ -3696,6 +3767,7 @@ def process_single_url(
             url=url,
             timeout_s=config.timeout,
             retries=config.retries,
+            max_html_bytes=config.max_html_bytes,
         )
         
         # 微信公众号文章自动检测
@@ -3708,6 +3780,10 @@ def process_single_url(
         # 确定正文提取策略
         target_id = config.target_id
         target_class = config.target_class
+        exclude_selectors = config.exclude_selectors
+        strip_nav = config.strip_nav
+        strip_page_toc = config.strip_page_toc
+        anchor_list_threshold = config.anchor_list_threshold
         
         # 微信模式下，如果未指定 target，自动使用 rich_media_content
         if is_wechat and not target_id and not target_class:
@@ -3725,6 +3801,17 @@ def process_single_url(
                         target_id = ",".join(preset.target_ids)
                     if not target_class and preset.target_classes:
                         target_class = ",".join(preset.target_classes)
+                    # 批量模式下 auto-detect 也应尽量复用预设的“去导航”能力，保持与单页模式一致
+                    preset_excludes = ",".join(preset.exclude_selectors) if preset.exclude_selectors else ""
+                    if preset_excludes:
+                        if exclude_selectors:
+                            exclude_selectors = f"{exclude_selectors},{preset_excludes}"
+                        else:
+                            exclude_selectors = preset_excludes
+                    strip_nav = True
+                    strip_page_toc = True
+                    if anchor_list_threshold == 0:
+                        anchor_list_threshold = 10
         
         # 提取正文（支持多值 target，T2.1）
         if target_id or target_class:
@@ -3748,9 +3835,9 @@ def process_single_url(
         
         # Phase 1: HTML 导航元素剥离（在提取正文后、转换 Markdown 前）
         strip_selectors = get_strip_selectors(
-            strip_nav=config.strip_nav,
-            strip_page_toc=config.strip_page_toc,
-            exclude_selectors=config.exclude_selectors,
+            strip_nav=strip_nav,
+            strip_page_toc=strip_page_toc,
+            exclude_selectors=exclude_selectors,
         )
         if strip_selectors:
             article_html, _ = strip_html_elements(article_html, strip_selectors)
@@ -3786,8 +3873,8 @@ def process_single_url(
             md_body = clean_wiki_noise(md_body)
         
         # Phase 1: Markdown 锚点列表剥离
-        if config.anchor_list_threshold > 0:
-            md_body, _ = strip_anchor_lists(md_body, config.anchor_list_threshold)
+        if anchor_list_threshold > 0:
+            md_body, _ = strip_anchor_lists(md_body, anchor_list_threshold)
         
         return BatchPageResult(
             url=url,
@@ -4066,7 +4153,6 @@ def replace_image_urls_in_markdown(md_content: str, url_to_local: Dict[str, str]
         result = result.replace(f"]({url})", f"]({local_path})")
         
         # 方法2：也替换可能的 URL 编码变体
-        from urllib.parse import quote, unquote
         # 尝试替换 URL 编码版本
         encoded_url = quote(url, safe=':/?&=#')
         if encoded_url != url:
@@ -4193,21 +4279,35 @@ def rewrite_internal_links(md_content: str, url_to_anchor: Dict[str, str]) -> Tu
         text = match.group(1)
         url = match.group(2)
         
-        # 检查 URL 是否在映射表中
-        anchor = url_to_anchor.get(url)
-        if anchor:
-            rewrite_count += 1
-            return f"[{text}](#{anchor})"
-        
+        candidates: List[str] = [url]
+
         # 尝试 URL 解码后匹配
         try:
             decoded_url = unquote(url)
-            anchor = url_to_anchor.get(decoded_url)
+            if decoded_url and decoded_url != url:
+                candidates.append(decoded_url)
+        except Exception:
+            pass
+
+        # 常见变体：去 fragment（#/section），以及按脱敏规则去掉 query/fragment
+        try:
+            parsed = urlparse(url)
+            if parsed.fragment:
+                candidates.append(parsed._replace(fragment="").geturl())
+        except Exception:
+            pass
+        try:
+            candidates.append(redact_url(url))
+        except Exception:
+            pass
+
+        for c in candidates:
+            if not c:
+                continue
+            anchor = url_to_anchor.get(c)
             if anchor:
                 rewrite_count += 1
                 return f"[{text}](#{anchor})"
-        except Exception:
-            pass
         
         return match.group(0)  # 保持原样
     
@@ -4343,6 +4443,9 @@ def generate_merged_markdown(
         if rewrite_links and url_to_anchor:
             content, count = rewrite_internal_links(content, url_to_anchor)
             total_rewrite_count += count
+
+        if redact_urls:
+            content = redact_urls_in_markdown(content)
         
         parts.append(content)
         parts.append("")
@@ -4512,6 +4615,9 @@ def batch_save_individual(
             except ValueError:
                 # 如果无法计算相对路径（跨驱动器等），保持原样
                 pass
+
+        if redact_urls:
+            content = redact_urls_in_markdown(content)
         
         # 写入文件
         with open(filepath, "w", encoding="utf-8") as f:
@@ -4532,8 +4638,11 @@ def fetch_html(
     url: str,
     timeout_s: int,
     retries: int,
+    *,
+    max_html_bytes: int = _DEFAULT_MAX_HTML_BYTES,
 ) -> str:
     last_err: Optional[Exception] = None
+    max_bytes: Optional[int] = max_html_bytes if (max_html_bytes and max_html_bytes > 0) else None
     for attempt in range(1, retries + 1):
         r: Optional[requests.Response] = None
         try:
@@ -4547,9 +4656,26 @@ def fetch_html(
                 },
             )
             r.raise_for_status()
-            content = b"".join(r.iter_content(chunk_size=1024 * 128))
+
+            if max_bytes is not None:
+                cl = r.headers.get("Content-Length")
+                if cl:
+                    try:
+                        if int(cl) > max_bytes:
+                            raise RuntimeError(f"HTML 响应过大（Content-Length={cl} > {max_bytes} bytes）：{url}")
+                    except ValueError:
+                        pass
+
+            buf = bytearray()
+            for chunk in r.iter_content(chunk_size=1024 * 128):
+                if not chunk:
+                    continue
+                buf.extend(chunk)
+                if max_bytes is not None and len(buf) > max_bytes:
+                    raise RuntimeError(f"HTML 响应过大（>{max_bytes} bytes）：{url}")
+
             encoding = r.encoding or "utf-8"
-            return content.decode(encoding, errors="replace")
+            return bytes(buf).decode(encoding, errors="replace")
         except Exception as e:  # noqa: BLE001 - CLI tool wants retries on network errors
             last_err = e
             if attempt >= retries:
@@ -4635,10 +4761,18 @@ def _create_session(args: argparse.Namespace, referer_url: Optional[str] = None)
     if args.headers:
         try:
             custom_headers = json.loads(args.headers)
-            session.headers.update(custom_headers)
-            print(f"已加载自定义 Header（{len(custom_headers)} 个）")
-        except json.JSONDecodeError as e:
-            print(f"警告：无法解析 headers JSON：{e}", file=sys.stderr)
+            if not isinstance(custom_headers, dict):
+                raise ValueError("headers JSON 必须是对象（如 {\"Authorization\": \"Bearer xxx\"}）")
+            sanitized: Dict[str, str] = {}
+            for k, v in custom_headers.items():
+                kk = str(k).strip()
+                if not kk:
+                    continue
+                sanitized[kk] = str(v)
+            session.headers.update(sanitized)
+            print(f"已加载自定义 Header（{len(sanitized)} 个）")
+        except Exception as e:  # noqa: BLE001
+            print(f"警告：无法解析/应用 headers JSON：{e}", file=sys.stderr)
 
     if args.header:
         try:
@@ -4683,6 +4817,7 @@ def _batch_main(args: argparse.Namespace) -> int:
                 url=args.url,
                 timeout_s=args.timeout,
                 retries=args.retries,
+                max_html_bytes=args.max_html_bytes,
             )
         except Exception as e:
             print(f"错误：无法获取索引页：{e}", file=sys.stderr)
@@ -4727,6 +4862,7 @@ def _batch_main(args: argparse.Namespace) -> int:
         skip_errors=args.skip_errors,
         timeout=args.timeout,
         retries=args.retries,
+        max_html_bytes=args.max_html_bytes,
         best_effort_images=args.best_effort_images,  # Bug fix: 使用用户参数而非硬编码
         keep_html=args.keep_html,
         target_id=args.target_id,
@@ -4849,7 +4985,7 @@ def _batch_main(args: argparse.Namespace) -> int:
                 md_dir=md_dir,
                 timeout_s=args.timeout,
                 retries=args.retries,
-                best_effort=True,
+                best_effort=bool(args.best_effort_images),
                 progress_callback=img_progress,
                 redact_urls=args.redact_url,
                 max_image_bytes=args.max_image_bytes,
@@ -5040,6 +5176,12 @@ urls.txt 文件格式：
     ap.add_argument("--with-pdf", action="store_true", help="同时生成同名 PDF（需要本机 Edge/Chrome）")
     ap.add_argument("--timeout", type=int, default=60, help="请求超时（秒），默认 60")
     ap.add_argument("--retries", type=int, default=3, help="网络重试次数，默认 3")
+    ap.add_argument(
+        "--max-html-bytes",
+        type=int,
+        default=_DEFAULT_MAX_HTML_BYTES,
+        help="单页 HTML 最大允许字节数（默认 10MB；设为 0 表示不限制）",
+    )
     ap.add_argument("--best-effort-images", action="store_true", help="图片下载失败时仅警告并跳过（默认失败即退出）")
     ap.add_argument("--overwrite", action="store_true", help="允许覆盖已存在的 md 文件")
     ap.add_argument("--validate", action="store_true", help="生成后执行校验并输出结果")
@@ -5187,6 +5329,18 @@ urls.txt 文件格式：
         if not os.path.isfile(args.local_html):
             print(f"错误：本地 HTML 文件不存在：{args.local_html}", file=sys.stderr)
             return EXIT_ERROR
+
+        # 本地文件同样做体积保护（与 fetch_html 的 --max-html-bytes 行为保持一致）
+        try:
+            size = os.path.getsize(args.local_html)
+            if args.max_html_bytes and args.max_html_bytes > 0 and size > args.max_html_bytes:
+                print(
+                    f"错误：本地 HTML 文件过大（{size} > {args.max_html_bytes} bytes）：{args.local_html}",
+                    file=sys.stderr,
+                )
+                return EXIT_ERROR
+        except OSError:
+            pass
         
         # --local-html 模式下，url 参数可选，用于图片下载；优先使用 --base-url
         url = args.base_url or args.url or ""
@@ -5234,7 +5388,13 @@ urls.txt 文件格式：
     # 网络模式下下载页面
     if not args.local_html:
         print(f"下载页面：{url}")
-        page_html = fetch_html(session=session, url=url, timeout_s=args.timeout, retries=args.retries)
+        page_html = fetch_html(
+            session=session,
+            url=url,
+            timeout_s=args.timeout,
+            retries=args.retries,
+            max_html_bytes=args.max_html_bytes,
+        )
         
         # ====== JS 反爬检测 ======
         js_detection = detect_js_challenge(page_html)
@@ -5398,6 +5558,8 @@ urls.txt 文件格式：
         tags = [t.strip() for t in args.tags.split(",") if t.strip()]
 
     display_url = redact_url(url) if args.redact_url else url
+    if args.redact_url:
+        md_body = redact_urls_in_markdown(md_body)
 
     with open(out_md, "w", encoding="utf-8") as f:
         if args.frontmatter:

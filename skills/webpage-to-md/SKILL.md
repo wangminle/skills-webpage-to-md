@@ -36,6 +36,7 @@ python SKILL_DIR/scripts/grab_web_to_md.py "https://wiki.example.com/index" \
 |-----------|---------|---------|
 | `--out` | Output file path | `--out docs/article.md` |
 | `--validate` | Verify image integrity | `--validate` |
+| `--max-html-bytes` | Max HTML bytes per page (0=unlimited) | `--max-html-bytes 0` |
 | `--keep-html` | Preserve complex tables | `--keep-html` |
 | `--tags` | Add YAML frontmatter tags | `--tags "ai,tutorial"` |
 
@@ -103,7 +104,7 @@ python SKILL_DIR/scripts/grab_web_to_md.py "https://wiki.example.com/index" \
 | `--strip-page-toc` | Remove page-level TOC (.toc, .on-this-page) |
 | `--exclude-selectors STR` | Custom selectors to remove (comma-separated, simplified CSS) |
 | `--anchor-list-threshold N` | Remove link lists exceeding N lines (default 0=off, preset mode uses 10) |
-| `--docs-preset NAME` | Use framework preset (mintlify/docusaurus/gitbook/vuepress/mkdocs/readthedocs/sphinx/generic) |
+| `--docs-preset NAME` | Use framework preset (mintlify/docusaurus/gitbook/vuepress/mkdocs/readthedocs/sphinx/notion/confluence/generic) |
 | `--auto-detect` | Auto-detect docs framework and apply preset |
 | `--list-presets` | Show all available presets |
 | `--split-output DIR` | Output split files alongside merged (dual output mode) |
@@ -290,6 +291,8 @@ docs/
 | **MkDocs** | `--docs-preset mkdocs` |
 | **ReadTheDocs** | `--docs-preset readthedocs` |
 | **Sphinx** | `--docs-preset sphinx` |
+| **Notion** | `--docs-preset notion` |
+| **Confluence** | `--docs-preset confluence` |
 | **Generic Docs** | `--docs-preset generic` or `--strip-nav --strip-page-toc` |
 
 ## Dependencies
