@@ -2,6 +2,7 @@ import importlib.util
 import pathlib
 import sys
 import unittest
+from unittest import mock
 
 
 def _load_grabber_module():
@@ -99,6 +100,38 @@ class TestLinkRewrite(unittest.TestCase):
         out, n = grab.rewrite_internal_links(md, {"https://a.com/x": "anchor"})
         self.assertEqual(n, 1)
         self.assertIn("[p](#anchor)", out)
+
+
+class TestImageRewrite(unittest.TestCase):
+    def test_replace_image_urls_only_rewrites_images(self):
+        md = (
+            "[普通链接](https://a.com/img.png)\n"
+            "![图片](https://a.com/img.png)\n"
+            '<img src="https://a.com/img.png" alt="x">'
+        )
+        out = grab.replace_image_urls_in_markdown(md, {"https://a.com/img.png": "assets/001.png"})
+        self.assertIn("[普通链接](https://a.com/img.png)", out)
+        self.assertIn("![图片](assets/001.png)", out)
+        self.assertIn('<img src="assets/001.png" alt="x">', out)
+
+
+class TestBatchJsChallenge(unittest.TestCase):
+    def test_process_single_url_fails_on_js_challenge_without_force(self):
+        challenge_html = "<html><head><title>Just a moment</title></head><body>Checking your browser</body></html>"
+        config = grab.BatchConfig(force=False)
+        with mock.patch.object(grab, "fetch_html", return_value=challenge_html):
+            result = grab.process_single_url(session=object(), url="https://example.com/p", config=config)
+        self.assertFalse(result.success)
+        self.assertIsNotNone(result.error)
+        self.assertIn("JavaScript 反爬", result.error or "")
+        self.assertIn("--local-html", result.error or "")
+
+    def test_process_single_url_can_force_continue_on_js_challenge(self):
+        challenge_html = "<html><head><title>Just a moment</title></head><body>Checking your browser</body></html>"
+        config = grab.BatchConfig(force=True)
+        with mock.patch.object(grab, "fetch_html", return_value=challenge_html):
+            result = grab.process_single_url(session=object(), url="https://example.com/p", config=config)
+        self.assertTrue(result.success)
 
 
 if __name__ == "__main__":
