@@ -195,7 +195,8 @@ python SKILL_DIR/scripts/grab_web_to_md.py "URL" --ua-preset firefox-win
 
 Some websites use JavaScript-based anti-bot protection (Cloudflare, Akamai, etc.). The script **automatically detects** these challenges and provides clear guidance.
 
-> **Note**: JS Challenge detection only works in **single-page mode**. In batch mode (`--urls-file` or `--crawl`), individual pages are processed without JS challenge detection to avoid interrupting the batch process.
+> **Note**: JS Challenge detection works in both **single-page** and **batch** modes (`--urls-file` / `--crawl`).  
+> 默认行为是检测到挑战页即返回错误并给出 `--local-html` 方案；如需强制继续可使用 `--force`。
 
 ### What happens when JS protection is detected
 
