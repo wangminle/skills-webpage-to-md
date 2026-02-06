@@ -14,7 +14,7 @@
 
 **特定站点**：微信公众号（自动检测）、Wiki 系统噪音清理
 
-**其他**：YAML Frontmatter、反爬支持、PDF 导出、Windows 路径安全
+**其他**：YAML Frontmatter、反爬支持、PDF 导出、Windows 路径安全、模块化架构（8 个子模块）
 
 ---
 
@@ -23,6 +23,12 @@
 ```bash
 # Python 3.8+（兼容 Python <3.10）
 pip install requests
+
+# 可选：用于 PDF 导出的 Markdown 渲染
+pip install markdown
+
+# 可选：运行测试
+pip install pytest
 ```
 
 ---
@@ -453,9 +459,62 @@ output/
   - 流式下载：`iter_content(chunk_size=65536)` + 临时文件
   - HTML 净化：正则过滤 `on\w+=` 属性、`javascript:/vbscript:/file:` 协议
 
+### 模块化架构（v2.0.0+）
+
+项目从单文件重构为模块化包，总计约 5100 行代码：
+
+```
+scripts/
+├── grab_web_to_md.py       # CLI 入口（~1220 行）：参数解析 + 流程调度
+└── webpage_to_md/          # 核心功能包（~3900 行）
+    ├── __init__.py          # 包入口，导出数据模型
+    ├── models.py            # 数据模型（~70 行）
+    ├── security.py          # URL 脱敏 / JS 检测 / 校验（~240 行）
+    ├── http_client.py       # HTTP 会话与 HTML 抓取（~200 行）
+    ├── images.py            # 图片下载与路径替换（~500 行）
+    ├── extractors.py        # 正文提取 + 框架预设 + 导航剥离（~1100 行）
+    ├── markdown_conv.py     # HTML→Markdown + 噪音清理（~940 行）
+    ├── output.py            # 合并/分文件/索引/frontmatter（~450 行）
+    └── pdf_utils.py         # Markdown→PDF 渲染（~420 行）
+```
+
+**依赖关系**（无循环依赖）：
+```
+models (无依赖)
+  ↑
+security → models
+  ↑
+http_client (无包内依赖)
+extractors (无包内依赖)
+markdown_conv → security
+images → models, security
+output → markdown_conv, models, security
+pdf_utils (无包内依赖)
+```
+
+**设计原则**：
+- CLI 入口仅负责参数解析和流程编排，不包含业务逻辑
+- 各模块职责单一，可独立测试
+- 仅依赖 `requests`（必需）和标准库，保持轻量
+
 ---
 
 ## 更新日志
+
+### v2.0.0 (2026-02-06)
+- 🏗️ **模块化重构**：将单文件 `grab_web_to_md.py`（~3700 行）拆分为 `webpage_to_md` 包（8 个子模块）：
+  - `models.py`：数据模型（BatchConfig / BatchPageResult / JSChallengeResult / ValidationResult）
+  - `security.py`：URL 脱敏、JS 反爬检测、Markdown 校验
+  - `http_client.py`：UA 预设、Session 创建、HTML 抓取（重试/大小限制）
+  - `images.py`：图片下载（流式/跨域隔离）、格式嗅探、路径替换
+  - `extractors.py`：正文/标题/链接提取、10 种 Docs 框架预设、导航剥离
+  - `markdown_conv.py`：HTML→Markdown 解析器、LaTeX 公式、表格转换、噪音清理
+  - `output.py`：Frontmatter 生成、合并/分文件/索引输出、锚点冲突管理
+  - `pdf_utils.py`：Markdown→HTML 渲染、Edge/Chrome headless PDF 打印
+- 🏗️ **CLI 入口精简**：`grab_web_to_md.py` 仅保留参数解析和流程调度（~1220 行）
+- 🏗️ **依赖链清晰**：`models` ← `security` ← `markdown_conv`/`images`/`output`，无循环依赖
+- ✅ **新增单元测试**：`tests/test_grab_web_to_md.py`
+- 🔧 **无功能变化**：所有 CLI 参数和行为保持 100% 向后兼容
 
 ### v1.7.0 (2026-02-03)
 - ✨ **自动创建同名上级目录**：
