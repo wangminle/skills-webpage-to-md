@@ -1,8 +1,13 @@
 import importlib.util
+import io
 import pathlib
 import sys
+import tempfile
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
+
+import requests
 
 
 def _load_grabber_module():
@@ -132,6 +137,36 @@ class TestBatchJsChallenge(unittest.TestCase):
         with mock.patch.object(grab, "fetch_html", return_value=challenge_html):
             result = grab.process_single_url(session=object(), url="https://example.com/p", config=config)
         self.assertTrue(result.success)
+
+
+class TestHttpErrorGuidance(unittest.TestCase):
+    def _run_http_error_case(self, status_code: int) -> tuple[int, str]:
+        response = mock.Mock()
+        response.status_code = status_code
+        error = requests.exceptions.HTTPError(f"{status_code} error", response=response)
+
+        out_buf = io.StringIO()
+        err_buf = io.StringIO()
+        with tempfile.TemporaryDirectory() as td:
+            out_md = str(pathlib.Path(td) / "out.md")
+            with mock.patch.object(grab, "fetch_html", side_effect=error):
+                with redirect_stdout(out_buf), redirect_stderr(err_buf):
+                    code = grab.main(["https://example.com/p", "--out", out_md, "--overwrite"])
+        return code, err_buf.getvalue()
+
+    def test_main_http_403_shows_local_html_guidance(self):
+        code, stderr_text = self._run_http_error_case(403)
+        self.assertEqual(code, grab.EXIT_ERROR)
+        self.assertIn("错误：请求失败（HTTP 403）", stderr_text)
+        self.assertIn("可能触发了站点的反爬或访问频控", stderr_text)
+        self.assertIn("--local-html", stderr_text)
+
+    def test_main_http_429_shows_local_html_guidance(self):
+        code, stderr_text = self._run_http_error_case(429)
+        self.assertEqual(code, grab.EXIT_ERROR)
+        self.assertIn("错误：请求失败（HTTP 429）", stderr_text)
+        self.assertIn("可能触发了站点的反爬或访问频控", stderr_text)
+        self.assertIn("--local-html", stderr_text)
 
 
 if __name__ == "__main__":

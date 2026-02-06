@@ -152,29 +152,62 @@ skills-webpage-to-md/
 │   └── webpage-to-md/                  # Claude Skills 目录
 │       ├── SKILL.md                    # Skills 核心文件
 │       ├── scripts/
-│       │   ├── grab_web_to_md.py       # CLI 入口（参数解析 + 调度）
-│       │   └── webpage_to_md/
-│       │       ├── models.py           # 数据模型（BatchConfig 等）
-│       │       ├── security.py         # 脱敏 / JS challenge / 校验
-│       │       ├── http_client.py      # HTTP 请求与 session
-│       │       ├── images.py           # 图片下载与替换
-│       │       ├── extractors.py       # 正文/标题/链接提取
-│       │       ├── markdown_conv.py    # Markdown 清理与链接改写
-│       │       └── output.py           # 合并/分文件/索引/frontmatter
+│       │   ├── grab_web_to_md.py       # CLI 入口（参数解析 + 流程调度）
+│       │   └── webpage_to_md/          # 核心功能包（8 个子模块）
+│       │       ├── __init__.py         # 包入口，导出数据模型
+│       │       ├── models.py           # 数据模型（BatchConfig / BatchPageResult 等）
+│       │       ├── security.py         # URL 脱敏 / JS challenge 检测 / 校验
+│       │       ├── http_client.py      # HTTP 会话创建与 HTML 抓取
+│       │       ├── images.py           # 图片下载、格式嗅探与路径替换
+│       │       ├── extractors.py       # 正文 / 标题 / 链接提取 + docs 框架预设 + 导航剥离
+│       │       ├── markdown_conv.py    # HTML→Markdown 转换 + 噪音清理 + 链接改写
+│       │       ├── output.py           # 合并 / 分文件 / 索引 / frontmatter 输出
+│       │       └── pdf_utils.py        # Markdown→HTML→PDF 渲染（Edge/Chrome headless）
 │       └── references/
 │           └── full-guide.md           # 完整参考手册
+├── tests/
+│   └── test_grab_web_to_md.py          # 单元测试
+├── docs/                               # 设计文档（已 gitignore 部分内容）
 └── output/                             # 示例输出（已 gitignore）
 ```
+
+### 模块化架构
+
+项目采用模块化设计，`grab_web_to_md.py` 仅负责 CLI 参数解析和流程调度，核心功能拆分为 `webpage_to_md` 包：
+
+| 模块 | 行数 | 职责 |
+|------|------|------|
+| `models.py` | ~70 | 数据模型定义（BatchConfig、BatchPageResult、JSChallengeResult 等） |
+| `security.py` | ~240 | URL 脱敏、JS 反爬检测、Markdown 校验 |
+| `http_client.py` | ~200 | UA 预设、Session 创建、HTML 抓取（含重试/大小限制） |
+| `images.py` | ~500 | 图片下载（流式/跨域隔离）、格式嗅探、路径替换 |
+| `extractors.py` | ~1100 | 正文/标题/链接提取、10 种 Docs 框架预设、导航剥离 |
+| `markdown_conv.py` | ~940 | HTML→Markdown 解析器、LaTeX 公式、表格、噪音清理 |
+| `output.py` | ~450 | Frontmatter 生成、合并/分文件/索引输出、锚点管理 |
+| `pdf_utils.py` | ~420 | Markdown→HTML 渲染、PDF 打印（Edge/Chrome headless） |
+
+依赖关系：`models` ← `security` ← `markdown_conv` / `images` / `output`，无循环依赖。
 
 ## 文档
 
 - **Skills 入口**：[skills/webpage-to-md/SKILL.md](skills/webpage-to-md/SKILL.md) - Claude Skills 核心用法
 - **完整手册**：[skills/webpage-to-md/references/full-guide.md](skills/webpage-to-md/references/full-guide.md) - 所有参数、场景、案例
 
+## 测试
+
+```bash
+# 运行全部测试
+python -m pytest tests/ -v
+
+# 快速验证导入
+python -c "import sys; sys.path.insert(0, 'skills/webpage-to-md/scripts'); import grab_web_to_md; print('OK')"
+```
+
 ## 依赖
 
 - **必需**：`requests`（HTTP 请求）
 - **可选**：`markdown`（PDF 导出时使用）
+- **测试**：`pytest`（可选）
 
 ```bash
 pip install requests

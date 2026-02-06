@@ -9,7 +9,21 @@ Extract web content and convert to clean Markdown with local images.
 
 ## Script Location
 
-This skill includes a Python script at `scripts/grab_web_to_md.py`.
+This skill uses a modular Python package:
+
+```
+scripts/
+├── grab_web_to_md.py       # CLI entry point (argument parsing + orchestration)
+└── webpage_to_md/          # Core package (8 submodules)
+    ├── models.py           # Data models (BatchConfig, BatchPageResult, etc.)
+    ├── security.py         # URL redaction / JS challenge detection / validation
+    ├── http_client.py      # HTTP session creation and HTML fetching
+    ├── images.py           # Image download, format sniffing, path replacement
+    ├── extractors.py       # Content/title/link extraction + docs presets + nav stripping
+    ├── markdown_conv.py    # HTML→Markdown converter + noise cleanup + link rewriting
+    ├── output.py           # Merged/split/index/frontmatter output generation
+    └── pdf_utils.py        # Markdown→HTML→PDF rendering (Edge/Chrome headless)
+```
 
 When using this skill, replace `SKILL_DIR` with the actual skill installation path:
 - Claude Code: `~/.claude/skills/webpage-to-md/`
@@ -303,6 +317,24 @@ docs/
 
 Install: `pip install requests`
 
+## Architecture
+
+The codebase follows a modular design with clear separation of concerns:
+
+| Module | Responsibility |
+|--------|---------------|
+| `grab_web_to_md.py` | CLI entry point: argument parsing, single/batch orchestration |
+| `models.py` | Shared data classes (BatchConfig, BatchPageResult, etc.) |
+| `security.py` | URL redaction, JS challenge detection, markdown validation |
+| `http_client.py` | UA presets, session creation, HTML fetching with retries |
+| `images.py` | Image download (streaming, cross-origin isolation), format sniffing |
+| `extractors.py` | Content extraction, 10 docs framework presets, nav stripping |
+| `markdown_conv.py` | HTML→Markdown parser, LaTeX, tables, noise cleanup |
+| `output.py` | Frontmatter, merged/split/index output, anchor management |
+| `pdf_utils.py` | Markdown→HTML rendering, PDF printing via browser headless |
+
+Dependency chain: `models` ← `security` ← `markdown_conv` / `images` / `output` (no circular deps).
+
 ## References
 
 For complete documentation, see [references/full-guide.md](references/full-guide.md):
@@ -311,4 +343,5 @@ For complete documentation, see [references/full-guide.md](references/full-guide
 - 3 detailed real-world cases
 - Output structure diagrams
 - Technical implementation details
+- Modular architecture overview
 - Changelog history
