@@ -152,7 +152,15 @@ skills-webpage-to-md/
 │   └── webpage-to-md/                  # Claude Skills 目录
 │       ├── SKILL.md                    # Skills 核心文件
 │       ├── scripts/
-│       │   └── grab_web_to_md.py       # 主脚本
+│       │   ├── grab_web_to_md.py       # CLI 入口（参数解析 + 调度）
+│       │   └── webpage_to_md/
+│       │       ├── models.py           # 数据模型（BatchConfig 等）
+│       │       ├── security.py         # 脱敏 / JS challenge / 校验
+│       │       ├── http_client.py      # HTTP 请求与 session
+│       │       ├── images.py           # 图片下载与替换
+│       │       ├── extractors.py       # 正文/标题/链接提取
+│       │       ├── markdown_conv.py    # Markdown 清理与链接改写
+│       │       └── output.py           # 合并/分文件/索引/frontmatter
 │       └── references/
 │           └── full-guide.md           # 完整参考手册
 └── output/                             # 示例输出（已 gitignore）
