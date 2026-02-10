@@ -317,7 +317,36 @@ python scripts/grab_web_to_md.py --list-presets
 - 生成 INDEX.md 索引文件
 - 适配 Obsidian、检索工具、协作编辑等场景
 
-### 场景 8：数据安全与隐私
+### 场景 8：SSR 动态站点自动提取（新增）
+
+```bash
+# 腾讯云开发者文章 — Next.js SSR 自动提取 ProseMirror JSON
+python scripts/grab_web_to_md.py \
+  "https://cloud.tencent.com/developer/article/2624003" \
+  --auto-title --download-images
+
+# 火山引擎文档 — Modern.js SSR 自动提取 MDContent
+python scripts/grab_web_to_md.py \
+  "https://www.volcengine.com/docs/6396/2189942" \
+  --auto-title --download-images --best-effort-images
+
+# 禁用 SSR 提取，回退到普通 HTML 解析
+python scripts/grab_web_to_md.py URL --no-ssr
+```
+
+**检测逻辑**：工具会自动扫描 HTML 中的 SSR 数据标记：
+- `<script id="__NEXT_DATA__">` → Next.js 站点 → 提取 ProseMirror JSON → 转换为 HTML
+- `window._ROUTER_DATA = {...}` → Modern.js 站点 → 提取 MDContent（已是 Markdown）
+
+**智能反爬绕过**：如果检测到 JS 反爬信号但同时存在 SSR 数据，工具会自动跳过反爬警告继续提取。
+
+**支持站点**：
+| 站点 | SSR 框架 | 数据格式 |
+|------|---------|---------|
+| 腾讯云开发者社区 | Next.js | ProseMirror JSON |
+| 火山引擎文档 | Modern.js | Markdown (MDContent) |
+
+### 场景 9：数据安全与隐私
 
 ```bash
 # 默认行为：URL 脱敏开启，分享给他人时不会泄露 token/签名
@@ -468,16 +497,17 @@ output/
 
 ### 模块化架构（v2.0.0+）
 
-项目从单文件重构为模块化包，总计约 5100 行代码：
+项目从单文件重构为模块化包，总计约 5400 行代码：
 
 ```
 scripts/
-├── grab_web_to_md.py       # CLI 入口（~1220 行）：参数解析 + 流程调度
-└── webpage_to_md/          # 核心功能包（~3900 行）
+├── grab_web_to_md.py       # CLI 入口（~1290 行）：参数解析 + 流程调度
+└── webpage_to_md/          # 核心功能包（~4100 行）
     ├── __init__.py          # 包入口，导出数据模型
     ├── models.py            # 数据模型（~70 行）
     ├── security.py          # URL 脱敏 / JS 检测 / 校验（~240 行）
     ├── http_client.py       # HTTP 会话与 HTML 抓取（~200 行）
+    ├── ssr_extract.py       # SSR 数据提取：Next.js/Modern.js（~260 行）
     ├── images.py            # 图片下载与路径替换（~500 行）
     ├── extractors.py        # 正文提取 + 框架预设 + 导航剥离（~1100 行）
     ├── markdown_conv.py     # HTML→Markdown + 噪音清理（~940 行）
@@ -507,6 +537,16 @@ pdf_utils (无包内依赖)
 ---
 
 ## 更新日志
+
+### v2.1.1 (2026-02-10)
+- 🐛 **Markdown 图片 title 解析修复**：
+  - `collect_md_image_urls` 正确剔除标准 Markdown 图片 title 文本（`![alt](url "title")` → 仅提取 `url`）
+  - 同时处理 title 和非标准尺寸提示（`=800x`）的组合场景
+  - `resolve_relative_md_images` 同步修复，保留 title 部分用于最终输出
+- 🐛 **Editor.js HTML 清洗加固**：
+  - `_sanitize_editorjs_html` 覆盖无引号属性写法（`onclick=alert(1)`、`href=javascript:alert(1)`）
+  - 正则边界修正：无引号属性值匹配限制在 `[^\s>]`，避免吞入标签闭合符 `>`
+- ✅ **新增测试用例**：7 个新测试覆盖 title 剔除和无引号 XSS 清洗
 
 ### v2.1.0 (2026-02-10)
 - ✨ **`--auto-title` 自动命名**：
@@ -549,6 +589,19 @@ pdf_utils (无包内依赖)
   - 新增 `escape_markdown_link_text()` 处理 `]`/`[` 字符
   - 改用 `<h2 id="">` 锚点格式，提升 VSCode/Cursor 兼容性
   - 图片清理改为非破坏性策略（仅警告不删除）
+
+### v1.7.0 (2026-02-10)
+- ✨ **SSR 数据自动提取**：
+  - 新增 `ssr_extract.py` 模块，自动检测并提取 JS 渲染站点的嵌入正文
+  - 支持 Next.js `__NEXT_DATA__`（ProseMirror JSON → HTML）：腾讯云开发者社区
+  - 支持 Modern.js `window._ROUTER_DATA`（MDContent → Markdown）：火山引擎文档
+  - 检测到 SSR 数据时自动跳过 JS 反爬误报，无需 `--force`
+  - Markdown 图片尺寸提示自动清理（如 `=986x`）
+  - SSR 标题优先于 HTML 标题（auto-title 更准确）
+  - 新增 `--no-ssr` 参数禁用 SSR 提取
+- 🐛 **编码检测修复**：
+  - 新增 HTML `<meta charset>` 编码检测，修复 Shift-JIS/EUC-JP 日文页面乱码
+  - 优先级：HTTP Content-Type > HTML meta charset > UTF-8
 
 ### v1.6.0 (2026-02-02)
 - ✨ **双版本输出**（Phase 3-B）：

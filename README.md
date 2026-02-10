@@ -9,6 +9,8 @@
 - ✅ **图片本地化**：自动下载并检测格式（PNG/JPEG/GIF/WebP/SVG）
 - ✅ **批量处理**：URL 文件读取、索引页爬取、合并输出
 - ✅ **特定站点**：微信公众号（自动检测）、Wiki 噪音清理
+- ✅ **SSR 数据提取**：自动从 Next.js / Modern.js 的 SSR 数据中提取正文（腾讯云开发者、火山引擎文档等）
+- ✅ **通用 JSON 富文本转换**：兼容 ProseMirror / Slate / Editor.js / Lexical / Quill Delta 五种 Schema，零依赖自动兜底
 - ✅ **反爬支持**：Cookie/Header/UA 定制
 - ✅ **YAML Frontmatter**：兼容 Obsidian/Hugo/Jekyll
 - ✅ **数据安全**：URL 脱敏、跨域凭据隔离、流式下载防 OOM
@@ -59,7 +61,7 @@ python skills/webpage-to-md/scripts/grab_web_to_md.py "https://wiki.example.com/
   --merge --toc --merge-output wiki.md
 ```
 
-## 四种典型使用场景
+## 五种典型使用场景
 
 | 场景 | 说明 |
 |------|------|
@@ -67,6 +69,7 @@ python skills/webpage-to-md/scripts/grab_web_to_md.py "https://wiki.example.com/
 | **技术博客** | `--keep-html --tags` 保留代码块和复杂表格 |
 | **Wiki 批量** | `--crawl --merge --clean-wiki-noise` 爬取合并 |
 | **Docs 站点** | `--docs-preset mintlify` 一键导出，自动剥离导航 |
+| **SSR 动态站点** | 自动提取 JS 渲染站点正文（两阶段：精确匹配 → JSON 兜底扫描） |
 
 ### Docs 站点导出示例
 
@@ -90,6 +93,23 @@ python skills/webpage-to-md/scripts/grab_web_to_md.py "https://docs.example.com/
 python skills/webpage-to-md/scripts/grab_web_to_md.py --list-presets
 ```
 
+### SSR 动态站点导出示例
+
+```bash
+# 腾讯云开发者文章（Next.js + ProseMirror）— 自动提取
+python skills/webpage-to-md/scripts/grab_web_to_md.py \
+  "https://cloud.tencent.com/developer/article/2624003" \
+  --auto-title --download-images
+
+# 火山引擎文档（Modern.js + MDContent）— 自动提取
+python skills/webpage-to-md/scripts/grab_web_to_md.py \
+  "https://www.volcengine.com/docs/6396/2189942" \
+  --auto-title --download-images --best-effort-images
+
+# 禁用 SSR 提取（回退到普通 HTML 解析）
+python skills/webpage-to-md/scripts/grab_web_to_md.py "https://example.com" --no-ssr
+```
+
 ## 常用参数
 
 | 参数 | 说明 |
@@ -110,6 +130,7 @@ python skills/webpage-to-md/scripts/grab_web_to_md.py --list-presets
 | `--split-output DIR` | 同时输出分文件版本（与 --merge 配合使用） |
 | `--strip-nav` | 移除导航元素（侧边栏等） |
 | `--strip-page-toc` | 移除页内目录 |
+| `--no-ssr` | 禁用 SSR 数据自动提取（默认启用） |
 
 ## 数据安全
 
@@ -125,7 +146,7 @@ python skills/webpage-to-md/scripts/grab_web_to_md.py --list-presets
 | **单图大小限制** | 默认限制单张图片 25MB，防止恶意/超大响应 | `--max-image-bytes` |
 | **映射文件可选** | 可选择不生成 `*.assets.json` 映射文件（并清理已存在的旧映射文件） | `--no-map-json` |
 | **PDF 本地访问** | 生成 PDF 时默认关闭 `--allow-file-access-from-files` | `--pdf-allow-file-access` 可开启 |
-| **HTML 属性净化** | 保留 HTML 时自动过滤 `on*` 事件属性和 `javascript:` 协议 | 自动生效 |
+| **HTML 属性净化** | 保留 HTML 时自动过滤 `on*` 事件属性和 `javascript:` 协议（含无引号写法） | 自动生效 |
 
 ### 安全相关参数
 
@@ -168,6 +189,7 @@ skills-webpage-to-md/
 │       │       ├── images.py           # 图片下载、格式嗅探与路径替换
 │       │       ├── extractors.py       # 正文 / 标题 / 链接提取 + docs 框架预设 + 导航剥离
 │       │       ├── markdown_conv.py    # HTML→Markdown 转换 + 噪音清理 + 链接改写
+│       │       ├── ssr_extract.py     # SSR 数据提取 + 通用 JSON 富文本转换（ProseMirror/Slate/Editor.js/Lexical/Quill）
 │       │       ├── output.py           # 合并 / 分文件 / 索引 / frontmatter 输出
 │       │       └── pdf_utils.py        # Markdown→HTML→PDF 渲染（Edge/Chrome headless）
 │       └── references/
@@ -190,6 +212,7 @@ skills-webpage-to-md/
 | `images.py` | ~500 | 图片下载（流式/跨域隔离）、格式嗅探、路径替换 |
 | `extractors.py` | ~1100 | 正文/标题/链接提取、10 种 Docs 框架预设、导航剥离 |
 | `markdown_conv.py` | ~940 | HTML→Markdown 解析器、LaTeX 公式、表格、噪音清理 |
+| `ssr_extract.py` | ~530 | SSR 数据检测/提取 + 通用 JSON 富文本→HTML 转换器 + 两阶段兜底 |
 | `output.py` | ~450 | Frontmatter 生成、合并/分文件/索引输出、锚点管理 |
 | `pdf_utils.py` | ~420 | Markdown→HTML 渲染、PDF 打印（Edge/Chrome headless） |
 
