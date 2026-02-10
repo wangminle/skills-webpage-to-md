@@ -14,10 +14,11 @@ This skill uses a modular Python package:
 ```
 scripts/
 ├── grab_web_to_md.py       # CLI entry point (argument parsing + orchestration)
-└── webpage_to_md/          # Core package (8 submodules)
+└── webpage_to_md/          # Core package (9 submodules)
     ├── models.py           # Data models (BatchConfig, BatchPageResult, etc.)
     ├── security.py         # URL redaction / JS challenge detection / validation
     ├── http_client.py      # HTTP session creation and HTML fetching
+    ├── ssr_extract.py      # SSR data extraction (Next.js/Modern.js → HTML/Markdown)
     ├── images.py           # Image download, format sniffing, path replacement
     ├── extractors.py       # Content/title/link extraction + docs presets + nav stripping
     ├── markdown_conv.py    # HTML→Markdown converter + noise cleanup + link rewriting
@@ -49,6 +50,23 @@ python SKILL_DIR/scripts/grab_web_to_md.py "https://wiki.example.com/index" \
   --crawl --crawl-pattern 'page=' \
   --merge --toc --merge-output wiki.md
 ```
+
+### SSR Dynamic Site Export (Tencent Cloud, Volcengine, etc.)
+
+```bash
+# Tencent Cloud developer article (Next.js + ProseMirror) — auto-extracted
+python SKILL_DIR/scripts/grab_web_to_md.py "https://cloud.tencent.com/developer/article/xxx" \
+  --auto-title --download-images
+
+# Volcengine docs (Modern.js + MDContent) — auto-extracted
+python SKILL_DIR/scripts/grab_web_to_md.py "https://www.volcengine.com/docs/xxx" \
+  --auto-title --download-images --best-effort-images
+
+# Disable SSR extraction if needed
+python SKILL_DIR/scripts/grab_web_to_md.py "URL" --no-ssr
+```
+
+**Auto behavior**: Detects `__NEXT_DATA__` (Next.js) or `window._ROUTER_DATA` (Modern.js) in HTML → extracts embedded article content → converts ProseMirror JSON to HTML or uses raw MDContent directly. Skips JS anti-scraping warnings when SSR data is available.
 
 ## Core Parameters
 
@@ -196,7 +214,7 @@ python SKILL_DIR/scripts/grab_web_to_md.py "https://docs.example.com/" \
 - Cross-origin image downloads use clean session (no Cookie/Auth leak), including redirect chains
 - Redirects back to same host switch back to credentialed session when needed
 - Clean session inherits proxy/cert/adapters from the base session (still no sensitive headers)
-- HTML attributes sanitized (removes `on*` events, `javascript:` URLs)
+- HTML attributes sanitized (removes `on*` events and `javascript:` URLs, including unquoted attribute variants)
 - Streaming download prevents OOM on large images
 
 ## Anti-Scraping Support
@@ -263,9 +281,23 @@ python SKILL_DIR/scripts/grab_web_to_md.py \
 
 | Site | Protection | Workaround |
 |------|------------|------------|
+| Tencent Cloud Developer | Next.js SSR | **Auto-handled** (SSR extraction) |
+| Volcengine Docs | Modern.js SSR | **Auto-handled** (SSR extraction) |
+| Zhihu (知乎) | Aggressive JS challenge | Use `--local-html` |
 | PyPI | Cloudflare | Use `--local-html` |
 | Some GitHub pages | Cloudflare | Use `--local-html` |
 | News sites | Various | Try `--ua-preset` first, then `--local-html` |
+
+### SSR Auto-Extraction
+
+For sites that use Server-Side Rendering (SSR) frameworks, the tool can automatically extract content from embedded data blocks even when the page appears to require JavaScript:
+
+| Framework | Data Block | Content Format | Sites |
+|-----------|-----------|---------------|-------|
+| Next.js | `__NEXT_DATA__` | ProseMirror JSON → HTML | Tencent Cloud Developer |
+| Modern.js | `window._ROUTER_DATA` | MDContent (raw Markdown) | Volcengine Docs |
+
+SSR extraction is **enabled by default** and runs automatically. Use `--no-ssr` to disable.
 
 ### Design principle
 
@@ -274,7 +306,7 @@ This tool **intentionally** does not include browser automation (Playwright, Sel
 - Avoid complex setup and maintenance
 - Keep the tool lightweight and portable
 
-When JS protection is encountered, the tool honestly reports the limitation and provides a manual workaround.
+When JS protection is encountered and SSR data is not available, the tool honestly reports the limitation and provides a manual workaround.
 
 ## Output Structure
 
@@ -334,6 +366,7 @@ The codebase follows a modular design with clear separation of concerns:
 | `models.py` | Shared data classes (BatchConfig, BatchPageResult, etc.) |
 | `security.py` | URL redaction, JS challenge detection, markdown validation |
 | `http_client.py` | UA presets, session creation, HTML fetching with retries |
+| `ssr_extract.py` | SSR data extraction + universal JSON→HTML converter (ProseMirror/Slate/Editor.js/Lexical/Quill) + HTML sanitization |
 | `images.py` | Image download (streaming, cross-origin isolation), format sniffing |
 | `extractors.py` | Content extraction, 10 docs framework presets, nav stripping |
 | `markdown_conv.py` | HTML→Markdown parser, LaTeX, tables, noise cleanup |

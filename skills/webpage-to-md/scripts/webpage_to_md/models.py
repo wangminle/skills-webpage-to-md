@@ -69,3 +69,4 @@ class BatchConfig:
     docs_preset: Optional[str] = None  # 文档框架预设
     auto_detect: bool = False  # 自动检测框架
     force: bool = False  # 检测到 JS 反爬时强制继续
+    no_ssr: bool = False  # 禁用 SSR 数据自动提取

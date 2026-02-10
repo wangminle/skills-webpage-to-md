@@ -1,5 +1,6 @@
 import importlib.util
 import io
+import json
 import os
 import pathlib
 import sys
@@ -426,6 +427,803 @@ class TestDetectMetaCharset(unittest.TestCase):
     def test_unknown_charset_returns_none(self):
         raw = b'<meta charset="not-a-real-encoding">'
         self.assertIsNone(self.hc._detect_meta_charset(raw))
+
+
+# ============================================================================
+# SSR 提取模块测试
+# ============================================================================
+
+def _load_ssr_module():
+    """动态加载 ssr_extract 模块。"""
+    root = pathlib.Path(__file__).resolve().parents[1]
+    mod_path = root / "skills" / "webpage-to-md" / "scripts" / "webpage_to_md" / "ssr_extract.py"
+    spec = importlib.util.spec_from_file_location("webpage_to_md.ssr_extract", mod_path)
+    assert spec and spec.loader
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+ssr = _load_ssr_module()
+
+
+class TestSSRDetection(unittest.TestCase):
+    """测试 SSR 类型检测和统一入口。"""
+
+    def test_no_ssr_returns_none(self):
+        """普通 HTML 页面应返回 None。"""
+        html = "<html><head><title>普通页面</title></head><body><p>Hello</p></body></html>"
+        self.assertIsNone(ssr.try_ssr_extract(html))
+
+    def test_detects_nextjs(self):
+        """含 __NEXT_DATA__ 的 HTML 应触发 Next.js 提取。"""
+        pm_content = json.dumps({
+            "type": "doc",
+            "content": [
+                {"type": "heading", "attrs": {"level": 2}, "content": [
+                    {"type": "text", "text": "测试标题"}
+                ]},
+                {"type": "paragraph", "content": [
+                    {"type": "text", "text": "这是一段正文内容，长度需要超过50个字符才能通过验证。这是额外的填充文字。"}
+                ]},
+            ]
+        })
+        article_data = json.dumps({
+            "articleInfo": {
+                "title": "测试文章",
+                "content": pm_content,
+            }
+        })
+        next_data = json.dumps({
+            "props": {
+                "pageProps": {
+                    "fallback": {
+                        "/api/article/detail?id=123": json.loads(article_data),
+                    }
+                }
+            }
+        })
+        html = (
+            f'<html><head></head><body>'
+            f'<script id="__NEXT_DATA__" type="application/json">{next_data}</script>'
+            f'</body></html>'
+        )
+        result = ssr.try_ssr_extract(html)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.source_type, "nextjs")
+        self.assertEqual(result.title, "测试文章")
+        self.assertFalse(result.is_markdown)
+        self.assertIn("测试标题", result.body)
+        self.assertIn("正文内容", result.body)
+
+    def test_detects_modernjs_mdcontent(self):
+        """含 _ROUTER_DATA + MDContent 的 HTML 应触发 Modern.js 提取。"""
+        md_content = (
+            "## 变更历史\n\n"
+            "这是一段足够长的 Markdown 正文内容，确保长度超过50个字符的阈值。\n\n"
+            "### 步骤一\n\n"
+            "安装依赖包...\n\n"
+            "![示例图片](https://example.com/img1.png)\n"
+        )
+        router_data = json.dumps({
+            "loaderData": {
+                "docs/(libid)/(docid$)/page": {
+                    "curDoc": {
+                        "Title": "快速部署指南",
+                        "MDContent": md_content,
+                        "Content": "{}",
+                    }
+                }
+            }
+        })
+        html = (
+            f'<html><head></head><body>'
+            f'<script>window._ROUTER_DATA = {router_data};</script>'
+            f'</body></html>'
+        )
+        result = ssr.try_ssr_extract(html)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.source_type, "modernjs")
+        self.assertEqual(result.title, "快速部署指南")
+        self.assertTrue(result.is_markdown)
+        self.assertIn("变更历史", result.body)
+        self.assertIn("安装依赖包", result.body)
+
+
+class TestProseMirrorToHtml(unittest.TestCase):
+    """测试 ProseMirror JSON → HTML 转换（通过通用转换器）。"""
+
+    def test_paragraph(self):
+        doc = {"type": "doc", "content": [
+            {"type": "paragraph", "content": [{"type": "text", "text": "Hello world"}]}
+        ]}
+        html = ssr.richtext_json_to_html(doc)
+        self.assertIn("<p>Hello world</p>", html)
+
+    def test_heading_levels(self):
+        for level in [1, 2, 3, 4, 5, 6]:
+            doc = {"type": "doc", "content": [
+                {"type": "heading", "attrs": {"level": level}, "content": [
+                    {"type": "text", "text": f"H{level}"}
+                ]}
+            ]}
+            html = ssr.richtext_json_to_html(doc)
+            self.assertIn(f"<h{level}>H{level}</h{level}>", html)
+
+    def test_bold_italic_code_marks(self):
+        doc = {"type": "doc", "content": [
+            {"type": "paragraph", "content": [
+                {"type": "text", "text": "bold", "marks": [{"type": "bold"}]},
+                {"type": "text", "text": " "},
+                {"type": "text", "text": "italic", "marks": [{"type": "italic"}]},
+                {"type": "text", "text": " "},
+                {"type": "text", "text": "code", "marks": [{"type": "code"}]},
+            ]}
+        ]}
+        html = ssr.richtext_json_to_html(doc)
+        self.assertIn("<strong>bold</strong>", html)
+        self.assertIn("<em>italic</em>", html)
+        self.assertIn("<code>code</code>", html)
+
+    def test_link_mark(self):
+        doc = {"type": "doc", "content": [
+            {"type": "paragraph", "content": [
+                {"type": "text", "text": "click here",
+                 "marks": [{"type": "link", "attrs": {"href": "https://example.com"}}]},
+            ]}
+        ]}
+        html = ssr.richtext_json_to_html(doc)
+        self.assertIn('<a href="https://example.com">click here</a>', html)
+
+    def test_bullet_list(self):
+        doc = {"type": "doc", "content": [
+            {"type": "bulletList", "content": [
+                {"type": "listItem", "content": [
+                    {"type": "paragraph", "content": [{"type": "text", "text": "item 1"}]}
+                ]},
+                {"type": "listItem", "content": [
+                    {"type": "paragraph", "content": [{"type": "text", "text": "item 2"}]}
+                ]},
+            ]}
+        ]}
+        html = ssr.richtext_json_to_html(doc)
+        self.assertIn("<ul>", html)
+        self.assertIn("<li>", html)
+        self.assertIn("item 1", html)
+        self.assertIn("item 2", html)
+
+    def test_code_block(self):
+        doc = {"type": "doc", "content": [
+            {"type": "codeBlock", "attrs": {"language": "python"},
+             "content": [{"type": "text", "text": "print('hello')"}]}
+        ]}
+        html = ssr.richtext_json_to_html(doc)
+        self.assertIn('<code class="language-python">', html)
+        self.assertIn("print(&#x27;hello&#x27;)", html)
+
+    def test_image(self):
+        doc = {"type": "doc", "content": [
+            {"type": "image", "attrs": {
+                "src": "https://example.com/img.png",
+                "alt": "示例图"
+            }}
+        ]}
+        html = ssr.richtext_json_to_html(doc)
+        self.assertIn('src="https://example.com/img.png"', html)
+        self.assertIn('alt="示例图"', html)
+
+    def test_table(self):
+        doc = {"type": "doc", "content": [
+            {"type": "table", "content": [
+                {"type": "tableRow", "content": [
+                    {"type": "tableHeader", "attrs": {}, "content": [
+                        {"type": "paragraph", "content": [{"type": "text", "text": "名称"}]}
+                    ]},
+                    {"type": "tableHeader", "attrs": {}, "content": [
+                        {"type": "paragraph", "content": [{"type": "text", "text": "说明"}]}
+                    ]},
+                ]},
+                {"type": "tableRow", "content": [
+                    {"type": "tableCell", "attrs": {}, "content": [
+                        {"type": "paragraph", "content": [{"type": "text", "text": "foo"}]}
+                    ]},
+                    {"type": "tableCell", "attrs": {}, "content": [
+                        {"type": "paragraph", "content": [{"type": "text", "text": "bar"}]}
+                    ]},
+                ]},
+            ]}
+        ]}
+        html = ssr.richtext_json_to_html(doc)
+        self.assertIn("<table>", html)
+        self.assertIn("<th>", html)
+        self.assertIn("<td>", html)
+        self.assertIn("名称", html)
+        self.assertIn("foo", html)
+
+    def test_html_escape(self):
+        """特殊字符应被正确转义。"""
+        doc = {"type": "doc", "content": [
+            {"type": "paragraph", "content": [
+                {"type": "text", "text": "<script>alert('xss')</script>"}
+            ]}
+        ]}
+        html = ssr.richtext_json_to_html(doc)
+        self.assertNotIn("<script>", html)
+        self.assertIn("&lt;script&gt;", html)
+
+    def test_hard_break_and_hr(self):
+        doc = {"type": "doc", "content": [
+            {"type": "paragraph", "content": [
+                {"type": "text", "text": "before"},
+                {"type": "hardBreak"},
+                {"type": "text", "text": "after"},
+            ]},
+            {"type": "horizontalRule"},
+        ]}
+        html = ssr.richtext_json_to_html(doc)
+        self.assertIn("<br>", html)
+        self.assertIn("<hr>", html)
+
+
+class TestSlateToHtml(unittest.TestCase):
+    """测试 Slate.js JSON Schema → HTML 转换。"""
+
+    def test_paragraph_with_bold(self):
+        """Slate 风格：children 数组 + 扁平布尔属性标记格式。"""
+        doc = [
+            {"type": "paragraph", "children": [
+                {"text": "normal "},
+                {"text": "bold text", "bold": True},
+                {"text": " end"},
+            ]}
+        ]
+        html = ssr.richtext_json_to_html(doc)
+        self.assertIn("<p>", html)
+        self.assertIn("<strong>bold text</strong>", html)
+        self.assertIn("normal ", html)
+
+    def test_heading_with_level(self):
+        doc = [{"type": "heading", "level": 3, "children": [{"text": "Slate H3"}]}]
+        html = ssr.richtext_json_to_html(doc)
+        self.assertIn("<h3>Slate H3</h3>", html)
+
+    def test_bulleted_list(self):
+        doc = [
+            {"type": "bulleted-list", "children": [
+                {"type": "list-item", "children": [{"text": "apple"}]},
+                {"type": "list-item", "children": [{"text": "banana"}]},
+            ]}
+        ]
+        html = ssr.richtext_json_to_html(doc)
+        self.assertIn("<ul>", html)
+        self.assertIn("<li>", html)
+        self.assertIn("apple", html)
+        self.assertIn("banana", html)
+
+    def test_code_block(self):
+        doc = [{"type": "code-block", "children": [{"text": "x = 1"}]}]
+        html = ssr.richtext_json_to_html(doc)
+        self.assertIn("<pre><code>", html)
+        self.assertIn("x = 1", html)
+
+    def test_image(self):
+        doc = [{"type": "image", "url": "https://img.example.com/pic.jpg",
+                "children": [{"text": ""}]}]
+        html = ssr.richtext_json_to_html(doc)
+        self.assertIn('src="https://img.example.com/pic.jpg"', html)
+
+    def test_italic_and_strikethrough(self):
+        doc = [{"type": "paragraph", "children": [
+            {"text": "styled", "italic": True, "strikethrough": True}
+        ]}]
+        html = ssr.richtext_json_to_html(doc)
+        self.assertIn("<em>", html)
+        self.assertIn("<s>", html)
+
+
+class TestEditorJsToHtml(unittest.TestCase):
+    """测试 Editor.js blocks JSON Schema → HTML 转换。"""
+
+    def test_basic_blocks(self):
+        data = {
+            "blocks": [
+                {"type": "header", "data": {"text": "Editor.js Title", "level": 2}},
+                {"type": "paragraph", "data": {"text": "A paragraph of text."}},
+                {"type": "code", "data": {"code": "console.log('hi')"}},
+            ]
+        }
+        html = ssr.richtext_json_to_html(data)
+        self.assertIn("<h2>Editor.js Title</h2>", html)
+        self.assertIn("<p>A paragraph of text.</p>", html)
+        self.assertIn("<pre><code>console.log(&#x27;hi&#x27;)</code></pre>", html)
+
+    def test_list_block(self):
+        data = {
+            "blocks": [
+                {"type": "list", "data": {
+                    "style": "ordered",
+                    "items": ["first", "second", "third"]
+                }},
+            ]
+        }
+        html = ssr.richtext_json_to_html(data)
+        self.assertIn("<ol>", html)
+        self.assertIn("<li>first</li>", html)
+        self.assertIn("<li>third</li>", html)
+
+    def test_image_block(self):
+        data = {
+            "blocks": [
+                {"type": "image", "data": {
+                    "file": {"url": "https://cdn.example.com/photo.png"},
+                    "caption": "A photo"
+                }},
+            ]
+        }
+        html = ssr.richtext_json_to_html(data)
+        self.assertIn('src="https://cdn.example.com/photo.png"', html)
+        self.assertIn('alt="A photo"', html)
+
+    def test_delimiter_block(self):
+        data = {"blocks": [{"type": "delimiter", "data": {}}]}
+        html = ssr.richtext_json_to_html(data)
+        self.assertIn("<hr>", html)
+
+    def test_quote_block(self):
+        data = {"blocks": [{"type": "quote", "data": {"text": "To be or not to be"}}]}
+        html = ssr.richtext_json_to_html(data)
+        self.assertIn("<blockquote>To be or not to be</blockquote>", html)
+
+    def test_table_block(self):
+        data = {
+            "blocks": [
+                {"type": "table", "data": {
+                    "content": [
+                        ["Name", "Age"],
+                        ["Alice", "30"],
+                    ]
+                }}
+            ]
+        }
+        html = ssr.richtext_json_to_html(data)
+        self.assertIn("<table>", html)
+        self.assertIn("<td>Name</td>", html)
+        self.assertIn("<td>Alice</td>", html)
+
+    def test_html_in_text_preserved(self):
+        """Editor.js data.text 中的 HTML 格式标记应被保留。"""
+        data = {
+            "blocks": [
+                {"type": "paragraph", "data": {"text": "This is <b>bold</b> and <i>italic</i>."}},
+            ]
+        }
+        html = ssr.richtext_json_to_html(data)
+        # HTML 格式标记应原样保留，不应被双重转义
+        self.assertIn("<b>bold</b>", html)
+        self.assertIn("<i>italic</i>", html)
+        # 不应出现转义后的标签
+        self.assertNotIn("&lt;b&gt;", html)
+
+    def test_html_in_list_items_preserved(self):
+        """Editor.js list items 中的 HTML 格式标记应被保留。"""
+        data = {
+            "blocks": [
+                {"type": "list", "data": {
+                    "style": "unordered",
+                    "items": ["<b>bold item</b>", "plain item"]
+                }},
+            ]
+        }
+        html = ssr.richtext_json_to_html(data)
+        self.assertIn("<b>bold item</b>", html)
+        self.assertNotIn("&lt;b&gt;", html)
+
+    def test_dangerous_tags_stripped(self):
+        """Editor.js 内容中的危险标签应被移除。"""
+        data = {
+            "blocks": [
+                {"type": "paragraph", "data": {
+                    "text": 'Safe text<script>alert("xss")</script> end'
+                }},
+            ]
+        }
+        html = ssr.richtext_json_to_html(data)
+        self.assertNotIn("<script>", html)
+        self.assertIn("Safe text", html)
+        self.assertIn("end", html)
+
+    def test_event_attrs_stripped(self):
+        """Editor.js 内容中的带引号事件属性应被移除。"""
+        data = {
+            "blocks": [
+                {"type": "paragraph", "data": {
+                    "text": '<a href="https://example.com" onclick="alert(1)">link</a>'
+                }},
+            ]
+        }
+        html = ssr.richtext_json_to_html(data)
+        self.assertIn("https://example.com", html)
+        self.assertNotIn("onclick", html)
+        self.assertIn("link</a>", html)
+
+    def test_unquoted_event_attrs_stripped(self):
+        """无引号事件属性也应被移除。"""
+        data = {
+            "blocks": [
+                {"type": "paragraph", "data": {
+                    "text": '<a onclick=alert(1) href="https://x.com">x</a>'
+                }},
+            ]
+        }
+        html = ssr.richtext_json_to_html(data)
+        self.assertNotIn("onclick", html)
+        self.assertIn("https://x.com", html)
+
+    def test_unquoted_js_href_stripped(self):
+        """无引号 javascript: 协议应被清除。"""
+        data = {
+            "blocks": [
+                {"type": "paragraph", "data": {
+                    "text": '<a href=javascript:alert(1)>x</a>'
+                }},
+            ]
+        }
+        html = ssr.richtext_json_to_html(data)
+        self.assertNotIn("javascript:", html)
+        self.assertIn("x</a>", html)
+
+    def test_img_onerror_stripped(self):
+        """img 标签上的无引号 onerror 事件应被移除。"""
+        data = {
+            "blocks": [
+                {"type": "paragraph", "data": {
+                    "text": '<img src=x onerror=alert(1)>'
+                }},
+            ]
+        }
+        html = ssr.richtext_json_to_html(data)
+        self.assertNotIn("onerror", html)
+        self.assertIn("<img src=x>", html)
+
+
+class TestLexicalToHtml(unittest.TestCase):
+    """测试 Lexical JSON Schema → HTML 转换。"""
+
+    def test_basic_document(self):
+        """Lexical 风格：root 节点 + children + format 位掩码。"""
+        doc = {"type": "root", "children": [
+            {"type": "paragraph", "children": [
+                {"type": "text", "text": "normal "},
+                {"type": "text", "text": "bold", "format": 1},
+                {"type": "text", "text": " "},
+                {"type": "text", "text": "italic", "format": 2},
+            ]},
+        ]}
+        html = ssr.richtext_json_to_html(doc)
+        self.assertIn("<p>", html)
+        self.assertIn("<strong>bold</strong>", html)
+        self.assertIn("<em>italic</em>", html)
+
+    def test_heading_with_tag(self):
+        """Lexical 使用 tag 字段表示标题级别。"""
+        doc = {"type": "root", "children": [
+            {"type": "heading", "tag": "h3", "children": [
+                {"type": "text", "text": "Lexical H3"}
+            ]},
+        ]}
+        html = ssr.richtext_json_to_html(doc)
+        self.assertIn("<h3>Lexical H3</h3>", html)
+
+    def test_linebreak(self):
+        doc = {"type": "root", "children": [
+            {"type": "paragraph", "children": [
+                {"type": "text", "text": "line 1"},
+                {"type": "linebreak"},
+                {"type": "text", "text": "line 2"},
+            ]},
+        ]}
+        html = ssr.richtext_json_to_html(doc)
+        self.assertIn("<br>", html)
+        self.assertIn("line 1", html)
+        self.assertIn("line 2", html)
+
+    def test_combined_format_bitmask(self):
+        """format=3 表示 bold(1) + italic(2)。"""
+        doc = {"type": "root", "children": [
+            {"type": "paragraph", "children": [
+                {"type": "text", "text": "bold-italic", "format": 3},
+            ]},
+        ]}
+        html = ssr.richtext_json_to_html(doc)
+        self.assertIn("<strong>", html)
+        self.assertIn("<em>", html)
+        self.assertIn("bold-italic", html)
+
+    def test_code_format(self):
+        """format=16 表示 inline code。"""
+        doc = {"type": "root", "children": [
+            {"type": "paragraph", "children": [
+                {"type": "text", "text": "variable", "format": 16},
+            ]},
+        ]}
+        html = ssr.richtext_json_to_html(doc)
+        self.assertIn("<code>variable</code>", html)
+
+    def test_quote(self):
+        doc = {"type": "root", "children": [
+            {"type": "quote", "children": [
+                {"type": "text", "text": "wise words"},
+            ]},
+        ]}
+        html = ssr.richtext_json_to_html(doc)
+        self.assertIn("<blockquote>wise words</blockquote>", html)
+
+
+class TestQuillDeltaConvert(unittest.TestCase):
+    """测试 Quill Delta ops → HTML 转换。"""
+
+    def test_basic_ops(self):
+        ops = [
+            {"insert": "Hello "},
+            {"insert": "bold", "attributes": {"bold": True}},
+            {"insert": "\n\nSecond paragraph\n"},
+        ]
+        html = ssr._convert_quill_ops(ops)
+        self.assertIsNotNone(html)
+        self.assertIn("<strong>bold</strong>", html)
+        self.assertIn("Hello", html)
+
+    def test_image_insert(self):
+        ops = [
+            {"insert": "text before\n"},
+            {"insert": {"image": "https://example.com/photo.jpg"}},
+        ]
+        html = ssr._convert_quill_ops(ops)
+        self.assertIsNotNone(html)
+        self.assertIn('src="https://example.com/photo.jpg"', html)
+
+    def test_header_attribute(self):
+        ops = [
+            {"insert": "Title", "attributes": {"header": 2}},
+        ]
+        html = ssr._convert_quill_ops(ops)
+        self.assertIsNotNone(html)
+        self.assertIn("<h2>Title</h2>", html)
+
+
+class TestModernJsCleanup(unittest.TestCase):
+    """测试 Modern.js MDContent 清理。"""
+
+    def test_clean_admonition(self):
+        md = ":::warning\n内容\n:::\n其他"
+        cleaned = ssr._clean_md_content(md)
+        self.assertNotIn(":::", cleaned)
+        self.assertIn("> **warning**:", cleaned)
+        self.assertIn("内容", cleaned)
+
+    def test_clean_span_anchors(self):
+        md = '<span id="abc123"></span>\n## 标题'
+        cleaned = ssr._clean_md_content(md)
+        self.assertNotIn("<span", cleaned)
+        self.assertIn("## 标题", cleaned)
+
+    def test_clean_jsx_residual(self):
+        md = "正文内容\n\n```\n代码\n```\n\n}></RenderMd></Tabs.TabPane></Tabs>);"
+        cleaned = ssr._clean_md_content(md)
+        self.assertNotIn("RenderMd", cleaned)
+        self.assertIn("正文内容", cleaned)
+
+
+class TestCollectMdImageUrls(unittest.TestCase):
+    """测试从 Markdown 中提取图片 URL。"""
+
+    def test_basic_images(self):
+        md = "![alt](https://example.com/a.png)\n![](https://example.com/b.jpg)"
+        urls = ssr.collect_md_image_urls(md)
+        self.assertEqual(len(urls), 2)
+        self.assertIn("https://example.com/a.png", urls)
+        self.assertIn("https://example.com/b.jpg", urls)
+
+    def test_relative_urls_without_base(self):
+        """无 base_url 时，相对 URL 应被忽略。"""
+        md = "![alt](./local.png)\n![alt](https://example.com/remote.png)"
+        urls = ssr.collect_md_image_urls(md)
+        self.assertEqual(len(urls), 1)
+        self.assertEqual(urls[0], "https://example.com/remote.png")
+
+    def test_relative_urls_with_base(self):
+        """提供 base_url 时，相对 URL 应被解析为绝对 URL。"""
+        md = "![img](/assets/a.png)\n![img](images/b.jpg)\n![abs](https://cdn.example.com/c.png)"
+        urls = ssr.collect_md_image_urls(md, base_url="https://docs.example.com/page/123")
+        self.assertEqual(len(urls), 3)
+        self.assertEqual(urls[0], "https://docs.example.com/assets/a.png")
+        self.assertEqual(urls[1], "https://docs.example.com/page/images/b.jpg")
+        self.assertEqual(urls[2], "https://cdn.example.com/c.png")
+
+    def test_data_uri_ignored_with_base(self):
+        """data: URI 不应被解析。"""
+        md = "![img](data:image/png;base64,iVBOR...)"
+        urls = ssr.collect_md_image_urls(md, base_url="https://example.com/")
+        self.assertEqual(urls, [])
+
+    def test_title_stripped_from_url(self):
+        """标准 Markdown 图片 title 不应污染 URL。"""
+        md = '![alt](https://example.com/a.png "img title")\n![ok](https://example.com/b.png)'
+        urls = ssr.collect_md_image_urls(md)
+        self.assertEqual(len(urls), 2)
+        self.assertEqual(urls[0], "https://example.com/a.png")
+        self.assertEqual(urls[1], "https://example.com/b.png")
+
+    def test_title_with_single_quotes(self):
+        """单引号 title 也应正确剔除。"""
+        md = "![alt](https://example.com/pic.jpg 'hover text')"
+        urls = ssr.collect_md_image_urls(md)
+        self.assertEqual(len(urls), 1)
+        self.assertEqual(urls[0], "https://example.com/pic.jpg")
+
+    def test_title_and_size_hint_combined(self):
+        """同时有 title 和 size hint 时都应剔除。"""
+        md = '![alt](https://example.com/photo.png "title" =800x)'
+        urls = ssr.collect_md_image_urls(md)
+        # 优先剔除 title，再剔除 size hint（如果有）
+        self.assertEqual(len(urls), 1)
+        self.assertTrue(urls[0].startswith("https://example.com/photo.png"))
+        self.assertNotIn('"title"', urls[0])
+
+    def test_no_images(self):
+        md = "# Title\n\nJust text, no images."
+        urls = ssr.collect_md_image_urls(md)
+        self.assertEqual(urls, [])
+
+
+class TestExtractJsonObject(unittest.TestCase):
+    """测试从 HTML 中提取嵌套 JSON 对象。"""
+
+    def test_simple_object(self):
+        html = 'window.x = {"a": 1, "b": "hello"};'
+        start = html.index("{")
+        result = ssr._extract_json_object_str(html, start)
+        self.assertIsNotNone(result)
+        parsed = json.loads(result)
+        self.assertEqual(parsed["a"], 1)
+        self.assertEqual(parsed["b"], "hello")
+
+    def test_nested_object(self):
+        html = 'var x = {"outer": {"inner": [1, 2, 3]}};'
+        start = html.index("{")
+        result = ssr._extract_json_object_str(html, start)
+        self.assertIsNotNone(result)
+        parsed = json.loads(result)
+        self.assertEqual(parsed["outer"]["inner"], [1, 2, 3])
+
+    def test_string_with_braces(self):
+        html = 'var x = {"text": "a { b } c"};'
+        start = html.index("{")
+        result = ssr._extract_json_object_str(html, start)
+        self.assertIsNotNone(result)
+        parsed = json.loads(result)
+        self.assertEqual(parsed["text"], "a { b } c")
+
+
+class TestResolveRelativeMdImages(unittest.TestCase):
+    """测试 Markdown 中相对图片 URL 解析为绝对 URL。"""
+
+    def test_absolute_slash_path(self):
+        md = "text\n![img](/assets/a.png)\nmore"
+        result = ssr.resolve_relative_md_images(md, "https://example.com/docs/page")
+        self.assertIn("![img](https://example.com/assets/a.png)", result)
+
+    def test_relative_path(self):
+        md = "![pic](images/photo.jpg)"
+        result = ssr.resolve_relative_md_images(md, "https://example.com/docs/page")
+        self.assertIn("![pic](https://example.com/docs/images/photo.jpg)", result)
+
+    def test_absolute_url_unchanged(self):
+        md = "![img](https://cdn.example.com/pic.png)"
+        result = ssr.resolve_relative_md_images(md, "https://example.com/")
+        self.assertIn("![img](https://cdn.example.com/pic.png)", result)
+
+    def test_data_uri_unchanged(self):
+        md = "![img](data:image/png;base64,abc123)"
+        result = ssr.resolve_relative_md_images(md, "https://example.com/")
+        self.assertIn("data:image/png;base64,abc123", result)
+
+    def test_no_base_url_unchanged(self):
+        md = "![img](/assets/a.png)"
+        result = ssr.resolve_relative_md_images(md, "")
+        self.assertEqual(md, result)
+
+    def test_mixed_urls(self):
+        md = (
+            "![a](/local/a.png)\n"
+            "![b](https://cdn.com/b.jpg)\n"
+            "![c](relative/c.gif)"
+        )
+        result = ssr.resolve_relative_md_images(md, "https://example.com/page/1")
+        self.assertIn("https://example.com/local/a.png", result)
+        self.assertIn("https://cdn.com/b.jpg", result)
+        self.assertIn("https://example.com/page/relative/c.gif", result)
+
+
+class TestBatchSSRBypassJsChallenge(unittest.TestCase):
+    """测试批量模式下 SSR 数据可用时应绕过 JS 反爬拦截（P1 修复验证）。"""
+
+    def test_ssr_available_bypasses_js_challenge(self):
+        """含 __NEXT_DATA__ + noscript 标签的页面在批量模式下不应被拦截。"""
+        pm_content = json.dumps({
+            "type": "doc",
+            "content": [
+                {"type": "paragraph", "content": [
+                    {"type": "text", "text": "这是一段正文内容，长度需要超过50个字符才能通过验证。这是额外的填充文字确保够长。再多加一些文字确保 HTML 输出超过阈值。"}
+                ]},
+            ]
+        })
+        article_data = {
+            "articleInfo": {
+                "title": "测试文章",
+                "content": pm_content,
+            }
+        }
+        next_data = json.dumps({
+            "props": {"pageProps": {"fallback": {
+                "/api/article/detail?id=1": article_data,
+            }}}
+        })
+        # 构造带 noscript 的 HTML（会触发 JS 反爬检测）
+        html = (
+            '<html><head></head><body>'
+            '<noscript>请启用 JavaScript</noscript>'
+            '<div id="root"></div>'
+            f'<script id="__NEXT_DATA__" type="application/json">{next_data}</script>'
+            '</body></html>'
+        )
+        config = grab.BatchConfig(download_images=False, no_ssr=False, force=False)
+        with unittest.mock.patch.object(grab, 'fetch_html', return_value=html):
+            result = grab.process_single_url(
+                session=object(), url='https://example.com/article/1', config=config
+            )
+        # SSR 数据可用，不应被 JS 反爬拦截
+        self.assertTrue(result.success)
+        self.assertIn("正文内容", result.md_content)
+
+    def test_no_ssr_still_blocked(self):
+        """无 SSR 数据的 JS 反爬页面在非 force 模式下仍应被拦截。"""
+        html = (
+            '<html><head></head><body>'
+            '<noscript>请启用 JavaScript</noscript>'
+            '<div id="root">Loading...</div>'
+            '</body></html>'
+        )
+        config = grab.BatchConfig(download_images=False, no_ssr=False, force=False)
+        with unittest.mock.patch.object(grab, 'fetch_html', return_value=html):
+            result = grab.process_single_url(
+                session=object(), url='https://example.com/spa', config=config
+            )
+        self.assertFalse(result.success)
+        self.assertIn("反爬", result.error or "")
+
+
+class TestSSRTitleExtraction(unittest.TestCase):
+    """测试 _extract_title_for_filename 与 SSR 集成。"""
+
+    def test_ssr_title_takes_priority(self):
+        """SSR 标题应优先于 HTML 标题。"""
+        html = "<html><head><title>HTML 标题</title></head><body><h1>H1 标题</h1></body></html>"
+        ssr_content = ssr.SSRContent(
+            title="SSR 标题",
+            body="<p>content</p>",
+            source_type="nextjs",
+            is_markdown=False,
+        )
+        title = grab._extract_title_for_filename(html, ssr_result=ssr_content)
+        self.assertEqual(title, "SSR 标题")
+
+    def test_fallback_without_ssr(self):
+        """无 SSR 时回退到 H1 → title 标签。"""
+        html = "<html><head><title>网页标题</title></head><body><h1>主标题</h1></body></html>"
+        title = grab._extract_title_for_filename(html)
+        self.assertEqual(title, "主标题")
 
 
 if __name__ == "__main__":
