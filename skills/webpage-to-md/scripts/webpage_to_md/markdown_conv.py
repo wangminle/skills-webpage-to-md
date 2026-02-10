@@ -4,9 +4,20 @@ import html as htmllib
 import re
 from html.parser import HTMLParser
 from typing import Dict, List, Optional, Sequence, Tuple, Union
-from urllib.parse import unquote, urljoin, urlparse
+from urllib.parse import quote, unquote, urljoin, urlparse
 
 from .security import redact_url
+
+
+def _safe_markdown_url(url: str) -> str:
+    """
+    Ensure URL is safe for Markdown link destination (encode spaces and parentheses).
+    """
+    if not url:
+        return ""
+    # Only replace spaces and parentheses which break standard Markdown links.
+    # Avoid full quote() to prevent double-encoding % or other characters if not needed.
+    return url.replace(" ", "%20").replace("(", "%28").replace(")", "%29")
 
 
 def is_probable_icon(url: str) -> bool:
@@ -404,7 +415,9 @@ class HTMLToMarkdown(HTMLParser):
                         alt = (attrs.get("alt") or "").strip()
                         alt = alt.replace("[", "").replace("]", "")
                         local = self.url_to_local.get(img_url, img_url)
-                        self.cell_buf.append(f"![{alt}]({local})")
+                        # Encode spaces/parens in URL for valid Markdown
+                        safe_url = _safe_markdown_url(local)
+                        self.cell_buf.append(f"![{alt}]({safe_url})")
             return
 
         if tag in ("p",):
@@ -474,8 +487,10 @@ class HTMLToMarkdown(HTMLParser):
             alt = (attrs.get("alt") or "").strip()
             alt = alt.replace("[", "").replace("]", "")
             local = self.url_to_local.get(img_url, img_url)
+            # Encode spaces/parens in URL for valid Markdown
+            safe_url = _safe_markdown_url(local)
             self._ensure_blank_line()
-            self.out.append(f"![{alt}]({local})\n")
+            self.out.append(f"![{alt}]({safe_url})\n")
         elif tag in ("ul", "ol"):
             if self.list_stack:
                 if not self._tail().endswith("\n"):
@@ -560,7 +575,8 @@ class HTMLToMarkdown(HTMLParser):
                 href = self.table_a_href
                 if href:
                     href = urljoin(self.base_url, href)
-                    self._table_append(f"[{text}]({href})")
+                    safe_href = _safe_markdown_url(href)
+                    self._table_append(f"[{text}]({safe_href})")
                 else:
                     self._table_append(text)
                 self.table_in_a = False
@@ -697,7 +713,8 @@ class HTMLToMarkdown(HTMLParser):
 
             if href:
                 href = urljoin(self.base_url, href)
-                self.out.append(f"[{text}]({href})")
+                safe_href = _safe_markdown_url(href)
+                self.out.append(f"[{text}]({safe_href})")
             else:
                 self.out.append(text)
             self.in_a = False

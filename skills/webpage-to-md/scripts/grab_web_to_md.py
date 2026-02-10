@@ -82,6 +82,7 @@ from webpage_to_md.markdown_conv import (
 from webpage_to_md.output import (
     _default_basename,
     _safe_path_length,
+    _sanitize_filename_part,
     auto_wrap_output_dir,
     batch_save_individual,
     generate_frontmatter,
@@ -708,6 +709,73 @@ def _batch_main(args: argparse.Namespace) -> int:
     return EXIT_SUCCESS
 
 
+def _fetch_page_html(
+    session: requests.Session,
+    url: str,
+    args: argparse.Namespace,
+) -> Tuple[Optional[str], Optional[int]]:
+    """获取页面 HTML 并处理错误和 JS 反爬检测。
+
+    Returns:
+        (page_html, exit_code) — exit_code 为 None 表示成功
+    """
+    print(f"下载页面：{url}")
+    try:
+        page_html = fetch_html(
+            session=session,
+            url=url,
+            timeout_s=args.timeout,
+            retries=args.retries,
+            max_html_bytes=args.max_html_bytes,
+        )
+    except requests.exceptions.HTTPError as exc:
+        status = exc.response.status_code if exc.response is not None else "unknown"
+        safe_url = redact_url(url) if args.redact_url else url
+        print(f"错误：请求失败（HTTP {status}）：{safe_url}", file=sys.stderr)
+        if status in (403, 429):
+            print("", file=sys.stderr)
+            print("可能触发了站点的反爬或访问频控。建议：", file=sys.stderr)
+            print("  1. 在浏览器中打开该 URL，等待页面完全加载", file=sys.stderr)
+            print("  2. 右键页面另存为 .html 文件", file=sys.stderr)
+            print("  3. 使用 --local-html 与 --base-url 进行处理，例如：", file=sys.stderr)
+            print(
+                f'     python grab_web_to_md.py --local-html saved.html --base-url "{safe_url}" --out output.md',
+                file=sys.stderr,
+            )
+        return None, EXIT_ERROR
+    except requests.exceptions.RequestException as exc:
+        safe_url = redact_url(url) if args.redact_url else url
+        print(f"错误：下载失败：{safe_url}", file=sys.stderr)
+        print(f"详情：{exc}", file=sys.stderr)
+        print("建议：可改用浏览器保存 HTML 后，通过 --local-html 离线处理。", file=sys.stderr)
+        return None, EXIT_ERROR
+
+    # JS 反爬检测
+    js_detection = detect_js_challenge(page_html)
+    if js_detection.is_challenge:
+        print_js_challenge_warning(js_detection, url)
+        if not args.force:
+            return None, EXIT_JS_CHALLENGE
+        print("已添加 --force 参数，强制继续处理...", file=sys.stderr)
+
+    return page_html, None
+
+
+def _extract_title_for_filename(page_html: str, url: str = "") -> str:
+    """从页面 HTML 中提取标题（用于自动命名文件）。
+
+    优先级：微信标题 > H1 > <title> > "Untitled"
+    """
+    # 注意：url 可能为空（--local-html 未指定 --base-url），
+    # 此时仍需通过 HTML 特征检测微信页面，因此两个条件用 or 连接。
+    is_wechat = (bool(url) and is_wechat_article_url(url)) or is_wechat_article_html(page_html)
+    if is_wechat:
+        wechat_title = extract_wechat_title(page_html)
+        if wechat_title:
+            return wechat_title
+    return extract_h1(page_html) or extract_title(page_html) or "Untitled"
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     ap = argparse.ArgumentParser(
         description="抓取网页正文与图片，保存为 Markdown + assets。支持单页和批量模式。",
@@ -731,6 +799,8 @@ urls.txt 文件格式：
     )
     ap.add_argument("url", nargs="?", help="要抓取的网页 URL（单页模式必需，批量模式可选）")
     ap.add_argument("--out", help="输出 md 文件名（默认根据 URL 自动生成）")
+    ap.add_argument("--auto-title", action="store_true",
+                    help="从页面标题自动生成输出文件名（优先级低于 --out；未指定 --out 时生效）")
     ap.add_argument("--assets-dir", help="图片目录名（默认 <out>.assets）")
     ap.add_argument("--title", help="Markdown 顶部标题（默认从 <title> 提取）")
     ap.add_argument("--with-pdf", action="store_true", help="同时生成同名 PDF（需要本机 Edge/Chrome）")
@@ -884,6 +954,12 @@ urls.txt 文件格式：
     
     # ========== 单页处理模式（原有逻辑） ==========
     
+    page_html: Optional[str] = None  # 可能在 auto-title 或 local-html 模式下提前获取
+    session: Optional[requests.Session] = None  # 可能在 auto-title 模式下提前创建
+
+    # --auto-title 与 --out 同时指定时，--out 优先（auto-title 被忽略）
+    use_auto_title = bool(args.auto_title and not args.out)
+
     # 支持 --local-html 模式（从本地文件读取，跳过网络请求）
     if args.local_html:
         if not os.path.isfile(args.local_html):
@@ -914,6 +990,13 @@ urls.txt 文件格式：
         # 输出文件名
         if args.out:
             base = args.out
+        elif use_auto_title:
+            _page_title = _extract_title_for_filename(page_html, url)
+            _auto_name = _sanitize_filename_part(_page_title)
+            if len(_auto_name) > 80:
+                _auto_name = _auto_name[:80].rstrip("-")
+            base = _auto_name + ".md"
+            print(f"自动标题命名：{_page_title} → {base}")
         else:
             base = os.path.splitext(os.path.basename(args.local_html))[0] + ".md"
     else:
@@ -922,7 +1005,23 @@ urls.txt 文件格式：
             ap.error("单页模式必须提供 URL 参数，或使用 --urls-file / --crawl 进入批量模式，或使用 --local-html 读取本地文件")
         
         url = args.url
-        base = args.out or (_default_basename(url) + ".md")
+
+        if args.out:
+            base = args.out
+        elif use_auto_title:
+            # --auto-title 模式：先获取页面，提取标题后生成文件名
+            session = _create_session(args, referer_url=url)
+            page_html, exit_code = _fetch_page_html(session, url, args)
+            if exit_code is not None:
+                return exit_code
+            _page_title = _extract_title_for_filename(page_html, url)
+            _auto_name = _sanitize_filename_part(_page_title)
+            if len(_auto_name) > 80:
+                _auto_name = _auto_name[:80].rstrip("-")
+            base = _auto_name + ".md"
+            print(f"自动标题命名：{_page_title} → {base}")
+        else:
+            base = _default_basename(url) + ".md"
     
     out_md = base
     # 自动创建同名上级目录（如果用户未指定目录）
@@ -943,45 +1042,15 @@ urls.txt 文件格式：
         print(f"文件已存在：{out_md}（如需覆盖请加 --overwrite）", file=sys.stderr)
         return EXIT_FILE_EXISTS
 
-    session = _create_session(args, referer_url=url)
+    # 创建 Session（如果尚未在 auto-title 流程中创建）
+    if session is None:
+        session = _create_session(args, referer_url=url)
 
-    # 网络模式下下载页面
-    if not args.local_html:
-        print(f"下载页面：{url}")
-        try:
-            page_html = fetch_html(
-                session=session,
-                url=url,
-                timeout_s=args.timeout,
-                retries=args.retries,
-                max_html_bytes=args.max_html_bytes,
-            )
-        except requests.exceptions.HTTPError as exc:
-            status = exc.response.status_code if exc.response is not None else "unknown"
-            safe_url = redact_url(url) if args.redact_url else url
-            print(f"错误：请求失败（HTTP {status}）：{safe_url}", file=sys.stderr)
-            if status in (403, 429):
-                print("", file=sys.stderr)
-                print("可能触发了站点的反爬或访问频控。建议：", file=sys.stderr)
-                print("  1. 在浏览器中打开该 URL，等待页面完全加载", file=sys.stderr)
-                print("  2. 右键页面另存为 .html 文件", file=sys.stderr)
-                print("  3. 使用 --local-html 与 --base-url 进行处理，例如：", file=sys.stderr)
-                print(f'     python grab_web_to_md.py --local-html saved.html --base-url "{safe_url}" --out output.md', file=sys.stderr)
-            return EXIT_ERROR
-        except requests.exceptions.RequestException as exc:
-            safe_url = redact_url(url) if args.redact_url else url
-            print(f"错误：下载失败：{safe_url}", file=sys.stderr)
-            print(f"详情：{exc}", file=sys.stderr)
-            print("建议：可改用浏览器保存 HTML 后，通过 --local-html 离线处理。", file=sys.stderr)
-            return EXIT_ERROR
-        
-        # ====== JS 反爬检测 ======
-        js_detection = detect_js_challenge(page_html)
-        if js_detection.is_challenge:
-            print_js_challenge_warning(js_detection, url)
-            if not args.force:
-                return EXIT_JS_CHALLENGE
-            print("已添加 --force 参数，强制继续处理...", file=sys.stderr)
+    # 网络模式下下载页面（如果尚未在 auto-title 流程中获取）
+    if not args.local_html and page_html is None:
+        page_html, exit_code = _fetch_page_html(session, url, args)
+        if exit_code is not None:
+            return exit_code
 
     # 微信公众号文章自动检测
     is_wechat = args.wechat

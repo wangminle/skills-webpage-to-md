@@ -44,6 +44,12 @@ pip install requests
 # 单页导出
 python skills/webpage-to-md/scripts/grab_web_to_md.py "https://example.com/article" --out article.md
 
+# 自动按页面标题命名（例如：如何学Python/如何学Python.md）
+python skills/webpage-to-md/scripts/grab_web_to_md.py "https://example.com/article" --auto-title
+
+# 离线微信 HTML 也支持自动标题（无需 --base-url 即可提取微信标题）
+python skills/webpage-to-md/scripts/grab_web_to_md.py --local-html wechat.html --auto-title
+
 # 微信公众号（自动检测）
 python skills/webpage-to-md/scripts/grab_web_to_md.py "https://mp.weixin.qq.com/s/xxx"
 
@@ -89,6 +95,7 @@ python skills/webpage-to-md/scripts/grab_web_to_md.py --list-presets
 | 参数 | 说明 |
 |------|------|
 | `--out` | 输出文件路径 |
+| `--auto-title` | 自动按页面标题生成文件名（仅单页模式；未指定 `--out` 时生效；批量/爬取模式无效） |
 | `--validate` | 校验图片完整性 |
 | `--max-html-bytes` | 单页 HTML 最大字节数（默认 10MB；0 表示不限制） |
 | `--keep-html` | 复杂表格保留 HTML |
@@ -231,6 +238,13 @@ docs/
 ├── article.md
 ├── article.assets/
 └── article.md.assets.json
+
+# 输入：--auto-title（标题为“我的文章”）
+# 输出结构：
+我的文章/
+├── 我的文章.md
+├── 我的文章.assets/
+└── 我的文章.md.assets.json
 ```
 
 ## License

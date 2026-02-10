@@ -41,6 +41,7 @@ pip install pytest
 |------|------|--------|
 | `url` | 目标网页 URL | - |
 | `--out` | 输出文件名 | 根据 URL 生成 |
+| `--auto-title` | 自动按页面标题生成输出文件名（仅单页模式；未指定 `--out` 时生效；批量/爬取模式无效） | `False` |
 | `--assets-dir` | 图片目录 | `<out>.assets` |
 | `--title` | 文档标题 | 从 `<title>` 提取 |
 | `--overwrite` | 覆盖已存在文件 | `False` |
@@ -176,6 +177,9 @@ python scripts/grab_web_to_md.py https://example.com/article
 python scripts/grab_web_to_md.py https://example.com/article \
   --out my-article.md --tags "ai,tutorial"
 
+# 自动按标题命名（例如：学习笔记/学习笔记.md）
+python scripts/grab_web_to_md.py https://example.com/article --auto-title
+
 # 图片失败不中断
 python scripts/grab_web_to_md.py https://example.com/gallery --best-effort-images
 
@@ -255,6 +259,9 @@ python scripts/grab_web_to_md.py "https://mp.weixin.qq.com/s/xxx"
 
 # 强制启用
 python scripts/grab_web_to_md.py "URL" --wechat
+
+# 离线 HTML（未提供 URL 也可从微信页面特征提取标题）
+python scripts/grab_web_to_md.py --local-html wechat_saved.html --auto-title
 ```
 
 **自动处理**：提取 `rich_media_content`、标题从 `og:title` 获取、清理交互按钮
@@ -500,6 +507,19 @@ pdf_utils (无包内依赖)
 ---
 
 ## 更新日志
+
+### v2.1.0 (2026-02-10)
+- ✨ **`--auto-title` 自动命名**：
+  - 从页面 `<h1>` / `<title>` 提取标题，清理后作为输出文件名
+  - 仅单页模式生效；`--out` 优先级更高
+  - 支持 `--local-html` 离线微信页面（无需 `--base-url` 即可通过 HTML 特征提取微信标题）
+  - 标题长度限制 80 字符，特殊字符替换为连字符
+- 🐛 **修复 `--validate` 校验误报**：
+  - 修复本地图片路径包含 URL 编码（%20/%28/%29）时被误判为缺失的问题
+  - 采用"先查字面路径 → 再回退解码路径"策略，兼容字面包含 `%20` 的文件名
+- 🏗️ **代码重构**：
+  - 新增 `_fetch_page_html()` 辅助函数，统一页面获取 + 错误处理 + JS 反爬检测
+  - 新增 `_extract_title_for_filename()` 标题提取函数（微信标题 > H1 > title > Untitled）
 
 ### v2.0.0 (2026-02-06)
 - 🏗️ **模块化重构**：将单文件 `grab_web_to_md.py`（~3700 行）拆分为 `webpage_to_md` 包（8 个子模块）：
