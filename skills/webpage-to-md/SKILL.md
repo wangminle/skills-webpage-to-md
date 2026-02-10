@@ -35,6 +35,12 @@ When using this skill, replace `SKILL_DIR` with the actual skill installation pa
 # Single page export
 python SKILL_DIR/scripts/grab_web_to_md.py "https://example.com/article" --out output.md --validate
 
+# Auto-name from page title (e.g. "如何学Python" → 如何学Python/如何学Python.md)
+python SKILL_DIR/scripts/grab_web_to_md.py "https://example.com/article" --auto-title
+
+# Local WeChat HTML offline (title can still be extracted without --base-url)
+python SKILL_DIR/scripts/grab_web_to_md.py --local-html wechat_saved.html --auto-title
+
 # WeChat article (auto-detected)
 python SKILL_DIR/scripts/grab_web_to_md.py "https://mp.weixin.qq.com/s/xxx" --out article.md
 
@@ -49,6 +55,7 @@ python SKILL_DIR/scripts/grab_web_to_md.py "https://wiki.example.com/index" \
 | Parameter | Purpose | Example |
 |-----------|---------|---------|
 | `--out` | Output file path | `--out docs/article.md` |
+| `--auto-title` | Auto-name output file from page title (single-page only; ignored when `--out` is set or in batch/crawl mode) | `--auto-title` |
 | `--validate` | Verify image integrity | `--validate` |
 | `--max-html-bytes` | Max HTML bytes per page (0=unlimited) | `--max-html-bytes 0` |
 | `--keep-html` | Preserve complex tables | `--keep-html` |
@@ -75,7 +82,7 @@ python SKILL_DIR/scripts/grab_web_to_md.py "https://mp.weixin.qq.com/s/xxx" \
   --out article.md
 ```
 
-**Auto behavior**: Detects WeChat URL → extracts `rich_media_content` → cleans interaction buttons.
+**Auto behavior**: Detects WeChat URL or WeChat HTML markers → extracts `rich_media_content` → cleans interaction buttons.
 
 ### 3. Wiki Batch Crawl + Merge
 

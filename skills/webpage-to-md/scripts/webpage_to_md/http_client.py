@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import codecs
 import json
+import re
 import sys
 import time
 from typing import Dict, Optional, Sequence
@@ -42,6 +44,36 @@ UA_PRESETS: Dict[str, str] = {
         "Chrome/120.0.0.0 Safari/537.36"
     ),
 }
+
+
+# ---------------------------------------------------------------------------
+# HTML <meta> charset detection
+# ---------------------------------------------------------------------------
+# 仅扫描 HTML 前 4KB 的 ASCII 安全区域来寻找 <meta charset="..."> 或
+# <meta http-equiv="Content-Type" content="...; charset=...">
+_META_CHARSET_RE = re.compile(
+    rb'<meta[^>]+charset=["\']?\s*([A-Za-z0-9_.:-]+)',
+    re.IGNORECASE,
+)
+
+
+def _detect_meta_charset(raw: bytes, limit: int = 4096) -> Optional[str]:
+    """从 HTML 原始字节的前 *limit* 字节中提取 <meta> 声明的编码。
+
+    返回标准化后的编码名称（可直接传给 ``bytes.decode``），
+    未找到或名称无法识别时返回 ``None``。
+    """
+    m = _META_CHARSET_RE.search(raw[:limit])
+    if not m:
+        return None
+    charset = m.group(1).decode("ascii", errors="ignore").strip()
+    if not charset:
+        return None
+    # 标准化编码名称（sjis → shift_jis，euc-jp → euc_jp 等）
+    try:
+        return codecs.lookup(charset).name
+    except LookupError:
+        return None
 
 
 def _resolve_user_agent(user_agent: Optional[str], ua_preset: str) -> str:
@@ -91,8 +123,28 @@ def fetch_html(
                 if max_bytes is not None and len(buf) > max_bytes:
                     raise RuntimeError(f"HTML 响应过大（>{max_bytes} bytes）：{url}")
 
-            encoding = r.encoding or "utf-8"
-            return bytes(buf).decode(encoding, errors="replace")
+            raw = bytes(buf)
+
+            # ── 编码检测 ──────────────────────────────────────
+            # requests 在 HTTP Content-Type 未声明 charset 时会默认
+            # ISO-8859-1（RFC 2616）。但很多非英语页面仅在 HTML <meta>
+            # 中声明实际编码（如 Shift_JIS、EUC-JP、GB2312）。
+            # 策略：
+            #   1. 如果 HTTP 头明确给出了 charset → 直接采信
+            #   2. 否则，尝试从 HTML <meta> 中提取 charset
+            #   3. 都没有时回退到 utf-8
+            http_encoding = r.encoding  # 可能为 None 或 ISO-8859-1
+            is_default = (
+                http_encoding is None
+                or http_encoding.lower().replace("-", "") in ("iso88591", "latin1")
+            )
+            if is_default:
+                meta_enc = _detect_meta_charset(raw)
+                encoding = meta_enc or "utf-8"
+            else:
+                encoding = http_encoding  # type: ignore[assignment]
+
+            return raw.decode(encoding, errors="replace")
         except Exception as e:
             last_err = e
             if attempt >= retries:

@@ -5,7 +5,7 @@ import os
 import re
 import sys
 from typing import Dict, List, Optional, Union
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 from .models import JSChallengeResult, ValidationResult
 
@@ -217,13 +217,26 @@ def validate_markdown(md_path: str, assets_dir: str) -> ValidationResult:
     local_refs = [r for r in refs if not re.match(r"^[a-z]+://", r, re.IGNORECASE)]
 
     missing: List[str] = []
+    md_parent = os.path.dirname(md_path)
     for r in local_refs:
+        # 先按字面路径检查（处理文件名本身包含 %20 等字面序列的情况）
         if os.path.isabs(r) or re.match(r"^[A-Za-z]:[\\/]", r):
-            p = os.path.normpath(r)
+            p_raw = os.path.normpath(r)
         else:
-            p = os.path.normpath(os.path.join(os.path.dirname(md_path), r))
-        if not os.path.exists(p):
-            missing.append(r)
+            p_raw = os.path.normpath(os.path.join(md_parent, r))
+        if os.path.exists(p_raw):
+            continue
+        # 字面路径不存在时，回退到 URL 解码后再查
+        # （_safe_markdown_url 会把空格→%20、括号→%28/%29，实际文件名无编码）
+        decoded = unquote(r)
+        if decoded != r:
+            if os.path.isabs(decoded) or re.match(r"^[A-Za-z]:[\\/]", decoded):
+                p_decoded = os.path.normpath(decoded)
+            else:
+                p_decoded = os.path.normpath(os.path.join(md_parent, decoded))
+            if os.path.exists(p_decoded):
+                continue
+        missing.append(r)
 
     asset_files = 0
     if os.path.isdir(assets_dir):
