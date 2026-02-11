@@ -33,6 +33,22 @@ from typing import Dict, List, Optional, Sequence, Tuple, Callable
 
 import requests
 
+# ── 确保输出实时可见 ────────────────────────────────────────────────
+# 当 stdout 通过管道/重定向（非 TTY）时，Python 默认使用块缓冲，
+# 导致进度信息被缓冲在内存中无法实时显示。强制使用行缓冲（line buffering）
+# 可确保每条 print() 输出都会立即刷新到接收端。
+if hasattr(sys.stdout, "reconfigure"):
+    # Python 3.7+：直接切换为行缓冲
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except Exception:
+        pass
+if hasattr(sys.stderr, "reconfigure"):
+    try:
+        sys.stderr.reconfigure(line_buffering=True)
+    except Exception:
+        pass
+
 # 支持通过 importlib 直接加载本脚本时导入同级 package
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 if _SCRIPT_DIR not in sys.path:
