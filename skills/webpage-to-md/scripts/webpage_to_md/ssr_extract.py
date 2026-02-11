@@ -766,7 +766,7 @@ def _extract_modernjs(page_html: str, url: str) -> Optional[SSRContent]:
         return None
 
     cur_doc = None
-    for key, val in loader.items():
+    for _key, val in loader.items():
         if isinstance(val, dict) and "curDoc" in val:
             cur_doc = val["curDoc"]
             break
