@@ -1226,5 +1226,236 @@ class TestSSRTitleExtraction(unittest.TestCase):
         self.assertEqual(title, "主标题")
 
 
+# ============================================================================
+#  微信异步渲染文章（图文笔记/小绿书）提取测试
+# ============================================================================
+
+def _load_extractors_module():
+    root = pathlib.Path(__file__).resolve().parents[1]
+    mod_path = root / "skills" / "webpage-to-md" / "scripts" / "webpage_to_md" / "extractors.py"
+    spec = importlib.util.spec_from_file_location("webpage_to_md.extractors", mod_path)
+    assert spec and spec.loader
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+ext = _load_extractors_module()
+
+# 最小的 window.cgiDataNew HTML 样例，模拟微信图文笔记格式
+_WECHAT_ASYNC_HTML = (
+    "<html><head><title>微信</title></head><body>"
+    "<script>"
+    "window.cgiDataNew = {"
+    "  is_async: '1',"
+    "  item_show_type: '10',"
+    "  title: JsDecode('\\x5fae\\x4fe1\\x56fe\\x6587\\x7b14\\x8bb0'),"
+    "  nick_name: JsDecode('\\x6d4b\\x8bd5\\x516c\\x4f17\\x53f7'),"
+    "  signature: JsDecode('\\x8fd9\\x662f\\x7b7e\\x540d'),"
+    "  cdn_url: JsDecode('https://example.com/img.jpg'),"
+    "  source_url: JsDecode(''),"
+    "  create_time: JsDecode('1709280000'),"
+    "  text_page_info: ["
+    "    {"
+    "      content_noencode: JsDecode('\\x8fd9\\x662f\\x6b63\\x6587\\x5185\\x5bb9\\x3c br\\x3e\\x7b2c\\x4e8c\\x884c'),"
+    "    }"
+    "  ],"
+    "};"
+    "</script>"
+    "</body></html>"
+)
+
+# 传统微信文章 HTML（有 rich_media_content）——不应被误判为异步格式
+_WECHAT_TRADITIONAL_HTML = (
+    '<html><head><title>微信</title></head><body>'
+    '<h1 class="rich_media_title">传统文章</h1>'
+    '<div class="rich_media_content" id="js_content"><p>传统正文</p></div>'
+    '</body></html>'
+)
+
+
+class TestWechatJsDecode(unittest.TestCase):
+    """测试 _wechat_jsdecode 转义还原。"""
+
+    def test_basic_escapes(self):
+        self.assertEqual(ext._wechat_jsdecode("a\\x26b"), "a&b")
+        self.assertEqual(ext._wechat_jsdecode("\\x3ctag\\x3e"), "<tag>")
+        self.assertEqual(ext._wechat_jsdecode("line1\\x0aline2"), "line1\nline2")
+
+    def test_backslash(self):
+        self.assertEqual(ext._wechat_jsdecode("a\\x5cb"), "a\\b")
+
+    def test_no_escapes(self):
+        self.assertEqual(ext._wechat_jsdecode("plain text"), "plain text")
+
+
+class TestIsWechatAsyncArticle(unittest.TestCase):
+    """测试异步微信文章检测。"""
+
+    def test_detects_async_article(self):
+        self.assertTrue(ext.is_wechat_async_article(_WECHAT_ASYNC_HTML))
+
+    def test_traditional_not_detected(self):
+        self.assertFalse(ext.is_wechat_async_article(_WECHAT_TRADITIONAL_HTML))
+
+    def test_plain_html_not_detected(self):
+        self.assertFalse(ext.is_wechat_async_article("<html><body>hello</body></html>"))
+
+    def test_cgidata_without_async_flag(self):
+        html = "<html><body><script>window.cgiDataNew = { is_async: '0' };</script></body></html>"
+        self.assertFalse(ext.is_wechat_async_article(html))
+
+    def test_cgidata_with_rich_media(self):
+        html = (
+            '<html><body>'
+            '<div class="rich_media_content"><p>有传统正文</p></div>'
+            "<script>window.cgiDataNew = { is_async: '1' };</script>"
+            '</body></html>'
+        )
+        self.assertFalse(ext.is_wechat_async_article(html))
+
+    def test_double_quoted_is_async(self):
+        html = (
+            '<html><body><script>'
+            'window.cgiDataNew = { is_async: "1", item_show_type: "10" };'
+            '</script></body></html>'
+        )
+        self.assertTrue(ext.is_wechat_async_article(html))
+
+    def test_unquoted_is_async(self):
+        html = (
+            '<html><body><script>'
+            'window.cgiDataNew = { is_async: 1, item_show_type: 10 };'
+            '</script></body></html>'
+        )
+        self.assertTrue(ext.is_wechat_async_article(html))
+
+
+class TestExtractWechatAsyncContent(unittest.TestCase):
+    """测试从 cgiDataNew 中提取内容。"""
+
+    def test_extracts_title(self):
+        info = ext.extract_wechat_async_content(_WECHAT_ASYNC_HTML)
+        self.assertIsNotNone(info)
+        self.assertTrue(len(info["title"]) > 0)
+
+    def test_extracts_content(self):
+        info = ext.extract_wechat_async_content(_WECHAT_ASYNC_HTML)
+        self.assertIsNotNone(info)
+        self.assertTrue(len(info["content"]) > 0)
+
+    def test_extracts_nick_name(self):
+        info = ext.extract_wechat_async_content(_WECHAT_ASYNC_HTML)
+        self.assertIsNotNone(info)
+        self.assertTrue(len(info["nick_name"]) > 0)
+
+    def test_returns_none_without_cgidata(self):
+        self.assertIsNone(ext.extract_wechat_async_content("<html><body>plain</body></html>"))
+
+    def test_returns_none_without_title(self):
+        html = (
+            "<html><body><script>"
+            "window.cgiDataNew = { nick_name: JsDecode('test') };"
+            "</script></body></html>"
+        )
+        self.assertIsNone(ext.extract_wechat_async_content(html))
+
+    def test_long_content_beyond_80kb(self):
+        """内容超过 80KB 时不应被截断导致提取失败。"""
+        long_text = "A" * 100_000
+        html = (
+            "<html><body><script>"
+            "window.cgiDataNew = {"
+            "  is_async: '1',"
+            f"  title: JsDecode('LongTitle'),"
+            f"  nick_name: JsDecode('Author'),"
+            f"  content_noencode: JsDecode('{long_text}'),"
+            "};"
+            "</script></body></html>"
+        )
+        info = ext.extract_wechat_async_content(html)
+        self.assertIsNotNone(info)
+        self.assertEqual(info["title"], "LongTitle")
+        self.assertEqual(len(info["content"]), 100_000)
+
+
+class TestWechatAsyncToMarkdown(unittest.TestCase):
+    """测试异步微信内容转 Markdown。"""
+
+    def test_formats_with_nick_name(self):
+        info = {
+            "title": "标题",
+            "nick_name": "测试号",
+            "signature": "签名",
+            "content": "第一行\n第二行",
+        }
+        md = ext.wechat_async_to_markdown(info)
+        self.assertIn("> 公众号：**测试号**", md)
+        self.assertIn("> 签名", md)
+        self.assertIn("第一行", md)
+        self.assertIn("第二行", md)
+
+    def test_formats_without_nick_name(self):
+        info = {"title": "标题", "nick_name": "", "content": "正文", "signature": ""}
+        md = ext.wechat_async_to_markdown(info)
+        self.assertNotIn("公众号", md)
+        self.assertIn("正文", md)
+
+    def test_empty_content(self):
+        info = {"title": "标题", "nick_name": "", "content": "", "signature": ""}
+        md = ext.wechat_async_to_markdown(info)
+        self.assertEqual(md, "")
+
+
+class TestWechatAsyncIntegration(unittest.TestCase):
+    """集成测试：process_single_url 对异步微信文章的处理。"""
+
+    def test_batch_mode_extracts_async_wechat(self):
+        config = grab.BatchConfig(download_images=False)
+        with mock.patch.object(grab, "fetch_html", return_value=_WECHAT_ASYNC_HTML):
+            result = grab.process_single_url(
+                session=object(),
+                url="https://mp.weixin.qq.com/s/test_async",
+                config=config,
+            )
+        self.assertTrue(result.success)
+        self.assertTrue(len(result.md_content) > 0)
+        self.assertEqual(result.image_urls, [])
+
+    def test_batch_mode_traditional_wechat_still_works(self):
+        config = grab.BatchConfig(download_images=False)
+        with mock.patch.object(grab, "fetch_html", return_value=_WECHAT_TRADITIONAL_HTML):
+            result = grab.process_single_url(
+                session=object(),
+                url="https://mp.weixin.qq.com/s/test_traditional",
+                config=config,
+            )
+        self.assertTrue(result.success)
+        self.assertIn("传统正文", result.md_content)
+
+    def test_main_mode_extracts_async_wechat(self):
+        """单页 main() 模式也能正确提取异步微信文章。"""
+        with tempfile.TemporaryDirectory() as td:
+            out_md = os.path.join(td, "out.md")
+            with mock.patch.object(grab, "fetch_html", return_value=_WECHAT_ASYNC_HTML):
+                with mock.patch.object(grab, "detect_js_challenge") as mock_js:
+                    mock_js.return_value = mock.Mock(is_challenge=False)
+                    out_buf = io.StringIO()
+                    err_buf = io.StringIO()
+                    with redirect_stdout(out_buf), redirect_stderr(err_buf):
+                        code = grab.main([
+                            "https://mp.weixin.qq.com/s/test_async",
+                            "--out", out_md,
+                            "--overwrite",
+                            "--no-map-json",
+                        ])
+            self.assertEqual(code, grab.EXIT_SUCCESS)
+            self.assertTrue(os.path.isfile(out_md))
+            with open(out_md, encoding="utf-8") as f:
+                content = f.read()
+            self.assertTrue(len(content) > 50)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1096,3 +1096,116 @@ def read_urls_file(filepath: str) -> List[Tuple[str, Optional[str]]]:
             urls.append((url, title))
 
     return urls
+
+
+# ---------------------------------------------------------------------------
+#  微信异步渲染文章（图文笔记/小绿书）提取
+# ---------------------------------------------------------------------------
+
+def _wechat_jsdecode(s: str) -> str:
+    """复现微信页面中的 JsDecode 函数，将转义序列还原为原始字符。"""
+    return (
+        s.replace("\\x5c", "\\")
+        .replace("\\x0d", "\r")
+        .replace("\\x22", '"')
+        .replace("\\x26", "&")
+        .replace("\\x27", "'")
+        .replace("\\x3c", "<")
+        .replace("\\x3e", ">")
+        .replace("\\x0a", "\n")
+    )
+
+
+def is_wechat_async_article(page_html: str) -> bool:
+    """
+    检测是否为微信"小绿书"/图文笔记等异步渲染格式。
+
+    这类文章的特征：
+    - 包含 window.cgiDataNew 且 is_async 为 1
+    - 不包含 rich_media_content / js_content 等传统正文容器
+    - item_show_type 通常为 10
+    """
+    if "window.cgiDataNew" not in page_html:
+        return False
+    if 'class="rich_media_content' in page_html or 'id="js_content"' in page_html:
+        return False
+    # 兼容 JS 对象中 is_async 的三种合法写法：'1'、"1"、1
+    m = re.search(r"""is_async\s*:\s*['"]?(\d+)['"]?""", page_html)
+    return m is not None and m.group(1) == "1"
+
+
+def extract_wechat_async_content(page_html: str) -> Optional[Dict[str, str]]:
+    """
+    从微信异步渲染文章的 window.cgiDataNew 中提取可用内容。
+
+    返回 dict 包含: title, nick_name, content, create_time, cdn_url, source_url, signature
+    如果提取失败返回 None。
+    """
+    cgi_idx = page_html.find("window.cgiDataNew")
+    if cgi_idx < 0:
+        return None
+
+    # 取完整 script 块而非固定截断，避免长文内容被截断导致正则匹配失败
+    script_end = page_html.find("</script>", cgi_idx)
+    chunk = page_html[cgi_idx : script_end] if script_end > cgi_idx else page_html[cgi_idx:]
+
+    def _extract_jsdecode(field: str) -> str:
+        m = re.search(rf"(?<![_\w]){re.escape(field)}\s*:\s*JsDecode\('(.*?)'\)", chunk, re.DOTALL)
+        if m:
+            return _wechat_jsdecode(m.group(1))
+        return ""
+
+    def _extract_raw(field: str) -> str:
+        pat = r"(?<![_\w])" + re.escape(field) + r"""\s*:\s*['""]?([^'"",\s}]+)['""]?"""
+        m = re.search(pat, chunk)
+        if m:
+            return m.group(1).strip()
+        return ""
+
+    title = _extract_jsdecode("title")
+    if not title:
+        return None
+
+    content = ""
+    tpi_idx = chunk.find("text_page_info")
+    if tpi_idx >= 0:
+        tpi_chunk = chunk[tpi_idx:]
+        m_cn = re.search(r"content_noencode\s*:\s*JsDecode\('(.*?)'\)", tpi_chunk, re.DOTALL)
+        if m_cn:
+            content = _wechat_jsdecode(m_cn.group(1))
+    if not content:
+        content = _extract_jsdecode("content_noencode")
+    if not content:
+        content = _extract_jsdecode("content")
+
+    return {
+        "title": title,
+        "nick_name": _extract_jsdecode("nick_name"),
+        "content": content,
+        "create_time": _extract_jsdecode("create_time") or _extract_raw("ori_create_time"),
+        "cdn_url": _extract_jsdecode("cdn_url"),
+        "source_url": _extract_jsdecode("source_url"),
+        "signature": _extract_jsdecode("signature"),
+    }
+
+
+def wechat_async_to_markdown(info: Dict[str, str]) -> str:
+    """将从 cgiDataNew 提取到的内容格式化为 Markdown 正文。"""
+    parts: List[str] = []
+    if info.get("nick_name"):
+        parts.append(f"> 公众号：**{info['nick_name']}**")
+        if info.get("signature"):
+            parts.append(f"> {info['signature']}")
+        parts.append("")
+    text = info.get("content", "")
+    if text:
+        lines = text.split("\n")
+        formatted: List[str] = []
+        for line in lines:
+            stripped = line.strip()
+            if not stripped:
+                formatted.append("")
+            else:
+                formatted.append(stripped)
+        parts.append("\n".join(formatted))
+    return "\n".join(parts).strip()

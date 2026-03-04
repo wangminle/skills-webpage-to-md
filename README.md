@@ -8,7 +8,7 @@
 - ✅ **Markdown 转换**：标题、表格、代码块、列表、链接、图片、数学公式
 - ✅ **图片本地化**：自动下载并检测格式（PNG/JPEG/GIF/WebP/SVG）
 - ✅ **批量处理**：URL 文件读取、索引页爬取、合并输出
-- ✅ **特定站点**：微信公众号（自动检测）、Wiki 噪音清理
+- ✅ **特定站点**：微信公众号（自动检测，支持传统长文 + 图文笔记/小绿书新格式）、Wiki 噪音清理
 - ✅ **SSR 数据提取**：自动从 Next.js / Modern.js 的 SSR 数据中提取正文（腾讯云开发者、火山引擎文档等）
 - ✅ **通用 JSON 富文本转换**：兼容 ProseMirror / Slate / Editor.js / Lexical / Quill Delta 五种 Schema，零依赖自动兜底
 - ✅ **反爬支持**：Cookie/Header/UA 定制
@@ -65,7 +65,7 @@ python skills/webpage-to-md/scripts/grab_web_to_md.py "https://wiki.example.com/
 
 | 场景 | 说明 |
 |------|------|
-| **微信公众号** | 自动检测 mp.weixin.qq.com，清理交互按钮噪音 |
+| **微信公众号** | 自动检测 mp.weixin.qq.com，支持传统长文和图文笔记（小绿书）两种格式 |
 | **技术博客** | `--keep-html --tags` 保留代码块和复杂表格 |
 | **Wiki 批量** | `--crawl --merge --clean-wiki-noise` 爬取合并 |
 | **Docs 站点** | `--docs-preset mintlify` 一键导出，自动剥离导航 |
@@ -210,7 +210,7 @@ skills-webpage-to-md/
 | `security.py` | ~240 | URL 脱敏、JS 反爬检测、Markdown 校验 |
 | `http_client.py` | ~200 | UA 预设、Session 创建、HTML 抓取（含重试/大小限制） |
 | `images.py` | ~500 | 图片下载（流式/跨域隔离）、格式嗅探、路径替换 |
-| `extractors.py` | ~1100 | 正文/标题/链接提取、10 种 Docs 框架预设、导航剥离 |
+| `extractors.py` | ~1210 | 正文/标题/链接提取、10 种 Docs 框架预设、导航剥离、微信异步提取 |
 | `markdown_conv.py` | ~940 | HTML→Markdown 解析器、LaTeX 公式、表格、噪音清理 |
 | `ssr_extract.py` | ~530 | SSR 数据检测/提取 + 通用 JSON 富文本→HTML 转换器 + 两阶段兜底 |
 | `output.py` | ~450 | Frontmatter 生成、合并/分文件/索引输出、锚点管理 |
