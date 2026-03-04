@@ -79,7 +79,7 @@ python SKILL_DIR/scripts/grab_web_to_md.py "URL" --no-ssr
 | `--keep-html` | Preserve complex tables | `--keep-html` |
 | `--tags` | Add YAML frontmatter tags | `--tags "ai,tutorial"` |
 
-## Three Main Use Cases
+## Main Use Cases
 
 ### 1. Single Page Export (Blog/News)
 
@@ -100,7 +100,11 @@ python SKILL_DIR/scripts/grab_web_to_md.py "https://mp.weixin.qq.com/s/xxx" \
   --out article.md
 ```
 
-**Auto behavior**: Detects WeChat URL or WeChat HTML markers → extracts `rich_media_content` → cleans interaction buttons.
+**Auto behavior**: Detects WeChat URL or WeChat HTML markers → extracts content → cleans interaction buttons.
+
+Supports two WeChat article formats:
+- **Traditional articles**: Extracts `rich_media_content` HTML with images
+- **New-format posts** (图文笔记/小绿书, `item_show_type=10`): Content is embedded in JavaScript (`window.cgiDataNew`) and loaded asynchronously. The script automatically detects this format and extracts text content from the embedded data. Note: images in new-format posts are loaded dynamically and cannot be extracted via HTTP.
 
 ### 3. Wiki Batch Crawl + Merge
 
@@ -126,30 +130,7 @@ python SKILL_DIR/scripts/grab_web_to_md.py "https://wiki.example.com/index" \
 - `--rewrite-links`: Convert external URLs to internal anchors
 - `--download-images`: Save images locally
 
-## Content Extraction Parameters
-
-| Parameter | Purpose |
-|-----------|---------|
-| `--target-id ID` | Extract element by id (supports comma-separated values for priority fallback) |
-| `--target-class CLASS` | Extract element by class (supports comma-separated values) |
-| `--clean-wiki-noise` | Remove Wiki system noise (PukiWiki/MediaWiki) |
-| `--wechat` | Force WeChat article mode |
-
-## Navigation Stripping Parameters (Docs/Wiki Sites)
-
-| Parameter | Purpose |
-|-----------|---------|
-| `--strip-nav` | Remove navigation elements (nav, aside, sidebar) |
-| `--strip-page-toc` | Remove page-level TOC (.toc, .on-this-page) |
-| `--exclude-selectors STR` | Custom selectors to remove (comma-separated, simplified CSS) |
-| `--anchor-list-threshold N` | Remove link lists exceeding N lines (default 0=off, preset mode uses 10) |
-| `--docs-preset NAME` | Use framework preset (mintlify/docusaurus/gitbook/vuepress/mkdocs/readthedocs/sphinx/notion/confluence/generic) |
-| `--auto-detect` | Auto-detect docs framework and apply preset |
-| `--list-presets` | Show all available presets |
-| `--split-output DIR` | Output split files alongside merged (dual output mode) |
-| `--warn-anchor-collisions` | Show anchor collision details (auto-fixed with -2, -3 suffixes) |
-
-### 4. Docs Site Export (NEW)
+### 4. Docs Site Export
 
 ```bash
 # Using preset for Mintlify docs (e.g., OpenClaw)
@@ -160,7 +141,7 @@ python SKILL_DIR/scripts/grab_web_to_md.py "https://docs.example.com/" \
   --merge-output docs_guide.md \
   --download-images
 
-# Dual output: merged + split files (Phase 3-B)
+# Dual output: merged + split files
 python SKILL_DIR/scripts/grab_web_to_md.py "https://docs.example.com/" \
   --crawl --merge --toc \
   --docs-preset mintlify \
@@ -189,6 +170,29 @@ python SKILL_DIR/scripts/grab_web_to_md.py "https://docs.example.com/" \
 - Shared assets directory (images downloaded once)
 - INDEX.md with links to each page file
 - Compatible with Obsidian, search tools, collaborative editing
+
+## Content Extraction Parameters
+
+| Parameter | Purpose |
+|-----------|---------|
+| `--target-id ID` | Extract element by id (supports comma-separated values for priority fallback) |
+| `--target-class CLASS` | Extract element by class (supports comma-separated values) |
+| `--clean-wiki-noise` | Remove Wiki system noise (PukiWiki/MediaWiki) |
+| `--wechat` | Force WeChat article mode |
+
+## Navigation Stripping Parameters (Docs/Wiki Sites)
+
+| Parameter | Purpose |
+|-----------|---------|
+| `--strip-nav` | Remove navigation elements (nav, aside, sidebar) |
+| `--strip-page-toc` | Remove page-level TOC (.toc, .on-this-page) |
+| `--exclude-selectors STR` | Custom selectors to remove (comma-separated, simplified CSS) |
+| `--anchor-list-threshold N` | Remove link lists exceeding N lines (default 0=off, preset mode uses 10) |
+| `--docs-preset NAME` | Use framework preset (mintlify/docusaurus/gitbook/vuepress/mkdocs/readthedocs/sphinx/notion/confluence/generic) |
+| `--auto-detect` | Auto-detect docs framework and apply preset |
+| `--list-presets` | Show all available presets |
+| `--split-output DIR` | Output split files alongside merged (dual output mode) |
+| `--warn-anchor-collisions` | Show anchor collision details (auto-fixed with -2, -3 suffixes) |
 
 ## Batch Processing Parameters
 

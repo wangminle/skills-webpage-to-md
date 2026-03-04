@@ -203,6 +203,7 @@ output/
 
 # Local regression checklist (personal/untracked)
 tests/待测试列表.md
+tests/回归测试集.md
 
 # Temporary HTML files (used during PDF generation)
 *.no_frontmatter.md

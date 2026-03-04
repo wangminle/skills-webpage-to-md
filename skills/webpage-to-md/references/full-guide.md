@@ -12,7 +12,7 @@
 
 **批量处理**：URL 文件读取、索引页爬取、并发下载、合并输出/独立文件
 
-**特定站点**：微信公众号（自动检测）、Wiki 系统噪音清理
+**特定站点**：微信公众号（自动检测，支持传统长文 + 图文笔记/小绿书新格式）、Wiki 系统噪音清理
 
 **其他**：YAML Frontmatter、反爬支持、PDF 导出、Windows 路径安全、模块化架构（8 个子模块）
 
@@ -264,9 +264,11 @@ python scripts/grab_web_to_md.py "URL" --wechat
 python scripts/grab_web_to_md.py --local-html wechat_saved.html --auto-title
 ```
 
-**自动处理**：提取 `rich_media_content`、标题从 `og:title` 获取、清理交互按钮
+**自动处理**：
+- 传统长文：提取 `rich_media_content`、标题从 `og:title` 获取、清理交互按钮、下载图片
+- 图文笔记（小绿书，`item_show_type=10`，`is_async=1`）：自动检测异步渲染格式，从 `window.cgiDataNew` 中提取标题、公众号信息和正文文本。此类文章的图片由 JS 动态加载，无法通过 HTTP 直接提取
 
-### 场景 7：Docs 站点导出（新增）
+### 场景 7：Docs 站点导出
 
 ```bash
 # 使用预设导出 Mintlify 文档
@@ -277,7 +279,7 @@ python scripts/grab_web_to_md.py "https://docs.example.com/" \
   --merge-output docs.md \
   --download-images
 
-# 双版本输出：同时生成合并版和分文件版（Phase 3-B）
+# 双版本输出：同时生成合并版和分文件版
 python scripts/grab_web_to_md.py "https://docs.example.com/" \
   --crawl --merge --toc \
   --docs-preset mintlify \
@@ -317,7 +319,7 @@ python scripts/grab_web_to_md.py --list-presets
 - 生成 INDEX.md 索引文件
 - 适配 Obsidian、检索工具、协作编辑等场景
 
-### 场景 8：SSR 动态站点自动提取（新增）
+### 场景 8：SSR 动态站点自动提取
 
 ```bash
 # 腾讯云开发者文章 — Next.js SSR 自动提取 ProseMirror JSON
@@ -501,7 +503,7 @@ output/
 
 ```
 scripts/
-├── grab_web_to_md.py       # CLI 入口（~1290 行）：参数解析 + 流程调度
+├── grab_web_to_md.py       # CLI 入口（~1450 行）：参数解析 + 流程调度
 └── webpage_to_md/          # 核心功能包（~4100 行）
     ├── __init__.py          # 包入口，导出数据模型
     ├── models.py            # 数据模型（~70 行）
@@ -509,7 +511,7 @@ scripts/
     ├── http_client.py       # HTTP 会话与 HTML 抓取（~200 行）
     ├── ssr_extract.py       # SSR 数据提取：Next.js/Modern.js（~260 行）
     ├── images.py            # 图片下载与路径替换（~500 行）
-    ├── extractors.py        # 正文提取 + 框架预设 + 导航剥离（~1100 行）
+    ├── extractors.py        # 正文提取 + 框架预设 + 导航剥离 + 微信异步提取（~1210 行）
     ├── markdown_conv.py     # HTML→Markdown + 噪音清理（~940 行）
     ├── output.py            # 合并/分文件/索引/frontmatter（~450 行）
     └── pdf_utils.py         # Markdown→PDF 渲染（~420 行）
@@ -537,6 +539,15 @@ pdf_utils (无包内依赖)
 ---
 
 ## 更新日志
+
+### v2.1.2 (2026-03-03)
+- ✨ **微信图文笔记（小绿书）新格式支持**：
+  - 自动检测 `is_async=1` + `item_show_type=10` 的异步渲染文章
+  - 从 `window.cgiDataNew` 中提取标题、公众号名称、签名和正文文本
+  - 实现 `JsDecode` 转义还原（`\x0a`→换行、`\x3c`→`<` 等）
+  - 新增函数：`is_wechat_async_article()`、`extract_wechat_async_content()`、`wechat_async_to_markdown()`
+  - 传统 `rich_media_content` 文章不受影响，保持原有行为
+  - 注意：此类文章的图片由 JS 动态加载，仅能提取文本内容
 
 ### v2.1.1 (2026-02-10)
 - 🐛 **Markdown 图片 title 解析修复**：

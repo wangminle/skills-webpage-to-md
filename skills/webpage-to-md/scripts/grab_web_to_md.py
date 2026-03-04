@@ -71,16 +71,19 @@ from webpage_to_md.extractors import (
     extract_target_html,
     extract_target_html_multi,
     extract_title,
+    extract_wechat_async_content,
     extract_wechat_title,
     get_available_presets,
     get_strip_selectors,
     html_text_len,
     is_wechat_article_html,
     is_wechat_article_url,
+    is_wechat_async_article,
     read_urls_file,
     strip_anchor_lists,
     strip_html_elements,
     uniq_preserve_order,
+    wechat_async_to_markdown,
 )
 from webpage_to_md.images import (
     _DEFAULT_MAX_IMAGE_BYTES,
@@ -207,7 +210,18 @@ def process_single_url(
             is_wechat = True
         elif not is_wechat and is_wechat_article_html(page_html):
             is_wechat = True
-        
+
+        # 微信异步渲染文章（小绿书/图文笔记）快速路径
+        if is_wechat and is_wechat_async_article(page_html):
+            async_info = extract_wechat_async_content(page_html)
+            if async_info and async_info.get("content"):
+                title = custom_title or async_info["title"] or "Untitled"
+                md_body = wechat_async_to_markdown(async_info)
+                return BatchPageResult(
+                    url=url, title=title, md_content=md_body,
+                    success=True, order=order, image_urls=[],
+                )
+
         # 确定正文提取策略
         target_id = config.target_id
         target_class = config.target_class
@@ -1196,144 +1210,156 @@ urls.txt 文件格式：
             is_wechat = True
             print("检测到微信公众号文章特征，自动启用微信模式")
 
-        # 确定正文提取策略
-        target_id = args.target_id
-        target_class = args.target_class
-        exclude_selectors = args.exclude_selectors
-        strip_nav = args.strip_nav
-        strip_page_toc = args.strip_page_toc
-        anchor_list_threshold = args.anchor_list_threshold
+        # 微信异步渲染文章（小绿书/图文笔记）：内容嵌入在 JS 变量中，
+        # 传统的 rich_media_content 容器不存在，需要从 cgiDataNew 提取。
+        _wechat_async_done = False
+        if is_wechat and is_wechat_async_article(page_html):
+            _async_info = extract_wechat_async_content(page_html)
+            if _async_info and _async_info.get("content"):
+                print("检测到微信图文笔记格式（异步渲染），从嵌入数据中提取内容")
+                title = args.title or _async_info["title"] or "Untitled"
+                md_body = wechat_async_to_markdown(_async_info)
+                url_to_local: Dict[str, str] = {}
+                _wechat_async_done = True
+
+        if not _wechat_async_done:
+
+            # 确定正文提取策略
+            target_id = args.target_id
+            target_class = args.target_class
+            exclude_selectors = args.exclude_selectors
+            strip_nav = args.strip_nav
+            strip_page_toc = args.strip_page_toc
+            anchor_list_threshold = args.anchor_list_threshold
         
-        # 单页模式：应用 docs-preset（Phase 2）
-        if hasattr(args, 'docs_preset') and args.docs_preset:
-            preset = DOCS_PRESETS.get(args.docs_preset)
-            if preset:
-                print(f"📦 使用文档框架预设：{preset.name} ({preset.description})")
-                # 应用预设的 target 配置（仅当用户未指定时）
-                if not target_id and preset.target_ids:
-                    target_id = ",".join(preset.target_ids)
-                if not target_class and preset.target_classes:
-                    target_class = ",".join(preset.target_classes)
-                # 合并预设的 exclude_selectors
-                preset_excludes = ",".join(preset.exclude_selectors)
-                if exclude_selectors:
-                    exclude_selectors = f"{exclude_selectors},{preset_excludes}"
-                else:
-                    exclude_selectors = preset_excludes
-                # 自动启用导航剥离
-                strip_nav = True
-                strip_page_toc = True
-                # 预设模式下自动启用锚点列表剥离
-                if anchor_list_threshold == 0:
-                    anchor_list_threshold = 10
-                print(f"  • 正文容器 ID：{target_id or '(未设置)'}")
-                print(f"  • 正文容器 class：{target_class or '(未设置)'}")
-        
-        # 单页模式：自动检测文档框架（Phase 2）
-        elif hasattr(args, 'auto_detect') and args.auto_detect:
-            framework, confidence, signals = detect_docs_framework(page_html)
-            if framework and confidence >= 0.6:
-                preset = DOCS_PRESETS.get(framework)
+            # 单页模式：应用 docs-preset（Phase 2）
+            if hasattr(args, 'docs_preset') and args.docs_preset:
+                preset = DOCS_PRESETS.get(args.docs_preset)
                 if preset:
-                    print(f"🔍 自动检测到文档框架：{preset.name}（置信度：{confidence:.0%}）")
-                    # 应用预设配置
+                    print(f"📦 使用文档框架预设：{preset.name} ({preset.description})")
+                    # 应用预设的 target 配置（仅当用户未指定时）
                     if not target_id and preset.target_ids:
                         target_id = ",".join(preset.target_ids)
                     if not target_class and preset.target_classes:
                         target_class = ",".join(preset.target_classes)
+                    # 合并预设的 exclude_selectors
                     preset_excludes = ",".join(preset.exclude_selectors)
                     if exclude_selectors:
                         exclude_selectors = f"{exclude_selectors},{preset_excludes}"
                     else:
                         exclude_selectors = preset_excludes
+                    # 自动启用导航剥离
                     strip_nav = True
                     strip_page_toc = True
+                    # 预设模式下自动启用锚点列表剥离
                     if anchor_list_threshold == 0:
                         anchor_list_threshold = 10
-            elif framework:
-                print(f"🔍 检测到可能的文档框架：{framework}（置信度：{confidence:.0%}，未自动应用）")
+                    print(f"  • 正文容器 ID：{target_id or '(未设置)'}")
+                    print(f"  • 正文容器 class：{target_class or '(未设置)'}")
         
-        # 微信模式下，如果未指定 target，自动使用 rich_media_content
-        if is_wechat and not target_id and not target_class:
-            target_class = "rich_media_content"
-            print("使用微信正文区域：rich_media_content")
+            # 单页模式：自动检测文档框架（Phase 2）
+            elif hasattr(args, 'auto_detect') and args.auto_detect:
+                framework, confidence, signals = detect_docs_framework(page_html)
+                if framework and confidence >= 0.6:
+                    preset = DOCS_PRESETS.get(framework)
+                    if preset:
+                        print(f"🔍 自动检测到文档框架：{preset.name}（置信度：{confidence:.0%}）")
+                        if not target_id and preset.target_ids:
+                            target_id = ",".join(preset.target_ids)
+                        if not target_class and preset.target_classes:
+                            target_class = ",".join(preset.target_classes)
+                        preset_excludes = ",".join(preset.exclude_selectors)
+                        if exclude_selectors:
+                            exclude_selectors = f"{exclude_selectors},{preset_excludes}"
+                        else:
+                            exclude_selectors = preset_excludes
+                        strip_nav = True
+                        strip_page_toc = True
+                        if anchor_list_threshold == 0:
+                            anchor_list_threshold = 10
+                elif framework:
+                    print(f"🔍 检测到可能的文档框架：{framework}（置信度：{confidence:.0%}，未自动应用）")
 
-        # 使用多值 target 提取（Phase 2 支持逗号分隔）
-        if target_id or target_class:
-            article_html, matched_selector = extract_target_html_multi(
-                page_html, target_ids=target_id, target_classes=target_class
-            )
-            if not article_html:
-                print("警告：未找到指定的目标区域，将回退到自动抽取。", file=sys.stderr)
+            # 微信模式下，如果未指定 target，自动使用 rich_media_content
+            if is_wechat and not target_id and not target_class:
+                target_class = "rich_media_content"
+                print("使用微信正文区域：rich_media_content")
+
+            # 使用多值 target 提取（Phase 2 支持逗号分隔）
+            if target_id or target_class:
+                article_html, matched_selector = extract_target_html_multi(
+                    page_html, target_ids=target_id, target_classes=target_class
+                )
+                if not article_html:
+                    print("警告：未找到指定的目标区域，将回退到自动抽取。", file=sys.stderr)
+                    article_html = extract_main_html(page_html)
+                elif matched_selector:
+                    print(f"使用正文容器：{matched_selector}")
+            else:
                 article_html = extract_main_html(page_html)
-            elif matched_selector:
-                print(f"使用正文容器：{matched_selector}")
-        else:
-            article_html = extract_main_html(page_html)
 
-        # 单页模式：应用导航剥离（Phase 1）
-        strip_selectors = get_strip_selectors(
-            strip_nav=strip_nav,
-            strip_page_toc=strip_page_toc,
-            exclude_selectors=exclude_selectors,
-        )
-        if strip_selectors:
-            article_html, strip_stats = strip_html_elements(article_html, strip_selectors)
-            if strip_stats.elements_removed > 0:
-                print(f"已移除 {strip_stats.elements_removed} 个导航元素")
+            # 单页模式：应用导航剥离（Phase 1）
+            strip_selectors = get_strip_selectors(
+                strip_nav=strip_nav,
+                strip_page_toc=strip_page_toc,
+                exclude_selectors=exclude_selectors,
+            )
+            if strip_selectors:
+                article_html, strip_stats = strip_html_elements(article_html, strip_selectors)
+                if strip_stats.elements_removed > 0:
+                    print(f"已移除 {strip_stats.elements_removed} 个导航元素")
 
-        if args.spa_warn_len and html_text_len(article_html) < args.spa_warn_len:
-            print(
-                f"警告：抽取到的正文内容较短（<{args.spa_warn_len} 字符），该页面可能为 SPA 动态渲染；"
-                "如内容为空/不完整，可尝试：1) 使用 --target-id/--target-class 指定正文区域；"
-                "2) 等待页面完整加载后保存 HTML 再处理；3) 使用浏览器开发者工具获取渲染后的 HTML。",
-                file=sys.stderr,
+            if args.spa_warn_len and html_text_len(article_html) < args.spa_warn_len:
+                print(
+                    f"警告：抽取到的正文内容较短（<{args.spa_warn_len} 字符），该页面可能为 SPA 动态渲染；"
+                    "如内容为空/不完整，可尝试：1) 使用 --target-id/--target-class 指定正文区域；"
+                    "2) 等待页面完整加载后保存 HTML 再处理；3) 使用浏览器开发者工具获取渲染后的 HTML。",
+                    file=sys.stderr,
+                )
+
+            collector = ImageURLCollector(base_url=url)
+            collector.feed(article_html)
+            image_urls = uniq_preserve_order(collector.image_urls)
+
+            print(f"发现图片：{len(image_urls)} 张，开始下载到：{assets_dir}")
+            url_to_local = download_images(
+                session=session,
+                image_urls=image_urls,
+                assets_dir=assets_dir,
+                md_dir=md_dir,
+                timeout_s=args.timeout,
+                retries=args.retries,
+                best_effort=bool(args.best_effort_images),
+                page_url=url,
+                redact_urls=args.redact_url,
+                max_image_bytes=args.max_image_bytes,
             )
 
-        collector = ImageURLCollector(base_url=url)
-        collector.feed(article_html)
-        image_urls = uniq_preserve_order(collector.image_urls)
+            # 提取标题（微信模式下优先使用专用提取函数）
+            if args.title:
+                title = args.title
+            elif is_wechat:
+                title = extract_wechat_title(page_html) or extract_h1(article_html) or extract_title(page_html) or "Untitled"
+            else:
+                title = extract_h1(article_html) or extract_title(page_html) or "Untitled"
+            md_body = html_to_markdown(
+                article_html=article_html,
+                base_url=url,
+                url_to_local=url_to_local,
+                keep_html=args.keep_html,
+            )
+            md_body = strip_duplicate_h1(md_body, title)
 
-        print(f"发现图片：{len(image_urls)} 张，开始下载到：{assets_dir}")
-        url_to_local = download_images(
-            session=session,
-            image_urls=image_urls,
-            assets_dir=assets_dir,
-            md_dir=md_dir,
-            timeout_s=args.timeout,
-            retries=args.retries,
-            best_effort=bool(args.best_effort_images),
-            page_url=url,
-            redact_urls=args.redact_url,
-            max_image_bytes=args.max_image_bytes,
-        )
+            # 清理噪音内容
+            if is_wechat:
+                md_body = clean_wechat_noise(md_body)
+                print("已清理微信公众号 UI 噪音")
 
-        # 提取标题（微信模式下优先使用专用提取函数）
-        if args.title:
-            title = args.title
-        elif is_wechat:
-            title = extract_wechat_title(page_html) or extract_h1(article_html) or extract_title(page_html) or "Untitled"
-        else:
-            title = extract_h1(article_html) or extract_title(page_html) or "Untitled"
-        md_body = html_to_markdown(
-            article_html=article_html,
-            base_url=url,
-            url_to_local=url_to_local,
-            keep_html=args.keep_html,
-        )
-        md_body = strip_duplicate_h1(md_body, title)
-
-        # 清理噪音内容
-        if is_wechat:
-            md_body = clean_wechat_noise(md_body)
-            print("已清理微信公众号 UI 噪音")
-
-        # 单页模式：锚点列表剥离（Phase 1）
-        # 使用局部变量 anchor_list_threshold（可能被预设修改）
-        if anchor_list_threshold > 0:
-            md_body, anchor_stats = strip_anchor_lists(md_body, anchor_list_threshold)
-            if anchor_stats.anchor_lists_removed > 0:
-                print(f"已移除 {anchor_stats.anchor_lists_removed} 个锚点列表块（共 {anchor_stats.anchor_lines_removed} 行）")
+            # 单页模式：锚点列表剥离（Phase 1）
+            if anchor_list_threshold > 0:
+                md_body, anchor_stats = strip_anchor_lists(md_body, anchor_list_threshold)
+                if anchor_stats.anchor_lists_removed > 0:
+                    print(f"已移除 {anchor_stats.anchor_lists_removed} 个锚点列表块（共 {anchor_stats.anchor_lines_removed} 行）")
 
     # 解析 tags 参数
     tags: Optional[List[str]] = None
