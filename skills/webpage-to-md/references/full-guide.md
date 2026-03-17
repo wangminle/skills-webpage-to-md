@@ -2,6 +2,20 @@
 
 抓取网页并转换为 Markdown 格式的 Python 工具。支持单页抓取、批量处理、从索引页爬取整个子目录，并可下载图片到本地。
 
+## 目录
+
+- [功能特性](#功能特性)
+- [安装](#安装)
+- [参数完整说明](#参数完整说明)（基础 / 网络 / HTTP / Frontmatter / 内容提取 / 导航剥离 / 批量 / 合并 / 爬取 / PDF / 安全）
+- [参数支持矩阵](#参数支持矩阵)
+- [使用场景](#使用场景)（单页 / 批量 / 爬取 / 内容过滤 / 反爬 / 微信 / Docs / SSR / Notion / 安全）
+- [实战案例](#实战案例)（微信 / 博客 / Wiki）
+- [输出结构](#输出结构)
+- [技术细节](#技术细节)（模块化架构）
+- [更新日志](#更新日志)
+
+---
+
 ## 功能特性
 
 **内容提取**：智能正文抽取（article → main → body）、手动选择器（`--target-id`/`--target-class`）、SPA 检测
@@ -14,7 +28,9 @@
 
 **特定站点**：微信公众号（自动检测，支持传统长文 + 图文笔记/小绿书新格式）、Wiki 系统噪音清理
 
-**其他**：YAML Frontmatter、反爬支持、PDF 导出、Windows 路径安全、模块化架构（8 个子模块）
+**Notion 公开页面**：自动检测 `notion.so` 和 `*.notion.site` URL，通过内部 API 递归获取所有 Block 并转换为 HTML，支持标题/段落/列表/代码/引用/折叠/待办/图片等 Block 类型
+
+**其他**：YAML Frontmatter、反爬支持、PDF 导出、Windows 路径安全、模块化架构（10 个子模块）
 
 ---
 
@@ -40,12 +56,12 @@ pip install pytest
 | 参数 | 说明 | 默认值 |
 |------|------|--------|
 | `url` | 目标网页 URL | - |
-| `--out` | 输出文件名 | 根据 URL 生成 |
-| `--auto-title` | 自动按页面标题生成输出文件名（仅单页模式；未指定 `--out` 时生效；批量/爬取模式无效） | `False` |
-| `--assets-dir` | 图片目录 | `<out>.assets` |
+| `--out` | 输出文件名（仅单页模式） | 根据 URL 生成 |
+| `--auto-title` | 自动按页面标题生成输出文件名（仅单页模式；未指定 `--out` 时生效） | `False` |
+| `--assets-dir` | 图片目录（仅单页模式） | `<out>.assets` |
 | `--title` | 文档标题 | 从 `<title>` 提取 |
-| `--overwrite` | 覆盖已存在文件 | `False` |
-| `--validate` | 校验图片引用 | `False` |
+| `--overwrite` | 覆盖上次运行的已存在文件（同批次同名页面始终用数字后缀区分，不会互相覆盖） | `False` |
+| `--validate` | 校验图片引用完整性（单页模式及批量模式均支持） | `False` |
 
 ### 网络请求参数
 
@@ -85,6 +101,7 @@ pip install pytest
 | `--spa-warn-len` | SPA 警告阈值 | `500` |
 | `--clean-wiki-noise` | 清理 Wiki 噪音 | `False` |
 | `--wechat` | 微信模式 | 自动 |
+| `--no-notion` | 禁用 Notion 公开页面 API 自动提取 | `False`（默认自动检测） |
 
 ### 导航剥离参数（Docs/Wiki 站点优化）
 
@@ -162,6 +179,32 @@ pip install pytest
 | `--no-map-json` | 不生成 `*.assets.json` 映射文件（并清理已存在的旧映射文件） | `False` |
 | `--max-image-bytes` | 单张图片最大字节数（0 表示不限制） | `25MB` |
 | `--pdf-allow-file-access` | 生成 PDF 时允许 file:// 访问本地文件 | `False` |
+
+---
+
+## 参数支持矩阵
+
+下表说明各参数在不同运行模式下的可用性。
+
+| 参数 | 单页模式 | 批量/爬取模式 | 合并输出 | 说明 |
+|------|:--------:|:------------:|:--------:|------|
+| `--out` | ✅ | ❌ | ❌ | 单页输出文件名 |
+| `--auto-title` | ✅ | ❌ | ❌ | 按页面标题自动命名 |
+| `--assets-dir` | ✅ | ❌ | ❌ | 自定义图片目录 |
+| `--overwrite` | ✅ | ✅ | ✅ | 覆盖已存在文件 |
+| `--validate` | ✅ | ✅ | ✅ | 校验图片引用完整性 |
+| `--download-images` | ❌（默认下载） | ✅ | ✅ | 批量模式默认不下载图片 |
+| `--clean-wiki-noise` | ✅ | ✅ | ✅ | 清理 Wiki 噪音 |
+| `--target-id` / `--target-class` | ✅ | ✅ | ✅ | 内容选择器 |
+| `--local-html` | ✅ | ❌ | ❌ | 从本地文件读取 |
+| `--urls-file` | ❌ | ✅ | ✅ | 批量 URL 文件 |
+| `--merge` | ❌ | ✅ | - | 启用合并输出 |
+| `--crawl` | ❌ | ✅ | ✅ | 启用爬取模式 |
+| `--with-pdf` | ✅ | ❌ | ❌ | 生成 PDF |
+| `--redact-url` | ✅ | ✅ | ✅ | URL 脱敏（仅影响输出文本） |
+| `--no-notion` | ✅ | ✅ | ✅ | 禁用 Notion 公开页面 API 提取 |
+
+> **注意**：单页模式默认下载图片到 `<输出文件名>.assets/` 目录；批量模式默认保留原始图片 URL，需显式加 `--download-images` 才下载。
 
 ---
 
@@ -251,6 +294,20 @@ python scripts/grab_web_to_md.py URL --header "Authorization: Bearer xxx"
 python scripts/grab_web_to_md.py URL --ua-preset firefox-win
 ```
 
+**JS Challenge 检测**：工具会自动识别 JavaScript 反爬保护（Cloudflare、Akamai 等），检测到时返回 exit code **4** 并提示使用 `--local-html` 处理本地保存的 HTML。
+
+**已知 JS 保护站点**：
+
+| 站点 | 保护类型 | 应对方式 |
+|------|----------|----------|
+| 腾讯云开发者 | Next.js SSR | **自动处理**（SSR 提取） |
+| 火山引擎文档 | Modern.js SSR | **自动处理**（SSR 提取） |
+| Notion 公开页面 | SPA（无 SSR） | **自动处理**（Notion API 提取） |
+| 知乎 | 高强度 JS | 使用 `--local-html` |
+| PyPI | Cloudflare | 使用 `--local-html` |
+| 部分 GitHub 页面 | Cloudflare | 使用 `--local-html` |
+| 新闻站点 | 多种类型 | 先试 `--ua-preset`，再试 `--local-html` |
+
 ### 场景 6：微信公众号
 
 ```bash
@@ -323,14 +380,15 @@ python scripts/grab_web_to_md.py --list-presets
 
 ```bash
 # 腾讯云开发者文章 — Next.js SSR 自动提取 ProseMirror JSON
+# 单页模式默认下载图片，无需 --download-images
 python scripts/grab_web_to_md.py \
   "https://cloud.tencent.com/developer/article/2624003" \
-  --auto-title --download-images
+  --auto-title
 
 # 火山引擎文档 — Modern.js SSR 自动提取 MDContent
 python scripts/grab_web_to_md.py \
   "https://www.volcengine.com/docs/6396/2189942" \
-  --auto-title --download-images --best-effort-images
+  --auto-title --best-effort-images
 
 # 禁用 SSR 提取，回退到普通 HTML 解析
 python scripts/grab_web_to_md.py URL --no-ssr
@@ -348,7 +406,52 @@ python scripts/grab_web_to_md.py URL --no-ssr
 | 腾讯云开发者社区 | Next.js | ProseMirror JSON |
 | 火山引擎文档 | Modern.js | Markdown (MDContent) |
 
-### 场景 9：数据安全与隐私
+### 场景 9：Notion 公开页面导出
+
+```bash
+# Notion 公开页面 — 自动检测 notion.so 和 *.notion.site 域名
+python scripts/grab_web_to_md.py \
+  "https://www.notion.so/Kiro-29cbd3b8020080d5a1e5f7cd300576dd" \
+  --auto-title
+
+# *.notion.site 域名同样支持
+python scripts/grab_web_to_md.py \
+  "https://team.notion.site/Guide-abcdef0123456789abcdef0123456789" \
+  --auto-title
+
+# 禁用 Notion 自动检测
+python scripts/grab_web_to_md.py \
+  "https://www.notion.so/Page-ID" --no-notion
+```
+
+**工作原理**：
+
+1. 检测到 `notion.so` 或 `*.notion.site` 域名后，自动切换到 Notion API 管线
+2. 通过 `loadPageChunk` 获取初始 Block 数据（最多 300 个）
+3. 递归调用 `syncRecordValues` 获取所有子 Block
+4. 将 Block 树转换为 HTML（支持 15+ 种 Block 类型）
+5. 图片使用 Notion 代理 URL，由标准图片下载管线处理
+
+**支持的 Block 类型**：
+
+| Block 类型 | 转换结果 |
+|-----------|---------|
+| text, header, sub_header, sub_sub_header | 段落/标题 |
+| bulleted_list, numbered_list | 列表（自动合并连续项） |
+| code | 代码块（含语言标识） |
+| quote, callout | 引用/提示框 |
+| toggle | 折叠块 (details/summary) |
+| image | 图片（通过 Notion 代理 URL 下载） |
+| to_do | 待办事项 |
+| bookmark, embed, video | 链接/嵌入 |
+| divider | 分割线 |
+| column_list, column | 多列布局 |
+
+> **注意**：仅适用于公开页面。私有页面需要 Cookie 或 Integration Token（暂不支持）。
+>
+> **错误处理**：Notion API 提取失败时**不会**静默回退到普通 HTTP（因为 Notion 空壳 HTML 无内容），而是直接报错。
+
+### 场景 10：数据安全与隐私
 
 ```bash
 # 默认行为：URL 脱敏开启，分享给他人时不会泄露 token/签名
@@ -370,6 +473,7 @@ python scripts/grab_web_to_md.py URL --max-image-bytes 0
 **安全特性（默认生效）**：
 - URL 脱敏：输出文件中的 URL 只保留 `scheme://host/path`
 - 跨域凭据隔离：包括 30x 重定向到 CDN 的场景；跨域请求不携带原站 Cookie/Authorization，同域则可携带
+- 跨域 Referer 脱敏：跨域图片请求的 Referer 自动移除 query/fragment（防止 token 泄露给第三方 CDN），同域保留完整 URL
 - 网络配置继承：干净 session 会继承代理/证书/adapter 配置，避免企业网络环境跨域图片下载失败
 - 流式下载：图片写入临时文件而非内存，防止 OOM
 - HTML 净化：保留 HTML 时自动移除 `onclick`/`onerror` 等事件属性
@@ -493,6 +597,7 @@ output/
 - **安全**：
   - URL 脱敏：`urllib.parse` 解析后移除 query/fragment
   - 跨域凭据隔离：对比 URL 主机名（含重定向链），跨域请求使用干净 session
+  - 跨域 Referer 脱敏：跨域图片请求自动移除 Referer 中的 query/fragment，同域保留完整 URL
   - 网络配置继承：干净 session 继承 `proxies/verify/cert/adapters`，避免网络环境差异导致下载失败
   - 流式下载：`iter_content(chunk_size=65536)` + 临时文件
   - HTML 净化：正则过滤 `on\w+=` 属性、`javascript:/vbscript:/file:` 协议
@@ -504,12 +609,13 @@ output/
 ```
 scripts/
 ├── grab_web_to_md.py       # CLI 入口（~1450 行）：参数解析 + 流程调度
-└── webpage_to_md/          # 核心功能包（~4100 行）
+└── webpage_to_md/          # 核心功能包（~4600 行）
     ├── __init__.py          # 包入口，导出数据模型
     ├── models.py            # 数据模型（~70 行）
     ├── security.py          # URL 脱敏 / JS 检测 / 校验（~240 行）
     ├── http_client.py       # HTTP 会话与 HTML 抓取（~200 行）
     ├── ssr_extract.py       # SSR 数据提取：Next.js/Modern.js（~260 行）
+    ├── notion.py            # Notion 公开页面 API 提取（~500 行）
     ├── images.py            # 图片下载与路径替换（~500 行）
     ├── extractors.py        # 正文提取 + 框架预设 + 导航剥离 + 微信异步提取（~1210 行）
     ├── markdown_conv.py     # HTML→Markdown + 噪音清理（~940 行）

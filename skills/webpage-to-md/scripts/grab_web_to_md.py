@@ -120,6 +120,7 @@ from webpage_to_md.security import (
     redact_urls_in_markdown,
     validate_markdown,
 )
+from webpage_to_md.notion import fetch_notion_page, is_notion_url
 from webpage_to_md.ssr_extract import (
     SSRContent,
     collect_md_image_urls,
@@ -148,14 +149,33 @@ def process_single_url(
 ) -> BatchPageResult:
     """处理单个 URL，返回结果"""
     try:
-        # 获取页面
-        page_html = fetch_html(
-            session=session,
-            url=url,
-            timeout_s=config.timeout,
-            retries=config.retries,
-            max_html_bytes=config.max_html_bytes,
-        )
+        page_html: Optional[str] = None
+
+        # ── Notion 公开页面 API 提取 ──
+        is_notion = not config.no_notion and is_notion_url(url)
+        if is_notion:
+            try:
+                notion_html, notion_title = fetch_notion_page(
+                    url, timeout_s=config.timeout, retries=config.retries,
+                )
+                page_html = notion_html
+                if not custom_title and notion_title:
+                    custom_title = notion_title
+            except Exception as e:
+                raise RuntimeError(
+                    f"Notion API 提取失败: {e}（不会回退到普通 HTTP，"
+                    f"因为 Notion 空壳页面无有效内容）"
+                ) from e
+
+        # 获取页面（非 Notion URL 走普通路径）
+        if page_html is None:
+            page_html = fetch_html(
+                session=session,
+                url=url,
+                timeout_s=config.timeout,
+                retries=config.retries,
+                max_html_bytes=config.max_html_bytes,
+            )
 
         # ── SSR 数据自动提取（批量模式）—— 必须在反爬检测之前 ──
         # 原因：含 <noscript> 提示的 SSR 页面会触发 JS 反爬检测，
@@ -322,6 +342,13 @@ def process_single_url(
         # Phase 1: Markdown 锚点列表剥离
         if anchor_list_threshold > 0:
             md_body, _ = strip_anchor_lists(md_body, anchor_list_threshold)
+
+        if not md_body or not md_body.strip():
+            return BatchPageResult(
+                url=url, title=title, md_content="", success=False,
+                error="转换后 Markdown 正文为空（服务端可能返回了拦截/占位页面）",
+                order=order,
+            )
         
         return BatchPageResult(
             url=url,
@@ -512,6 +539,7 @@ def _batch_main(args: argparse.Namespace) -> int:
         auto_detect=args.auto_detect,
         force=args.force,
         no_ssr=getattr(args, "no_ssr", False),
+        no_notion=getattr(args, "no_notion", False),
     )
     
     # Phase 2: 应用文档框架预设
@@ -717,6 +745,7 @@ def _batch_main(args: argparse.Namespace) -> int:
                 include_frontmatter=args.frontmatter,
                 redact_urls=args.redact_url,
                 shared_assets_dir=shared_assets,
+                overwrite=args.overwrite,
             )
             
             # 生成索引文件
@@ -750,6 +779,7 @@ def _batch_main(args: argparse.Namespace) -> int:
             include_frontmatter=args.frontmatter,
             redact_urls=args.redact_url,
             shared_assets_dir=None,
+            overwrite=args.overwrite,
         )
         
         # 来源 URL 优先级：--source-url > 爬取模式的索引页 > None（提取域名）
@@ -778,7 +808,44 @@ def _batch_main(args: argparse.Namespace) -> int:
             if not result.success:
                 print(f"  - {result.url}")
                 print(f"    错误：{result.error}")
-    
+
+    # 批量模式校验
+    if args.validate:
+        has_failure = False
+        if args.merge:
+            md_file = args.merge_output or "merged.md"
+            md_file = auto_wrap_output_dir(md_file)
+            a_dir = os.path.splitext(md_file)[0] + ".assets"
+            vr = validate_markdown(md_file, a_dir)
+            print(f"\n校验结果（{os.path.basename(md_file)}）：")
+            print(f"- 图片引用数（总）：{vr.image_refs}")
+            print(f"- 图片引用数（本地）：{vr.local_image_refs}")
+            print(f"- assets 文件数：{vr.asset_files}")
+            if vr.missing_files:
+                print("- 缺失文件：")
+                for m in vr.missing_files:
+                    print(f"  - {m}")
+                has_failure = True
+            else:
+                print("- 缺失文件：0")
+        else:
+            for sf in saved_files:
+                a_dir = os.path.splitext(sf)[0] + ".assets"
+                vr = validate_markdown(sf, a_dir)
+                print(f"\n校验结果（{os.path.basename(sf)}）：")
+                print(f"- 图片引用数（总）：{vr.image_refs}")
+                print(f"- 图片引用数（本地）：{vr.local_image_refs}")
+                print(f"- assets 文件数：{vr.asset_files}")
+                if vr.missing_files:
+                    print("- 缺失文件：")
+                    for m in vr.missing_files:
+                        print(f"  - {m}")
+                    has_failure = True
+                else:
+                    print("- 缺失文件：0")
+        if has_failure:
+            return EXIT_VALIDATION_FAILED
+
     return EXIT_SUCCESS
 
 
@@ -939,6 +1006,9 @@ urls.txt 文件格式：
     # SSR 数据自动提取（默认启用）
     ap.add_argument("--no-ssr", action="store_true", default=False,
                     help="禁用 SSR 数据自动提取（__NEXT_DATA__, _ROUTER_DATA 等）")
+    # Notion 公开页面自动提取（默认启用）
+    ap.add_argument("--no-notion", action="store_true", default=False,
+                    help="禁用 Notion 公开页面自动检测与 API 提取")
     ap.add_argument("--tags", help="Frontmatter 中的标签，逗号分隔，如 'tech,ai,tutorial'")
     # Cookie/Header 支持
     ap.add_argument("--cookie", help="Cookie 字符串，如 'session=abc; token=xyz'")
@@ -1096,10 +1166,25 @@ urls.txt 文件格式：
             base = args.out
         elif use_auto_title:
             # --auto-title 模式：先获取页面，提取标题后生成文件名
-            session = _create_session(args, referer_url=url)
-            page_html, exit_code = _fetch_page_html(session, url, args)
-            if exit_code is not None:
-                return exit_code
+            # Notion URL 走 API 路径
+            if not getattr(args, "no_notion", False) and is_notion_url(url):
+                print(f"🔧 检测到 Notion 公开页面，通过 API 获取内容...")
+                try:
+                    notion_html, notion_title = fetch_notion_page(
+                        url, timeout_s=args.timeout, retries=args.retries,
+                    )
+                    page_html = notion_html
+                    if notion_title:
+                        args.title = args.title or notion_title
+                    print(f"  Notion 页面标题：{notion_title}")
+                except Exception as e:
+                    print(f"错误：Notion API 提取失败: {e}", file=sys.stderr)
+                    return EXIT_ERROR
+            if page_html is None:
+                session = _create_session(args, referer_url=url)
+                page_html, exit_code = _fetch_page_html(session, url, args)
+                if exit_code is not None:
+                    return exit_code
             # SSR 提前提取，以便获取更准确的标题
             _early_ssr: Optional[SSRContent] = None
             if not getattr(args, "no_ssr", False):
@@ -1131,6 +1216,27 @@ urls.txt 文件格式：
     if os.path.exists(out_md) and not args.overwrite:
         print(f"文件已存在：{out_md}（如需覆盖请加 --overwrite）", file=sys.stderr)
         return EXIT_FILE_EXISTS
+
+    # ── Notion 公开页面自动检测 ─────────────────────────────────────
+    is_notion = (
+        not args.local_html
+        and not getattr(args, "no_notion", False)
+        and page_html is None
+        and is_notion_url(url)
+    )
+    if is_notion:
+        print(f"🔧 检测到 Notion 公开页面，通过 API 获取内容...")
+        try:
+            notion_html, notion_title = fetch_notion_page(
+                url, timeout_s=args.timeout, retries=args.retries,
+            )
+            page_html = notion_html
+            if not args.title and notion_title:
+                args.title = notion_title
+            print(f"  Notion 页面标题：{notion_title}")
+        except Exception as e:
+            print(f"错误：Notion API 提取失败: {e}", file=sys.stderr)
+            return EXIT_ERROR
 
     # 创建 Session（如果尚未在 auto-title 流程中创建）
     if session is None:
@@ -1354,6 +1460,9 @@ urls.txt 文件格式：
             if is_wechat:
                 md_body = clean_wechat_noise(md_body)
                 print("已清理微信公众号 UI 噪音")
+            if args.clean_wiki_noise:
+                md_body = clean_wiki_noise(md_body)
+                print("已清理 Wiki 系统噪音")
 
             # 单页模式：锚点列表剥离（Phase 1）
             if anchor_list_threshold > 0:
@@ -1365,6 +1474,25 @@ urls.txt 文件格式：
     tags: Optional[List[str]] = None
     if args.tags:
         tags = [t.strip() for t in args.tags.split(",") if t.strip()]
+
+    # ── 空内容保护：最终写入前检查 md_body ──
+    _body_text_len = len(md_body.strip()) if md_body else 0
+    if _body_text_len == 0:
+        print(
+            "错误：转换后的 Markdown 正文为空，未写入文件。\n"
+            "可能原因：1) 服务端返回了拦截/占位页面；"
+            "2) 正文容器不存在或被反爬机制隐藏；"
+            "3) 页面需要在特定环境（如微信客户端）内打开。\n"
+            "建议：稍后重试，或用浏览器保存完整 HTML 后通过 --local-html 处理。",
+            file=sys.stderr,
+        )
+        return EXIT_ERROR
+    elif _body_text_len < 50:
+        print(
+            f"警告：转换后的 Markdown 正文极短（{_body_text_len} 字符），内容可能不完整。\n"
+            "可能原因：服务端返回了拦截页面或内容未完整渲染。",
+            file=sys.stderr,
+        )
 
     display_url = redact_url(url) if args.redact_url else url
     if args.redact_url:

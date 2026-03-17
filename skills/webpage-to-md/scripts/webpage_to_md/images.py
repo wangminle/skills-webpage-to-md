@@ -135,19 +135,24 @@ def _safe_image_get(
     anon_session: requests.Session,
     timeout_s: int,
     referer: str,
+    redact_urls: bool = True,
 ) -> requests.Response:
     """
     安全地 GET 图片 URL，手动处理重定向并在跨域时切换到干净 session。
 
     防止同域 URL 重定向到第三方 CDN 时泄露敏感请求头。
+    跨域请求时自动脱敏 Referer（移除 query/fragment），
+    同域请求保留完整 Referer 以满足防盗链需求。
     """
     current_url = img_url
-    current_session = session if _is_same_host(img_url, page_url) else anon_session
+    is_same = _is_same_host(img_url, page_url)
+    current_session = session if is_same else anon_session
 
     for _ in range(_MAX_REDIRECTS):
         headers = {"Connection": "close"}
         if referer:
-            headers["Referer"] = referer
+            effective_referer = referer if is_same or not redact_urls else redact_url(referer)
+            headers["Referer"] = effective_referer
         r = current_session.get(
             current_url,
             timeout=timeout_s,
@@ -173,7 +178,8 @@ def _safe_image_get(
             pass
 
         next_url = urljoin(current_url, location)
-        current_session = session if _is_same_host(next_url, page_url) else anon_session
+        is_same = _is_same_host(next_url, page_url)
+        current_session = session if is_same else anon_session
         current_url = next_url
 
     raise RuntimeError(f"图片 URL 重定向次数超过 {_MAX_REDIRECTS} 次: {img_url}")
@@ -195,7 +201,7 @@ def download_images(
     os.makedirs(assets_dir, exist_ok=True)
     url_to_local: Dict[str, str] = {}
     anon_session = _create_anonymous_image_session(session)
-    referer = redact_url(page_url) if redact_urls else page_url
+    referer = page_url
     max_bytes: Optional[int] = max_image_bytes if (max_image_bytes and max_image_bytes > 0) else None
     known_image_exts = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".avif", ".bmp", ".ico"}
 
@@ -217,6 +223,7 @@ def download_images(
                     anon_session=anon_session,
                     timeout_s=timeout_s,
                     referer=referer,
+                    redact_urls=redact_urls,
                 )
                 r.raise_for_status()
                 break
@@ -355,7 +362,7 @@ def batch_download_images(
             continue
 
         referer_url = img_referer.get(img_url) or ""
-        referer = redact_url(referer_url) if (redact_urls and referer_url) else referer_url
+        referer = referer_url
         last_err: Optional[Exception] = None
         r: Optional[requests.Response] = None
 
@@ -368,6 +375,7 @@ def batch_download_images(
                     anon_session=anon_session,
                     timeout_s=timeout_s,
                     referer=referer,
+                    redact_urls=redact_urls,
                 )
                 r.raise_for_status()
                 break

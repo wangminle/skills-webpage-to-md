@@ -10,6 +10,7 @@
 - ✅ **批量处理**：URL 文件读取、索引页爬取、合并输出
 - ✅ **特定站点**：微信公众号（自动检测，支持传统长文 + 图文笔记/小绿书新格式）、Wiki 噪音清理
 - ✅ **SSR 数据提取**：自动从 Next.js / Modern.js 的 SSR 数据中提取正文（腾讯云开发者、火山引擎文档等）
+- ✅ **Notion 公开页面**：自动检测 Notion URL（`notion.so` 和 `*.notion.site`），通过内部 API 递归获取全部 Block 并转换（无需浏览器）
 - ✅ **通用 JSON 富文本转换**：兼容 ProseMirror / Slate / Editor.js / Lexical / Quill Delta 五种 Schema，零依赖自动兜底
 - ✅ **反爬支持**：Cookie/Header/UA 定制
 - ✅ **YAML Frontmatter**：兼容 Obsidian/Hugo/Jekyll
@@ -97,40 +98,61 @@ python skills/webpage-to-md/scripts/grab_web_to_md.py --list-presets
 
 ```bash
 # 腾讯云开发者文章（Next.js + ProseMirror）— 自动提取
+# 单页模式默认下载图片，无需 --download-images
 python skills/webpage-to-md/scripts/grab_web_to_md.py \
   "https://cloud.tencent.com/developer/article/2624003" \
-  --auto-title --download-images
+  --auto-title
 
 # 火山引擎文档（Modern.js + MDContent）— 自动提取
 python skills/webpage-to-md/scripts/grab_web_to_md.py \
   "https://www.volcengine.com/docs/6396/2189942" \
-  --auto-title --download-images --best-effort-images
+  --auto-title --best-effort-images
 
 # 禁用 SSR 提取（回退到普通 HTML 解析）
 python skills/webpage-to-md/scripts/grab_web_to_md.py "https://example.com" --no-ssr
 ```
 
+### Notion 公开页面导出示例
+
+```bash
+# Notion 公开页面 — 自动检测并通过 API 提取（支持 notion.so 和 *.notion.site）
+python skills/webpage-to-md/scripts/grab_web_to_md.py \
+  "https://www.notion.so/Kiro-29cbd3b8020080d5a1e5f7cd300576dd" \
+  --auto-title
+
+# *.notion.site 域名同样支持
+python skills/webpage-to-md/scripts/grab_web_to_md.py \
+  "https://team.notion.site/Guide-abcdef0123456789abcdef0123456789" \
+  --auto-title
+
+# 禁用 Notion 自动检测（强制走普通 HTTP 请求）
+python skills/webpage-to-md/scripts/grab_web_to_md.py \
+  "https://www.notion.so/Page-ID" --no-notion
+```
+
 ## 常用参数
 
-| 参数 | 说明 |
-|------|------|
-| `--out` | 输出文件路径 |
-| `--auto-title` | 自动按页面标题生成文件名（仅单页模式；未指定 `--out` 时生效；批量/爬取模式无效） |
-| `--validate` | 校验图片完整性 |
-| `--max-html-bytes` | 单页 HTML 最大字节数（默认 10MB；0 表示不限制） |
-| `--keep-html` | 复杂表格保留 HTML |
-| `--tags` | YAML Frontmatter 标签 |
-| `--target-id` / `--target-class` | 指定正文容器（支持逗号分隔多值） |
-| `--crawl` | 启用爬取模式 |
-| `--merge --toc` | 合并输出并生成目录 |
-| `--download-images` | 下载图片到本地 |
-| `--clean-wiki-noise` | 清理 Wiki 系统噪音 |
-| `--rewrite-links` | 站内链接改写为锚点 |
-| `--docs-preset` | 文档框架预设（mintlify/docusaurus/gitbook 等） |
-| `--split-output DIR` | 同时输出分文件版本（与 --merge 配合使用） |
-| `--strip-nav` | 移除导航元素（侧边栏等） |
-| `--strip-page-toc` | 移除页内目录 |
-| `--no-ssr` | 禁用 SSR 数据自动提取（默认启用） |
+| 参数 | 说明 | 适用模式 |
+|------|------|----------|
+| `--out` | 输出文件路径 | 单页 |
+| `--auto-title` | 自动按页面标题生成文件名（未指定 `--out` 时生效） | 单页 |
+| `--validate` | 校验图片引用完整性 | 全部 |
+| `--overwrite` | 覆盖上次运行的已存在文件（同批次同名页面始终用数字后缀区分） | 全部 |
+| `--max-html-bytes` | 单页 HTML 最大字节数（默认 10MB；0 表示不限制） | 全部 |
+| `--keep-html` | 复杂表格保留 HTML | 全部 |
+| `--tags` | YAML Frontmatter 标签 | 全部 |
+| `--target-id` / `--target-class` | 指定正文容器（支持逗号分隔多值） | 全部 |
+| `--crawl` | 启用爬取模式 | 批量 |
+| `--merge --toc` | 合并输出并生成目录 | 批量 |
+| `--download-images` | 下载图片到本地（单页默认下载，无需此参数） | 批量 |
+| `--clean-wiki-noise` | 清理 Wiki 系统噪音 | 全部 |
+| `--rewrite-links` | 站内链接改写为锚点 | 合并 |
+| `--docs-preset` | 文档框架预设（mintlify/docusaurus/gitbook 等） | 全部 |
+| `--split-output DIR` | 同时输出分文件版本（与 --merge 配合使用） | 合并 |
+| `--strip-nav` | 移除导航元素（侧边栏等） | 全部 |
+| `--strip-page-toc` | 移除页内目录 | 全部 |
+| `--no-ssr` | 禁用 SSR 数据自动提取（默认启用） | 全部 |
+| `--no-notion` | 禁用 Notion 公开页面 API 自动提取 | 全部 |
 
 ## 数据安全
 
@@ -142,6 +164,7 @@ python skills/webpage-to-md/scripts/grab_web_to_md.py "https://example.com" --no
 |---------|------|---------|
 | **URL 脱敏** | 输出文件中默认移除 URL 的 query/fragment 参数，避免泄露 token/签名等敏感信息 | `--no-redact-url` 可关闭 |
 | **跨域凭据隔离** | 下载图片时，仅同域名请求携带 Cookie/Authorization；跨域（含 30x 重定向到 CDN）使用"干净 session" | 自动生效 |
+| **跨域 Referer 脱敏** | 跨域图片请求的 Referer 自动脱敏（移除 query/fragment），防止 token/签名泄露给第三方 CDN；同域请求保留完整 Referer 以满足防盗链 | 自动生效 |
 | **流式下载** | 图片采用流式写入，避免大图导致内存溢出（OOM） | 自动生效 |
 | **单图大小限制** | 默认限制单张图片 25MB，防止恶意/超大响应 | `--max-image-bytes` |
 | **映射文件可选** | 可选择不生成 `*.assets.json` 映射文件（并清理已存在的旧映射文件） | `--no-map-json` |
@@ -181,15 +204,16 @@ skills-webpage-to-md/
 │       ├── SKILL.md                    # Skills 核心文件
 │       ├── scripts/
 │       │   ├── grab_web_to_md.py       # CLI 入口（参数解析 + 流程调度）
-│       │   └── webpage_to_md/          # 核心功能包（8 个子模块）
+│       │   └── webpage_to_md/          # 核心功能包（10 个子模块）
 │       │       ├── __init__.py         # 包入口，导出数据模型
 │       │       ├── models.py           # 数据模型（BatchConfig / BatchPageResult 等）
 │       │       ├── security.py         # URL 脱敏 / JS challenge 检测 / 校验
 │       │       ├── http_client.py      # HTTP 会话创建与 HTML 抓取
+│       │       ├── ssr_extract.py      # SSR 数据提取 + 通用 JSON 富文本转换
+│       │       ├── notion.py           # Notion 公开页面 API 提取（Block→HTML）
 │       │       ├── images.py           # 图片下载、格式嗅探与路径替换
 │       │       ├── extractors.py       # 正文 / 标题 / 链接提取 + docs 框架预设 + 导航剥离
 │       │       ├── markdown_conv.py    # HTML→Markdown 转换 + 噪音清理 + 链接改写
-│       │       ├── ssr_extract.py     # SSR 数据提取 + 通用 JSON 富文本转换（ProseMirror/Slate/Editor.js/Lexical/Quill）
 │       │       ├── output.py           # 合并 / 分文件 / 索引 / frontmatter 输出
 │       │       └── pdf_utils.py        # Markdown→HTML→PDF 渲染（Edge/Chrome headless）
 │       └── references/
@@ -213,6 +237,7 @@ skills-webpage-to-md/
 | `extractors.py` | ~1210 | 正文/标题/链接提取、10 种 Docs 框架预设、导航剥离、微信异步提取 |
 | `markdown_conv.py` | ~940 | HTML→Markdown 解析器、LaTeX 公式、表格、噪音清理 |
 | `ssr_extract.py` | ~530 | SSR 数据检测/提取 + 通用 JSON 富文本→HTML 转换器 + 两阶段兜底 |
+| `notion.py` | ~500 | Notion 公开页面 API 提取（Block 递归获取 + Block→HTML 转换） |
 | `output.py` | ~450 | Frontmatter 生成、合并/分文件/索引输出、锚点管理 |
 | `pdf_utils.py` | ~420 | Markdown→HTML 渲染、PDF 打印（Edge/Chrome headless） |
 

@@ -1457,5 +1457,243 @@ class TestWechatAsyncIntegration(unittest.TestCase):
             self.assertTrue(len(content) > 50)
 
 
+# ═══════════════════════════════════════════════════════════════════════
+# Notion 模块测试
+# ═══════════════════════════════════════════════════════════════════════
+
+from webpage_to_md.notion import (
+    _blocks_to_html,
+    _extract_page_id,
+    _rich_text_to_html,
+    is_notion_url,
+)
+
+
+class TestNotionURLDetection(unittest.TestCase):
+    def test_notion_url_positive(self):
+        self.assertTrue(is_notion_url("https://www.notion.so/Kiro-29cbd3b8020080d5a1e5f7cd300576dd"))
+        self.assertTrue(is_notion_url("https://notion.so/Some-Page-abcdef0123456789abcdef0123456789"))
+
+    def test_notion_site_url_positive(self):
+        self.assertTrue(is_notion_url("https://team.notion.site/Test-29cbd3b8020080d5a1e5f7cd300576dd"))
+        self.assertTrue(is_notion_url("https://my-org.notion.site/Page-abcdef0123456789abcdef0123456789"))
+
+    def test_notion_url_negative(self):
+        self.assertFalse(is_notion_url("https://example.com/page"))
+        self.assertFalse(is_notion_url("https://www.notion.so/"))
+        self.assertFalse(is_notion_url(""))
+
+    def test_notion_url_no_page_id_negative(self):
+        """notion.so 子路径但无 32 位 page ID 的普通页面不应识别为 Notion 公开页面"""
+        self.assertFalse(is_notion_url("https://www.notion.so/help/guides"))
+        self.assertFalse(is_notion_url("https://www.notion.so/product/docs"))
+        self.assertFalse(is_notion_url("https://www.notion.so/about"))
+        self.assertFalse(is_notion_url("https://www.notion.so/pricing"))
+
+    def test_extract_page_id(self):
+        pid = _extract_page_id("https://www.notion.so/Kiro-29cbd3b8020080d5a1e5f7cd300576dd")
+        self.assertEqual(pid, "29cbd3b8-0200-80d5-a1e5-f7cd300576dd")
+
+    def test_extract_page_id_no_title_prefix(self):
+        pid = _extract_page_id("https://www.notion.so/29cbd3b8020080d5a1e5f7cd300576dd")
+        self.assertEqual(pid, "29cbd3b8-0200-80d5-a1e5-f7cd300576dd")
+
+    def test_extract_page_id_invalid(self):
+        self.assertIsNone(_extract_page_id("https://www.notion.so/"))
+        self.assertIsNone(_extract_page_id("https://example.com"))
+
+
+class TestNotionRichText(unittest.TestCase):
+    def test_plain_text(self):
+        self.assertEqual(_rich_text_to_html([["Hello"]]), "Hello")
+
+    def test_bold_italic(self):
+        result = _rich_text_to_html([["Bold", [["b"]]], [" and "], ["Italic", [["i"]]]])
+        self.assertIn("<b>Bold</b>", result)
+        self.assertIn("<i>Italic</i>", result)
+
+    def test_link(self):
+        result = _rich_text_to_html([["click", [["a", "https://example.com"]]]])
+        self.assertIn('href="https://example.com"', result)
+        self.assertIn("click", result)
+
+    def test_code(self):
+        result = _rich_text_to_html([["code()", [["c"]]]])
+        self.assertIn("<code>code()</code>", result)
+
+    def test_html_escape(self):
+        result = _rich_text_to_html([["<script>alert(1)</script>"]])
+        self.assertNotIn("<script>", result)
+        self.assertIn("&lt;script&gt;", result)
+
+
+class TestNotionBlocksToHTML(unittest.TestCase):
+    def _make_block(self, block_id, block_type, title_text="", children=None, **extra):
+        block = {
+            "id": block_id,
+            "type": block_type,
+            "properties": {"title": [[title_text]]} if title_text else {},
+        }
+        if children:
+            block["content"] = children
+        block.update(extra)
+        return block
+
+    def test_basic_page(self):
+        page_id = "page-1"
+        blocks = {
+            page_id: self._make_block(page_id, "page", "Test Page", children=["b1", "b2"]),
+            "b1": self._make_block("b1", "header", "Section 1"),
+            "b2": self._make_block("b2", "text", "Hello world"),
+        }
+        html, title = _blocks_to_html(blocks, page_id)
+        self.assertEqual(title, "Test Page")
+        self.assertIn("<h1>Test Page</h1>", html)
+        self.assertIn("<h1>Section 1</h1>", html)
+        self.assertIn("<p>Hello world</p>", html)
+
+    def test_nested_lists(self):
+        page_id = "page-1"
+        blocks = {
+            page_id: self._make_block(page_id, "page", "List Page", children=["l1", "l2"]),
+            "l1": self._make_block("l1", "bulleted_list", "Item A"),
+            "l2": self._make_block("l2", "bulleted_list", "Item B"),
+        }
+        html, _ = _blocks_to_html(blocks, page_id)
+        self.assertIn("<ul>", html)
+        self.assertIn("<li>Item A</li>", html)
+        self.assertIn("<li>Item B</li>", html)
+
+    def test_code_block(self):
+        page_id = "page-1"
+        blocks = {
+            page_id: self._make_block(page_id, "page", "Code", children=["c1"]),
+            "c1": {
+                "id": "c1", "type": "code",
+                "properties": {
+                    "title": [["print('hello')"]],
+                    "language": [["python"]],
+                },
+            },
+        }
+        html, _ = _blocks_to_html(blocks, page_id)
+        self.assertIn("language-python", html)
+        self.assertIn("print(&#x27;hello&#x27;)", html)
+
+    def test_toggle_block(self):
+        page_id = "page-1"
+        blocks = {
+            page_id: self._make_block(page_id, "page", "Toggle", children=["t1"]),
+            "t1": self._make_block("t1", "toggle", "Click me", children=["t1c"]),
+            "t1c": self._make_block("t1c", "text", "Hidden content"),
+        }
+        html, _ = _blocks_to_html(blocks, page_id)
+        self.assertIn("<details>", html)
+        self.assertIn("<summary>Click me</summary>", html)
+        self.assertIn("Hidden content", html)
+
+    def test_quote_block(self):
+        page_id = "page-1"
+        blocks = {
+            page_id: self._make_block(page_id, "page", "Q", children=["q1"]),
+            "q1": self._make_block("q1", "quote", "A wise saying"),
+        }
+        html, _ = _blocks_to_html(blocks, page_id)
+        self.assertIn("<blockquote>A wise saying</blockquote>", html)
+
+    def test_nested_todo(self):
+        """嵌套待办项：父 to_do 包含子 to_do，子项不应丢失。"""
+        page_id = "page-1"
+        blocks = {
+            page_id: self._make_block(page_id, "page", "Todos", children=["t1"]),
+            "t1": {
+                "id": "t1", "type": "to_do",
+                "properties": {"title": [["Parent task"]], "checked": [["No"]]},
+                "content": ["t2"],
+            },
+            "t2": {
+                "id": "t2", "type": "to_do",
+                "properties": {"title": [["Child task"]], "checked": [["Yes"]]},
+            },
+        }
+        html, _ = _blocks_to_html(blocks, page_id)
+        self.assertIn("Parent task", html)
+        self.assertIn("Child task", html)
+        self.assertIn("☐", html)
+        self.assertIn("☑", html)
+
+    def test_divider(self):
+        page_id = "page-1"
+        blocks = {
+            page_id: self._make_block(page_id, "page", "D", children=["d1"]),
+            "d1": self._make_block("d1", "divider"),
+        }
+        html, _ = _blocks_to_html(blocks, page_id)
+        self.assertIn("<hr/>", html)
+
+
+class TestNotionNoNotionFlag(unittest.TestCase):
+    """测试 --no-notion 参数能正确禁用 Notion 检测。"""
+
+    def test_no_notion_skips_api(self):
+        with tempfile.TemporaryDirectory() as td:
+            out_md = os.path.join(td, "out.md")
+            html = "<html><head><title>Test</title></head><body><p>Content</p></body></html>"
+            with mock.patch.object(grab, "fetch_html", return_value=html):
+                with mock.patch.object(grab, "detect_js_challenge") as mock_js:
+                    mock_js.return_value = mock.Mock(is_challenge=False)
+                    with mock.patch("webpage_to_md.notion.fetch_notion_page") as mock_notion:
+                        out_buf = io.StringIO()
+                        err_buf = io.StringIO()
+                        with redirect_stdout(out_buf), redirect_stderr(err_buf):
+                            code = grab.main([
+                                "https://www.notion.so/Test-abcdef0123456789abcdef0123456789",
+                                "--out", out_md,
+                                "--overwrite",
+                                "--no-map-json",
+                                "--no-notion",
+                            ])
+                        mock_notion.assert_not_called()
+            self.assertEqual(code, grab.EXIT_SUCCESS)
+
+
+class TestNotionAPIFailureNoFallback(unittest.TestCase):
+    """Notion URL 识别后 API 失败，不应静默回退到 HTTP，应报错。"""
+
+    def test_batch_notion_api_failure_returns_error(self):
+        """批量模式：Notion API 失败应返回 success=False，不应静默成功。"""
+        config = grab.BatchConfig(
+            timeout=10,
+            retries=1,
+            max_html_bytes=5_000_000,
+            no_notion=False,
+        )
+        with mock.patch.object(grab, "fetch_notion_page", side_effect=RuntimeError("API 500")):
+            result = grab.process_single_url(
+                url="https://www.notion.so/Test-abcdef0123456789abcdef0123456789",
+                config=config,
+                session=mock.MagicMock(),
+            )
+            self.assertFalse(result.success)
+            self.assertIn("Notion API", result.error)
+
+    def test_single_page_notion_api_failure_exits(self):
+        """单页模式：Notion API 失败应返回 EXIT_ERROR，不应回退到 HTTP。"""
+        with tempfile.TemporaryDirectory() as td:
+            out_md = os.path.join(td, "out.md")
+            with mock.patch("webpage_to_md.notion.fetch_notion_page", side_effect=RuntimeError("API 500")):
+                out_buf = io.StringIO()
+                err_buf = io.StringIO()
+                with redirect_stdout(out_buf), redirect_stderr(err_buf):
+                    code = grab.main([
+                        "https://www.notion.so/Test-abcdef0123456789abcdef0123456789",
+                        "--out", out_md,
+                        "--overwrite",
+                        "--no-map-json",
+                    ])
+                self.assertEqual(code, grab.EXIT_ERROR)
+                self.assertIn("Notion API", err_buf.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()
