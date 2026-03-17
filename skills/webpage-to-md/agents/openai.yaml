@@ -1,0 +1,4 @@
+interface:
+  display_name: "Web to Markdown"
+  short_description: "Extract web content and convert to clean Markdown with images"
+  default_prompt: "Extract the given URL to a well-formatted Markdown file with local images."

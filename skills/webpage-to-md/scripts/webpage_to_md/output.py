@@ -395,9 +395,11 @@ def batch_save_individual(
     include_frontmatter: bool = True,
     redact_urls: bool = True,
     shared_assets_dir: Optional[str] = None,
+    overwrite: bool = False,
 ) -> List[str]:
     os.makedirs(output_dir, exist_ok=True)
     saved_files: List[str] = []
+    used_paths: set = set()
 
     for result in results:
         if not result.success:
@@ -409,9 +411,12 @@ def batch_save_individual(
 
         base, ext = os.path.splitext(filepath)
         counter = 1
-        while os.path.exists(filepath):
+        is_base = True
+        while filepath in used_paths or (not (overwrite and is_base) and os.path.exists(filepath)):
             filepath = f"{base}_{counter}{ext}"
             counter += 1
+            is_base = False
+        used_paths.add(filepath)
 
         content = result.md_content
         if shared_assets_dir:

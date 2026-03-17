@@ -1,6 +1,6 @@
 ---
 name: webpage-to-md
-description: "Web scraping and Markdown conversion toolkit for extracting web content with images. Use when Claude needs to: (1) Save web articles/blogs as Markdown files, (2) Export WeChat articles (mp.weixin.qq.com), (3) Batch crawl Wiki sites and merge into single document, (4) Download webpage images locally, (5) Convert HTML tables/code blocks to Markdown format."
+description: "Web scraping and Markdown conversion toolkit for extracting web content with images. Use when the agent needs to: (1) Save web articles/blogs as Markdown files, (2) Export WeChat articles (mp.weixin.qq.com), (3) Batch crawl Wiki/Docs sites and merge into single document, (4) Download webpage images locally, (5) Convert HTML tables/code blocks to Markdown format, (6) Export Notion public pages (notion.so / *.notion.site). Do NOT use for: generating Markdown from scratch (no URL involved), editing existing Markdown files, or browser automation tasks (Playwright/Selenium)."
 ---
 
 # Web to Markdown Grabber
@@ -14,11 +14,12 @@ This skill uses a modular Python package:
 ```
 scripts/
 ├── grab_web_to_md.py       # CLI entry point (argument parsing + orchestration)
-└── webpage_to_md/          # Core package (9 submodules)
+└── webpage_to_md/          # Core package (10 submodules)
     ├── models.py           # Data models (BatchConfig, BatchPageResult, etc.)
     ├── security.py         # URL redaction / JS challenge detection / validation
     ├── http_client.py      # HTTP session creation and HTML fetching
     ├── ssr_extract.py      # SSR data extraction (Next.js/Modern.js → HTML/Markdown)
+    ├── notion.py           # Notion public page API extraction (Block→HTML)
     ├── images.py           # Image download, format sniffing, path replacement
     ├── extractors.py       # Content/title/link extraction + docs presets + nav stripping
     ├── markdown_conv.py    # HTML→Markdown converter + noise cleanup + link rewriting
@@ -55,18 +56,58 @@ python SKILL_DIR/scripts/grab_web_to_md.py "https://wiki.example.com/index" \
 
 ```bash
 # Tencent Cloud developer article (Next.js + ProseMirror) — auto-extracted
+# Single-page mode downloads images by default, no need for --download-images
 python SKILL_DIR/scripts/grab_web_to_md.py "https://cloud.tencent.com/developer/article/xxx" \
-  --auto-title --download-images
+  --auto-title
 
 # Volcengine docs (Modern.js + MDContent) — auto-extracted
 python SKILL_DIR/scripts/grab_web_to_md.py "https://www.volcengine.com/docs/xxx" \
-  --auto-title --download-images --best-effort-images
+  --auto-title --best-effort-images
 
 # Disable SSR extraction if needed
 python SKILL_DIR/scripts/grab_web_to_md.py "URL" --no-ssr
 ```
 
 **Auto behavior**: Detects `__NEXT_DATA__` (Next.js) or `window._ROUTER_DATA` (Modern.js) in HTML → extracts embedded article content → converts ProseMirror JSON to HTML or uses raw MDContent directly. Skips JS anti-scraping warnings when SSR data is available.
+
+### Notion Public Page Export
+
+```bash
+# Notion public page — auto-detected via notion.so / *.notion.site domains
+python SKILL_DIR/scripts/grab_web_to_md.py \
+  "https://www.notion.so/Page-Title-29cbd3b8020080d5a1e5f7cd300576dd" \
+  --auto-title
+
+# *.notion.site domains also supported
+python SKILL_DIR/scripts/grab_web_to_md.py \
+  "https://team.notion.site/Guide-abcdef0123456789abcdef0123456789" \
+  --auto-title
+
+# Disable Notion API extraction
+python SKILL_DIR/scripts/grab_web_to_md.py "https://www.notion.so/..." --no-notion
+```
+
+**Auto behavior**: Detects `notion.so` and `*.notion.site` URLs → fetches all blocks via Notion internal API (`loadPageChunk` + `syncRecordValues`) → converts block tree to HTML → runs standard HTML→Markdown pipeline. Supports 15+ block types including text, headings, lists, code, quotes, toggles, to-do items, images, bookmarks. Only works for **publicly shared** pages. If API extraction fails, the tool **reports an error** instead of silently falling back to HTTP (which would yield empty Notion shell HTML).
+
+## Offline Smoke Test (No Network Required)
+
+Verify the skill is installed correctly using a local HTML file:
+
+```bash
+# 1. Create a minimal test HTML
+echo '<html><head><title>Smoke Test</title></head><body><h1>Hello</h1><p>Skill works.</p></body></html>' > /tmp/smoke.html
+
+# 2. Convert local HTML → Markdown (no network needed)
+python SKILL_DIR/scripts/grab_web_to_md.py --local-html /tmp/smoke.html --out /tmp/smoke.md
+
+# 3. Verify output contains expected content
+grep -q "# Hello" /tmp/smoke.md && grep -q "Skill works" /tmp/smoke.md && echo "✅ PASS" || echo "❌ FAIL"
+
+# 4. Run unit tests (also offline)
+python -m pytest SKILL_DIR/../../tests/ -q
+```
+
+Expected: exit code 0, output file contains `# Hello` and `Skill works.`.
 
 ## Core Parameters
 
@@ -104,7 +145,7 @@ python SKILL_DIR/scripts/grab_web_to_md.py "https://mp.weixin.qq.com/s/xxx" \
 
 Supports two WeChat article formats:
 - **Traditional articles**: Extracts `rich_media_content` HTML with images
-- **New-format posts** (图文笔记/小绿书, `item_show_type=10`): Content is embedded in JavaScript (`window.cgiDataNew`) and loaded asynchronously. The script automatically detects this format and extracts text content from the embedded data. Note: images in new-format posts are loaded dynamically and cannot be extracted via HTTP.
+- **New-format posts** (WeChat "图文笔记/小绿书" short posts, `item_show_type=10`): Content is embedded in JavaScript (`window.cgiDataNew`) and loaded asynchronously. The script automatically detects this format and extracts text content from the embedded data. Note: images in new-format posts are loaded dynamically and cannot be extracted via HTTP.
 
 ### 3. Wiki Batch Crawl + Merge
 
@@ -214,12 +255,7 @@ python SKILL_DIR/scripts/grab_web_to_md.py "https://docs.example.com/" \
 | `--max-image-bytes` | 25MB | Max size per image (0=unlimited) |
 | `--pdf-allow-file-access` | False | Allow file:// access when generating PDF |
 
-**Security features (always active)**:
-- Cross-origin image downloads use clean session (no Cookie/Auth leak), including redirect chains
-- Redirects back to same host switch back to credentialed session when needed
-- Clean session inherits proxy/cert/adapters from the base session (still no sensitive headers)
-- HTML attributes sanitized (removes `on*` events and `javascript:` URLs, including unquoted attribute variants)
-- Streaming download prevents OOM on large images
+**Built-in security** (always active): cross-origin session isolation, Referer redaction, HTML sanitization, streaming download. For details see [references/full-guide.md](references/full-guide.md) §数据安全与隐私.
 
 ## Anti-Scraping Support
 
@@ -234,41 +270,11 @@ python SKILL_DIR/scripts/grab_web_to_md.py "URL" --header "Authorization: Bearer
 python SKILL_DIR/scripts/grab_web_to_md.py "URL" --ua-preset firefox-win
 ```
 
-## JS Challenge Detection (Cloudflare, etc.)
+## JS Challenge & Local HTML Fallback
 
-Some websites use JavaScript-based anti-bot protection (Cloudflare, Akamai, etc.). The script **automatically detects** these challenges and provides clear guidance.
-
-> **Note**: JS Challenge detection works in both **single-page** and **batch** modes (`--urls-file` / `--crawl`).  
-> 默认行为是检测到挑战页即返回错误并给出 `--local-html` 方案；如需强制继续可使用 `--force`。
-
-### What happens when JS protection is detected
-
-```
-⚠️  检测到 JavaScript 反爬保护（置信度：高）
-
-检测到的信号：
-  • 标题包含 'Challenge'
-  • 页面提示 JavaScript 必需/被禁用
-
-说明：
-  该网站使用了 JavaScript 反爬机制来验证访问者。
-  纯 HTTP 请求无法通过此验证，需要浏览器环境执行 JavaScript。
-  这超出了本工具（仅依赖 requests）的能力范围。
-
-建议操作：
-  1. 在浏览器中打开该 URL，等待页面完全加载
-  2. 右键点击页面 → 「另存为」→ 保存为 .html 文件
-  3. 使用 --local-html 参数处理本地文件
-```
-
-Exit code: **4** (JS_CHALLENGE)
-
-### Workaround: Process locally saved HTML
+JS-protected sites (Cloudflare, etc.) are auto-detected (exit code **4**). Workaround:
 
 ```bash
-# Step 1: Manually save the webpage in browser (File → Save As → .html)
-
-# Step 2: Process the local HTML file
 python SKILL_DIR/scripts/grab_web_to_md.py \
   --local-html saved_page.html \
   --base-url "https://original-url.com/page" \
@@ -281,36 +287,7 @@ python SKILL_DIR/scripts/grab_web_to_md.py \
 | `--base-url URL` | Base URL for downloading images (used with --local-html) |
 | `--force` | Force continue even when JS challenge detected (content may be empty) |
 
-### Known JS-protected sites
-
-| Site | Protection | Workaround |
-|------|------------|------------|
-| Tencent Cloud Developer | Next.js SSR | **Auto-handled** (SSR extraction) |
-| Volcengine Docs | Modern.js SSR | **Auto-handled** (SSR extraction) |
-| Zhihu (知乎) | Aggressive JS challenge | Use `--local-html` |
-| PyPI | Cloudflare | Use `--local-html` |
-| Some GitHub pages | Cloudflare | Use `--local-html` |
-| News sites | Various | Try `--ua-preset` first, then `--local-html` |
-
-### SSR Auto-Extraction
-
-For sites that use Server-Side Rendering (SSR) frameworks, the tool can automatically extract content from embedded data blocks even when the page appears to require JavaScript:
-
-| Framework | Data Block | Content Format | Sites |
-|-----------|-----------|---------------|-------|
-| Next.js | `__NEXT_DATA__` | ProseMirror JSON → HTML | Tencent Cloud Developer |
-| Modern.js | `window._ROUTER_DATA` | MDContent (raw Markdown) | Volcengine Docs |
-
-SSR extraction is **enabled by default** and runs automatically. Use `--no-ssr` to disable.
-
-### Design principle
-
-This tool **intentionally** does not include browser automation (Playwright, Selenium) to:
-- Minimize dependencies (only `requests` required)
-- Avoid complex setup and maintenance
-- Keep the tool lightweight and portable
-
-When JS protection is encountered and SSR data is not available, the tool honestly reports the limitation and provides a manual workaround.
+Auto-handled sites: Tencent Cloud (SSR), Volcengine (SSR), Notion (API). For details on JS challenge detection, known protected sites, and SSR extraction, see [references/full-guide.md](references/full-guide.md) §JS Challenge Detection.
 
 ## Output Structure
 
@@ -342,16 +319,7 @@ docs/
 | WordPress | `--target-class entry-content` |
 | WeChat | Auto-detected, or `--wechat` |
 | Tech Blog | `--keep-html --tags` |
-| **Mintlify Docs** | `--docs-preset mintlify` |
-| **Docusaurus** | `--docs-preset docusaurus` |
-| **GitBook** | `--docs-preset gitbook` |
-| **VuePress** | `--docs-preset vuepress` |
-| **MkDocs** | `--docs-preset mkdocs` |
-| **ReadTheDocs** | `--docs-preset readthedocs` |
-| **Sphinx** | `--docs-preset sphinx` |
-| **Notion** | `--docs-preset notion` |
-| **Confluence** | `--docs-preset confluence` |
-| **Generic Docs** | `--docs-preset generic` or `--strip-nav --strip-page-toc` |
+| Docs Frameworks | `--docs-preset NAME` (10 presets: mintlify / docusaurus / gitbook / vuepress / mkdocs / readthedocs / sphinx / notion / confluence / generic; use `--list-presets` to see all) |
 
 ## Dependencies
 
@@ -360,32 +328,12 @@ docs/
 
 Install: `pip install requests`
 
-## Architecture
-
-The codebase follows a modular design with clear separation of concerns:
-
-| Module | Responsibility |
-|--------|---------------|
-| `grab_web_to_md.py` | CLI entry point: argument parsing, single/batch orchestration |
-| `models.py` | Shared data classes (BatchConfig, BatchPageResult, etc.) |
-| `security.py` | URL redaction, JS challenge detection, markdown validation |
-| `http_client.py` | UA presets, session creation, HTML fetching with retries |
-| `ssr_extract.py` | SSR data extraction + universal JSON→HTML converter (ProseMirror/Slate/Editor.js/Lexical/Quill) + HTML sanitization |
-| `images.py` | Image download (streaming, cross-origin isolation), format sniffing |
-| `extractors.py` | Content extraction, 10 docs framework presets, nav stripping |
-| `markdown_conv.py` | HTML→Markdown parser, LaTeX, tables, noise cleanup |
-| `output.py` | Frontmatter, merged/split/index output, anchor management |
-| `pdf_utils.py` | Markdown→HTML rendering, PDF printing via browser headless |
-
-Dependency chain: `models` ← `security` ← `markdown_conv` / `images` / `output` (no circular deps).
-
 ## References
 
 For complete documentation, see [references/full-guide.md](references/full-guide.md):
-- All parameter explanations with defaults
-- 9 usage scenarios with examples
-- 3 detailed real-world cases
-- Output structure diagrams
-- Technical implementation details
-- Modular architecture overview
-- Changelog history
+- **All parameters with defaults**: see Parameter Reference tables
+- **JS challenge handling & known sites**: see JS Challenge Detection section
+- **Security architecture**: see Data Security & Privacy section
+- **Architecture & module details**: see Modular Architecture section
+- **10 usage scenarios with real-world cases**
+- **Changelog history**
