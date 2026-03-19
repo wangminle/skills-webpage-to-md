@@ -62,8 +62,12 @@ def sniff_ext(data: bytes) -> Optional[str]:
         return ".webp"
     if len(data) >= 4 and data[:4] == b"%PDF":
         return ".pdf"
+    if len(data) >= 12 and data[4:8] == b"ftyp" and data[8:12] in (b"avif", b"avis"):
+        return ".avif"
     head = data[:512].lstrip()
-    if head.startswith(b"<svg") or b"<svg" in head[:100]:
+    if head.startswith(b"<svg") or (head.startswith(b"<?xml") and b"<svg" in head[:256]):
+        return ".svg"
+    if b"<svg" in head[:100]:
         return ".svg"
     return None
 

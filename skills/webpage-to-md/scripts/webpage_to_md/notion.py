@@ -103,7 +103,10 @@ def _load_page_chunk(
         timeout=timeout_s,
     )
     r.raise_for_status()
-    return r.json()
+    try:
+        return r.json()
+    except ValueError as e:
+        raise RuntimeError(f"Notion API loadPageChunk 返回非 JSON 响应: {r.text[:200]}") from e
 
 
 def _sync_record_values(
@@ -124,7 +127,10 @@ def _sync_record_values(
         timeout=timeout_s,
     )
     r.raise_for_status()
-    return r.json()
+    try:
+        return r.json()
+    except ValueError as e:
+        raise RuntimeError(f"Notion API syncRecordValues 返回非 JSON 响应: {r.text[:200]}") from e
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -144,12 +150,14 @@ def _fetch_all_blocks(
     record_map = data.get("recordMap", {})
     block_map = record_map.get("block", {})
     for bid, entry in block_map.items():
+        if not isinstance(entry, dict):
+            continue
         value = entry.get("value", {})
         if value:
             all_blocks[bid] = value
 
     # Step 2: 递归获取子 Block
-    for _ in range(_MAX_RECURSION_ROUNDS):
+    for round_idx in range(_MAX_RECURSION_ROUNDS):
         missing: List[str] = []
         for block in list(all_blocks.values()):
             for child_id in block.get("content", []):
@@ -164,11 +172,20 @@ def _fetch_all_blocks(
             resp = _sync_record_values(session, batch, timeout_s)
             results = resp.get("recordMap", {}).get("block", {})
             for bid, entry in results.items():
+                if not isinstance(entry, dict):
+                    continue
                 value = entry.get("value", {})
                 if value:
                     all_blocks[bid] = value
             if i + _SYNC_BATCH_SIZE < len(missing):
                 time.sleep(0.2)
+    else:
+        if missing:
+            print(
+                f"警告：Notion Block 递归获取达到上限（{_MAX_RECURSION_ROUNDS} 轮），"
+                f"仍有 {len(missing)} 个子 Block 未获取，页面内容可能不完整",
+                file=sys.stderr,
+            )
 
     return all_blocks
 
@@ -486,16 +503,21 @@ def fetch_notion_page(
     session = requests.Session()
     session.headers.update(_api_headers())
 
-    last_err: Optional[Exception] = None
-    for attempt in range(1, retries + 1):
-        try:
-            all_blocks = _fetch_all_blocks(session, page_id, timeout_s)
-            html, title = _blocks_to_html(all_blocks, page_id)
-            return html, title
-        except Exception as e:
-            last_err = e
-            if attempt < retries:
-                time.sleep(min(2.0, 0.5 * attempt))
-                print(f"  Notion API 重试 ({attempt}/{retries})：{e}", file=sys.stderr)
+    try:
+        last_err: Optional[Exception] = None
+        for attempt in range(1, retries + 1):
+            try:
+                all_blocks = _fetch_all_blocks(session, page_id, timeout_s)
+                html, title = _blocks_to_html(all_blocks, page_id)
+                return html, title
+            except (ValueError, TypeError) as e:
+                raise
+            except Exception as e:
+                last_err = e
+                if attempt < retries:
+                    time.sleep(min(2.0, 0.5 * attempt))
+                    print(f"  Notion API 重试 ({attempt}/{retries})：{e}", file=sys.stderr)
 
-    raise last_err or RuntimeError("Notion page fetch failed")
+        raise last_err or RuntimeError("Notion page fetch failed")
+    finally:
+        session.close()

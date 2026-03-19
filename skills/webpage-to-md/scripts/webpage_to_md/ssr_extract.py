@@ -324,19 +324,26 @@ def _apply_marks(text: str, node: dict) -> str:
     return result
 
 
+def _safe_int(val: Any, default: int = 2) -> int:
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        return default
+
+
 def _get_heading_level(node: dict) -> int:
     """从各框架的 heading 节点中提取标题级别。"""
     # ProseMirror / Tiptap: attrs.level
     attrs = node.get("attrs", {})
     if isinstance(attrs, dict) and "level" in attrs:
-        return min(max(int(attrs["level"]), 1), 6)
+        return min(max(_safe_int(attrs["level"]), 1), 6)
     # Editor.js: data.level
     data = node.get("data", {})
     if isinstance(data, dict) and "level" in data:
-        return min(max(int(data["level"]), 1), 6)
+        return min(max(_safe_int(data["level"]), 1), 6)
     # Slate / Lexical: 直接在节点上的 level 字段
     if "level" in node:
-        return min(max(int(node["level"]), 1), 6)
+        return min(max(_safe_int(node["level"]), 1), 6)
     # Lexical: tag 字段 (如 "h2")
     tag = node.get("tag", "")
     if isinstance(tag, str) and tag.startswith("h") and len(tag) == 2 and tag[1].isdigit():
@@ -603,12 +610,12 @@ def _convert_quill_ops(ops: list) -> Optional[str]:
                 if "link" in attrs:
                     text = f'<a href="{html_escape(attrs["link"])}">{text}</a>'
                 if attrs.get("header"):
-                    level = min(max(int(attrs["header"]), 1), 6)
+                    level = min(max(_safe_int(attrs["header"]), 1), 6)
                     text = f"<h{level}>{text}</h{level}>\n"
             parts.append(text)
         elif isinstance(insert, dict):
-            if "image" in insert:
-                parts.append(f'<img src="{html_escape(insert["image"])}">\n')
+            if insert.get("image"):
+                parts.append(f'<img src="{html_escape(str(insert["image"]))}">\n')
 
     body = "".join(parts)
     if not body.strip():
