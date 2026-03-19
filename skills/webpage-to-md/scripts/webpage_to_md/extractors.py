@@ -577,7 +577,10 @@ def strip_html_elements(
     stats.chars_before = len(html_content)
 
     stripper = _HTMLElementStripper(selectors)
-    stripper.feed(html_content)
+    try:
+        stripper.feed(html_content)
+    except Exception:
+        return html_content, stats
     result = stripper.get_result()
 
     stats.elements_removed += stripper.stats.elements_removed
@@ -867,7 +870,10 @@ class _TargetSectionExtractor(HTMLParser):
 
 def extract_target_html(page_html: str, *, target_id: Optional[str], target_class: Optional[str]) -> Optional[str]:
     parser = _TargetSectionExtractor(target_id=target_id, target_class=target_class)
-    parser.feed(page_html or "")
+    try:
+        parser.feed(page_html or "")
+    except Exception:
+        return None
     out = "".join(parser.buf).strip()
     return out or None
 
@@ -1063,7 +1069,10 @@ def extract_links_from_html(
     same_domain: bool = True,
 ) -> List[Tuple[str, str]]:
     parser = LinkExtractor(base_url, pattern, same_domain)
-    parser.feed(html)
+    try:
+        parser.feed(html)
+    except Exception:
+        pass
     seen = set()
     unique_links = []
     for url, text in parser.links:
@@ -1075,7 +1084,15 @@ def extract_links_from_html(
 
 def read_urls_file(filepath: str) -> List[Tuple[str, Optional[str]]]:
     urls: List[Tuple[str, Optional[str]]] = []
-    with open(filepath, "r", encoding="utf-8") as f:
+    try:
+        f = open(filepath, "r", encoding="utf-8")
+    except FileNotFoundError:
+        print(f"错误：URL 文件不存在：{filepath}", file=sys.stderr)
+        return urls
+    except PermissionError:
+        print(f"错误：无权限读取 URL 文件：{filepath}", file=sys.stderr)
+        return urls
+    with f:
         for line_num, line in enumerate(f, 1):
             line = line.strip()
             if not line or line.startswith("#"):

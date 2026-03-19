@@ -553,11 +553,12 @@ def _batch_main(args: argparse.Namespace) -> int:
             if not config.target_class and preset.target_classes:
                 config.target_class = ",".join(preset.target_classes)
             # 合并预设的 exclude_selectors
-            preset_excludes = ",".join(preset.exclude_selectors)
-            if config.exclude_selectors:
-                config.exclude_selectors = f"{config.exclude_selectors},{preset_excludes}"
-            else:
-                config.exclude_selectors = preset_excludes
+            if preset.exclude_selectors:
+                preset_excludes = ",".join(preset.exclude_selectors)
+                if config.exclude_selectors:
+                    config.exclude_selectors = f"{config.exclude_selectors},{preset_excludes}"
+                else:
+                    config.exclude_selectors = preset_excludes
             # 自动启用导航剥离
             config.strip_nav = True
             config.strip_page_toc = True
@@ -1349,11 +1350,12 @@ urls.txt 文件格式：
                     if not target_class and preset.target_classes:
                         target_class = ",".join(preset.target_classes)
                     # 合并预设的 exclude_selectors
-                    preset_excludes = ",".join(preset.exclude_selectors)
-                    if exclude_selectors:
-                        exclude_selectors = f"{exclude_selectors},{preset_excludes}"
-                    else:
-                        exclude_selectors = preset_excludes
+                    if preset.exclude_selectors:
+                        preset_excludes = ",".join(preset.exclude_selectors)
+                        if exclude_selectors:
+                            exclude_selectors = f"{exclude_selectors},{preset_excludes}"
+                        else:
+                            exclude_selectors = preset_excludes
                     # 自动启用导航剥离
                     strip_nav = True
                     strip_page_toc = True
@@ -1374,11 +1376,12 @@ urls.txt 文件格式：
                             target_id = ",".join(preset.target_ids)
                         if not target_class and preset.target_classes:
                             target_class = ",".join(preset.target_classes)
-                        preset_excludes = ",".join(preset.exclude_selectors)
-                        if exclude_selectors:
-                            exclude_selectors = f"{exclude_selectors},{preset_excludes}"
-                        else:
-                            exclude_selectors = preset_excludes
+                        if preset.exclude_selectors:
+                            preset_excludes = ",".join(preset.exclude_selectors)
+                            if exclude_selectors:
+                                exclude_selectors = f"{exclude_selectors},{preset_excludes}"
+                            else:
+                                exclude_selectors = preset_excludes
                         strip_nav = True
                         strip_page_toc = True
                         if anchor_list_threshold == 0:
