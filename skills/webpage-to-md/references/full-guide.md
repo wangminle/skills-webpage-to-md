@@ -56,7 +56,7 @@ pip install pytest
 | 参数 | 说明 | 默认值 |
 |------|------|--------|
 | `url` | 目标网页 URL | - |
-| `--out` | 输出文件名（仅单页模式） | 根据 URL 生成 |
+| `--out` / `--output` | 输出文件名（仅单页模式；`--output` 为别名） | 根据 URL 生成 |
 | `--auto-title` | 自动按页面标题生成输出文件名（仅单页模式；未指定 `--out` 时生效） | `False` |
 | `--assets-dir` | 图片目录（仅单页模式） | `<out>.assets` |
 | `--title` | 文档标题 | 从 `<title>` 提取 |
@@ -527,14 +527,12 @@ python scripts/grab_web_to_md.py \
 
 ## 输出结构
 
-### 自动创建同名目录
-
-如果只指定文件名（不含目录），会**自动创建同名上级目录**，保持输出整洁：
+### 输出路径规则（当前行为）
 
 ```bash
-# 输入：--out article.md
-# 输出：
-article/
+# 输入：--out article.md（显式指定输出文件）
+# 输出（保持原路径，不自动包目录）：
+./
 ├── article.md
 ├── article.assets/
 └── article.md.assets.json
@@ -544,16 +542,22 @@ docs/
 ├── article.md
 ├── article.assets/
 └── article.md.assets.json
+
+# 输入：--auto-title（标题为“学习笔记”）
+学习笔记/
+├── 学习笔记.md
+├── 学习笔记.assets/
+└── 学习笔记.md.assets.json
 ```
 
 **单页模式**：
 ```
-article/
-├── article.md
-├── article.assets/
+<auto-name>/
+├── <auto-name>.md
+├── <auto-name>.assets/
 │   ├── 01-hero.png
 │   └── 02-diagram.jpg
-└── article.md.assets.json
+└── <auto-name>.md.assets.json
 ```
 
 **批量独立文件**：
@@ -645,6 +649,14 @@ pdf_utils (无包内依赖)
 ---
 
 ## 更新日志
+
+### v2.1.3 (2026-03-25)
+- 🐛 **修复单页 `--out` 路径被改写问题**：
+  - 显式指定 `--out article.md` 时，输出保持为 `./article.md`，不再自动包 `article/article.md`
+  - 自动包同名目录行为保留给自动命名场景（如 `--auto-title` 或默认 URL 命名）
+- ✨ **新增 `--output` 别名**：
+  - `--output` 与 `--out` 等价，兼容历史调用方式
+  - 避免与 `--output-dir` 的参数缩写歧义
 
 ### v2.1.2 (2026-03-03)
 - ✨ **微信图文笔记（小绿书）新格式支持**：

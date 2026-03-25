@@ -113,7 +113,7 @@ Expected: exit code 0, output file contains `# Hello` and `Skill works.`.
 
 | Parameter | Purpose | Example |
 |-----------|---------|---------|
-| `--out` | Output file path | `--out docs/article.md` |
+| `--out` / `--output` | Output file path (`--output` is an alias) | `--out docs/article.md` |
 | `--auto-title` | Auto-name output file from page title (single-page only; ignored when `--out` is set or in batch/crawl mode) | `--auto-title` |
 | `--validate` | Verify image integrity | `--validate` |
 | `--max-html-bytes` | Max HTML bytes per page (0=unlimited) | `--max-html-bytes 0` |
@@ -291,23 +291,27 @@ Auto-handled sites: Tencent Cloud (SSR), Volcengine (SSR), Notion (API). For det
 
 ## Output Structure
 
-**Auto directory creation**: If only filename is specified (no directory), a same-name parent directory is automatically created:
+**Output path behavior**:
 
 ```bash
-# Input: --out article.md
-# Output structure:
-article/
-├── article.md              # Markdown file
-├── article.assets/         # Images directory
-│   ├── 01-hero.png
-│   └── 02-diagram.jpg
-└── article.md.assets.json  # URL→local mapping
+# Input: --out article.md (explicit path)
+# Output structure (kept as-is, no auto wrapper):
+./
+├── article.md
+├── article.assets/
+└── article.md.assets.json
 
 # Input: --out docs/article.md (user specified directory, unchanged)
 docs/
 ├── article.md
 ├── article.assets/
 └── article.md.assets.json
+
+# Input: --auto-title (title is "My Article")
+My-Article/
+├── My-Article.md
+├── My-Article.assets/
+└── My-Article.md.assets.json
 ```
 
 ## Common Site Configurations

@@ -949,7 +949,8 @@ urls.txt 文件格式：
 """,
     )
     ap.add_argument("url", nargs="?", help="要抓取的网页 URL（单页模式必需，批量模式可选）")
-    ap.add_argument("--out", help="输出 md 文件名（默认根据 URL 自动生成）")
+    ap.add_argument("--out", "--output", dest="out",
+                    help="输出 md 文件名（默认根据 URL 自动生成；--output 为兼容别名）")
     ap.add_argument("--auto-title", action="store_true",
                     help="从页面标题自动生成输出文件名（优先级低于 --out；未指定 --out 时生效）")
     ap.add_argument("--assets-dir", help="图片目录名（默认 <out>.assets）")
@@ -1200,8 +1201,9 @@ urls.txt 文件格式：
             base = _default_basename(url) + ".md"
     
     out_md = base
-    # 自动创建同名上级目录（如果用户未指定目录）
-    out_md = auto_wrap_output_dir(out_md)
+    # 仅在未显式指定 --out/--output 时，自动创建同名上级目录
+    if not args.out:
+        out_md = auto_wrap_output_dir(out_md)
     # 检查输出文件路径长度
     md_dir = os.path.dirname(out_md) or "."
     out_md_name = os.path.basename(out_md)
