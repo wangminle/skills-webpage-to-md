@@ -18,7 +18,7 @@
 - ✅ **导航剥离**：自动移除侧边栏/页内目录，支持 10 种文档框架预设
 - ✅ **框架识别**：自动检测 Docusaurus/Mintlify/GitBook 等站点模板
 - ✅ **双版本输出**：同时生成合并版和分文件版，共享 assets 目录
-- ✅ **智能目录管理**：自动创建同名上级目录，保持输出整洁
+- ✅ **智能目录管理**：自动命名/合并输出可自动创建同名目录；显式 `--out` 路径保持不变
 
 ## 安装到 Claude Code
 
@@ -134,7 +134,7 @@ python skills/webpage-to-md/scripts/grab_web_to_md.py \
 
 | 参数 | 说明 | 适用模式 |
 |------|------|----------|
-| `--out` | 输出文件路径 | 单页 |
+| `--out` / `--output` | 输出文件路径（单页；两者等价） | 单页 |
 | `--auto-title` | 自动按页面标题生成文件名（未指定 `--out` 时生效） | 单页 |
 | `--validate` | 校验图片引用完整性 | 全部 |
 | `--overwrite` | 覆盖上次运行的已存在文件（同批次同名页面始终用数字后缀区分） | 全部 |
@@ -270,15 +270,15 @@ pip install requests
 
 ## 输出结构
 
-**自动创建同名目录**：如果只指定文件名（不含目录），会自动创建同名目录：
+**单页模式输出规则**：
 
 ```bash
-# 输入：--out article.md
-# 输出结构：
-article/
-├── article.md              # Markdown 文件
-├── article.assets/         # 图片目录
-└── article.md.assets.json  # URL→本地映射
+# 输入：--out article.md（显式指定输出文件）
+# 输出结构（保持原路径，不自动包目录）：
+./
+├── article.md
+├── article.assets/
+└── article.md.assets.json
 
 # 输入：--out docs/article.md（用户指定目录，保持不变）
 # 输出结构：
@@ -294,6 +294,8 @@ docs/
 ├── 我的文章.assets/
 └── 我的文章.md.assets.json
 ```
+
+**批量合并模式**：`--merge-output merged.md` 仍会自动生成为 `merged/merged.md`（保持历史行为）。
 
 ## License
 

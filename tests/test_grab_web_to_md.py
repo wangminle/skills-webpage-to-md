@@ -261,6 +261,51 @@ class TestAutoTitle(unittest.TestCase):
             self.assertNotIn("自动标题命名", out_buf.getvalue())
             self.assertTrue(os.path.isfile(out_path))
 
+    def test_out_bare_filename_not_wrapped(self):
+        """显式 --out bare.md 应保持原路径，不自动包同名目录"""
+        html = "<html><head><title>Ignored</title></head><body><h1>Hello</h1><p>content</p></body></html>"
+        with tempfile.TemporaryDirectory() as td:
+            html_path = str(pathlib.Path(td) / "page.html")
+            with open(html_path, "w", encoding="utf-8") as f:
+                f.write(html)
+
+            original_cwd = os.getcwd()
+            try:
+                os.chdir(td)
+                out_buf = io.StringIO()
+                err_buf = io.StringIO()
+                with redirect_stdout(out_buf), redirect_stderr(err_buf):
+                    code = grab.main([
+                        "--local-html", html_path,
+                        "--out", "article.md",
+                        "--overwrite",
+                    ])
+                self.assertEqual(code, grab.EXIT_SUCCESS)
+                self.assertTrue(os.path.isfile(os.path.join(td, "article.md")))
+                self.assertFalse(os.path.exists(os.path.join(td, "article", "article.md")))
+            finally:
+                os.chdir(original_cwd)
+
+    def test_output_alias_works_like_out(self):
+        """--output 作为 --out 别名可用"""
+        html = "<html><head><title>Ignored</title></head><body><h1>Hello</h1><p>content</p></body></html>"
+        with tempfile.TemporaryDirectory() as td:
+            html_path = str(pathlib.Path(td) / "page.html")
+            with open(html_path, "w", encoding="utf-8") as f:
+                f.write(html)
+
+            out_buf = io.StringIO()
+            err_buf = io.StringIO()
+            out_path = str(pathlib.Path(td) / "via-output.md")
+            with redirect_stdout(out_buf), redirect_stderr(err_buf):
+                code = grab.main([
+                    "--local-html", html_path,
+                    "--output", out_path,
+                    "--overwrite",
+                ])
+            self.assertEqual(code, grab.EXIT_SUCCESS)
+            self.assertTrue(os.path.isfile(out_path))
+
 
 class TestAutoTitleWechatNoUrl(unittest.TestCase):
     """回归测试：微信标题在无 URL 场景下的提取"""
