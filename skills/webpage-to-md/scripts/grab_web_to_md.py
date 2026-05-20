@@ -6,8 +6,6 @@
 
 依赖说明：
 - 必需依赖：requests（HTTP 请求）
-- 可选依赖：markdown（用于 PDF 渲染时的 Markdown→HTML 转换，无则使用内置简易转换）
-- PDF 生成：使用系统已安装的 Edge/Chrome 浏览器 headless 模式，无需额外安装工具
 - 不依赖：pandoc、playwright、selenium、bs4、lxml
 
 设计目标（来自之前四个站点的实践）：
@@ -25,7 +23,6 @@ import argparse
 import json
 import os
 import sys
-import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -59,6 +56,7 @@ from webpage_to_md.http_client import (
     UA_PRESETS,
     _DEFAULT_MAX_HTML_BYTES,
     _create_session,
+    browser_fetch_html,
     fetch_html,
 )
 from webpage_to_md.extractors import (
@@ -107,10 +105,6 @@ from webpage_to_md.output import (
     generate_frontmatter,
     generate_index_markdown,
     generate_merged_markdown,
-)
-from webpage_to_md.pdf_utils import (
-    generate_pdf_from_markdown,
-    strip_yaml_frontmatter,
 )
 from webpage_to_md.security import (
     _redact_url_to_local_map,
@@ -169,13 +163,16 @@ def process_single_url(
 
         # 获取页面（非 Notion URL 走普通路径）
         if page_html is None:
-            page_html = fetch_html(
-                session=session,
-                url=url,
-                timeout_s=config.timeout,
-                retries=config.retries,
-                max_html_bytes=config.max_html_bytes,
-            )
+            if config.browser_fetch:
+                page_html = browser_fetch_html(url, timeout_s=config.timeout)
+            else:
+                page_html = fetch_html(
+                    session=session,
+                    url=url,
+                    timeout_s=config.timeout,
+                    retries=config.retries,
+                    max_html_bytes=config.max_html_bytes,
+                )
 
         # ── SSR 数据自动提取（批量模式）—— 必须在反爬检测之前 ──
         # 原因：含 <noscript> 提示的 SSR 页面会触发 JS 反爬检测，
@@ -370,6 +367,19 @@ def process_single_url(
         )
 
 
+def _clone_session(session: requests.Session) -> requests.Session:
+    """克隆一个 Session 的不可变配置（headers/cookies）到新实例。
+
+    requests.Session 不是线程安全的（连接池、cookie jar、默认 header 字典
+    均无内部锁），并发 worker 共享同一实例可能导致连接池状态异常或 header
+    交叉污染。通过为每个 worker 克隆一个独立 Session 来规避。
+    """
+    new = requests.Session()
+    new.headers.update(session.headers)
+    new.cookies.update(session.cookies)
+    return new
+
+
 def batch_process_urls(
     session: requests.Session,
     urls: List[Tuple[str, Optional[str]]],
@@ -378,13 +388,13 @@ def batch_process_urls(
 ) -> List[BatchPageResult]:
     """
     批量处理 URL 列表
-    
+
     Args:
-        session: requests.Session
+        session: requests.Session（作为配置模板，每个 worker 会克隆独立实例）
         urls: [(url, custom_title), ...]
         config: 批量处理配置
         progress_callback: 进度回调函数 (current, total, url)
-    
+
     Returns:
         处理结果列表
     """
@@ -392,10 +402,10 @@ def batch_process_urls(
     total = len(urls)
     lock = threading.Lock()
     last_request_time = [0.0]  # 使用列表以便在闭包中修改
-    
+
     def process_with_delay(args: Tuple[int, str, Optional[str]]) -> BatchPageResult:
         idx, url, custom_title = args
-        
+
         # 控制请求间隔
         with lock:
             now = time.time()
@@ -403,12 +413,13 @@ def batch_process_urls(
             if elapsed < config.delay:
                 time.sleep(config.delay - elapsed)
             last_request_time[0] = time.time()
-        
+
         if progress_callback:
             progress_callback(idx + 1, total, url)
-        
+
+        worker_session = _clone_session(session)
         return process_single_url(
-            session=session,
+            session=worker_session,
             url=url,
             config=config,
             custom_title=custom_title,
@@ -463,24 +474,29 @@ def _batch_main(args: argparse.Namespace) -> int:
         print(f"正在从索引页提取链接：{args.url}")
         
         try:
-            index_html = fetch_html(
-                session=session,
-                url=args.url,
-                timeout_s=args.timeout,
-                retries=args.retries,
-                max_html_bytes=args.max_html_bytes,
-            )
+            if getattr(args, "browser_fetch", False):
+                print("使用浏览器获取索引页...")
+                index_html = browser_fetch_html(args.url, timeout_s=args.timeout)
+            else:
+                index_html = fetch_html(
+                    session=session,
+                    url=args.url,
+                    timeout_s=args.timeout,
+                    retries=args.retries,
+                    max_html_bytes=args.max_html_bytes,
+                )
         except Exception as e:
             print(f"错误：无法获取索引页：{e}", file=sys.stderr)
             return EXIT_ERROR
 
-        # 索引页也可能命中 JS 反爬：提前给出解决方案，避免后续“提取 0 链接”的误导
-        js_detection = detect_js_challenge(index_html)
-        if js_detection.is_challenge:
-            print_js_challenge_warning(js_detection, args.url)
-            if not args.force:
-                return EXIT_JS_CHALLENGE
-            print("已添加 --force 参数，强制继续处理索引页...", file=sys.stderr)
+        # 浏览器模式已通过 JS 挑战，无需重复检测
+        if not getattr(args, "browser_fetch", False):
+            js_detection = detect_js_challenge(index_html)
+            if js_detection.is_challenge:
+                print_js_challenge_warning(js_detection, args.url)
+                if not args.force:
+                    return EXIT_JS_CHALLENGE
+                print("已添加 --force 参数，强制继续处理索引页...", file=sys.stderr)
         
         # 提取链接
         links = extract_links_from_html(
@@ -539,6 +555,7 @@ def _batch_main(args: argparse.Namespace) -> int:
         auto_detect=args.auto_detect,
         force=args.force,
         no_ssr=getattr(args, "no_ssr", False),
+        browser_fetch=getattr(args, "browser_fetch", False),
         no_notion=getattr(args, "no_notion", False),
     )
     
@@ -860,6 +877,21 @@ def _fetch_page_html(
     Returns:
         (page_html, exit_code) — exit_code 为 None 表示成功
     """
+
+    # ── 浏览器获取模式 ────────────────────────────────────────────
+    if getattr(args, "browser_fetch", False):
+        print(f"使用浏览器获取页面：{url}")
+        try:
+            page_html = browser_fetch_html(url, timeout_s=args.timeout)
+            print(f"浏览器获取成功（{len(page_html)} bytes）")
+            return page_html, None
+        except RuntimeError as exc:
+            safe_url = redact_url(url) if args.redact_url else url
+            print(f"错误：浏览器获取失败：{safe_url}", file=sys.stderr)
+            print(f"详情：{exc}", file=sys.stderr)
+            return None, EXIT_ERROR
+
+    # ── 纯 HTTP 获取模式（默认） ───────────────────────────
     print(f"下载页面：{url}")
     try:
         page_html = fetch_html(
@@ -876,11 +908,12 @@ def _fetch_page_html(
         if status in (403, 429):
             print("", file=sys.stderr)
             print("可能触发了站点的反爬或访问频控。建议：", file=sys.stderr)
-            print("  1. 在浏览器中打开该 URL，等待页面完全加载", file=sys.stderr)
-            print("  2. 右键页面另存为 .html 文件", file=sys.stderr)
-            print("  3. 使用 --local-html 与 --base-url 进行处理，例如：", file=sys.stderr)
+            print("  1. 添加 --browser-fetch 参数使用系统浏览器获取（需安装 Chrome/Edge）", file=sys.stderr)
+            print("  2. 或在浏览器中打开该 URL，等待页面完全加载", file=sys.stderr)
+            print("  3. 右键页面另存为 .html 文件", file=sys.stderr)
+            print("  4. 使用 --local-html 与 --base-url 进行处理，例如：", file=sys.stderr)
             print(
-                f'     python grab_web_to_md.py --local-html saved.html --base-url "{safe_url}" --out output.md',
+                f'     python3 grab_web_to_md.py --local-html saved.html --base-url "{safe_url}" --out output.md',
                 file=sys.stderr,
             )
         return None, EXIT_ERROR
@@ -888,7 +921,7 @@ def _fetch_page_html(
         safe_url = redact_url(url) if args.redact_url else url
         print(f"错误：下载失败：{safe_url}", file=sys.stderr)
         print(f"详情：{exc}", file=sys.stderr)
-        print("建议：可改用浏览器保存 HTML 后，通过 --local-html 离线处理。", file=sys.stderr)
+        print("建议：可改用 --browser-fetch 或浏览器保存 HTML 后通过 --local-html 离线处理。", file=sys.stderr)
         return None, EXIT_ERROR
 
     # JS 反爬检测（SSR 站点可能误报，先检查是否有 SSR 数据）
@@ -934,13 +967,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         epilog="""
 批量处理示例：
   # 从文件读取 URL 列表，合并为单个文档
-  python grab_web_to_md.py --urls-file urls.txt --merge --merge-output output.md
+  python3 grab_web_to_md.py --urls-file urls.txt --merge --merge-output output.md
 
   # 从索引页爬取链接并批量导出
-  python grab_web_to_md.py https://example.com/index --crawl --merge --toc
+  python3 grab_web_to_md.py https://example.com/index --crawl --merge --toc
 
   # 批量导出为独立文件
-  python grab_web_to_md.py --urls-file urls.txt --output-dir ./docs
+  python3 grab_web_to_md.py --urls-file urls.txt --output-dir ./docs
 
 urls.txt 文件格式：
   # 这是注释
@@ -955,7 +988,6 @@ urls.txt 文件格式：
                     help="从页面标题自动生成输出文件名（优先级低于 --out；未指定 --out 时生效）")
     ap.add_argument("--assets-dir", help="图片目录名（默认 <out>.assets）")
     ap.add_argument("--title", help="Markdown 顶部标题（默认从 <title> 提取）")
-    ap.add_argument("--with-pdf", action="store_true", help="同时生成同名 PDF（需要本机 Edge/Chrome）")
     ap.add_argument("--timeout", type=int, default=60, help="请求超时（秒），默认 60")
     ap.add_argument("--retries", type=int, default=3, help="网络重试次数，默认 3")
     ap.add_argument(
@@ -971,6 +1003,8 @@ urls.txt 文件格式：
     ap.add_argument("--local-html", metavar="FILE", help="从本地 HTML 文件读取内容（跳过网络请求，用于处理浏览器保存的页面）")
     ap.add_argument("--base-url", help="配合 --local-html 使用，指定图片下载的基准 URL")
     ap.add_argument("--force", action="store_true", help="检测到 JS 反爬时仍强制继续处理（内容可能为空或不完整）")
+    ap.add_argument("--browser-fetch", action="store_true",
+                    help="使用系统 Chrome/Edge 浏览器 headless 模式获取页面（可绕过 Cloudflare 等 JS 反爬保护，需系统安装浏览器）")
     ap.add_argument(
         "--max-image-bytes",
         type=int,
@@ -994,11 +1028,6 @@ urls.txt 文件格式：
         "--no-map-json",
         action="store_true",
         help="不生成 *.assets.json URL→本地映射文件（避免泄露图片 URL）",
-    )
-    ap.add_argument(
-        "--pdf-allow-file-access",
-        action="store_true",
-        help="生成 PDF 时允许 file:// 访问其他本地文件（可能有安全风险；默认关闭）",
     )
     # Frontmatter 支持
     ap.add_argument("--frontmatter", action="store_true", default=True,
@@ -1101,7 +1130,7 @@ urls.txt 文件格式：
             print(f"                   正文 class: {', '.join(preset.target_classes[:3]) or '(无)'}{'...' if len(preset.target_classes) > 3 else ''}")
             print(f"                   排除选择器: {len(preset.exclude_selectors)} 个")
             print()
-        print("使用示例：python grab_web_to_md.py URL --docs-preset mintlify")
+        print("使用示例：python3 grab_web_to_md.py URL --docs-preset mintlify")
         return EXIT_SUCCESS
     
     # ========== 批量处理模式 ==========
@@ -1530,37 +1559,6 @@ urls.txt 文件格式：
     print(f"图片目录：{assets_dir}")
     if wrote_map_json:
         print(f"映射文件：{map_json}")
-
-    if args.with_pdf:
-        out_pdf = os.path.splitext(out_md)[0] + ".pdf"
-        if os.path.exists(out_pdf) and (not args.overwrite):
-            print(f"PDF 已存在，跳过：{out_pdf}（如需覆盖请加 --overwrite）", file=sys.stderr)
-        else:
-            print(f"生成 PDF：{out_pdf}")
-            if args.frontmatter:
-                # md 文件保留 frontmatter；但 PDF 渲染时剥离元数据块，并补一个可见标题/来源行。
-                pdf_md = f"# {title}\n\n- Source: {display_url}\n\n{md_body}"
-                md_dir_abs = os.path.dirname(os.path.abspath(out_md)) or "."
-                tmp = None
-                try:
-                    with tempfile.NamedTemporaryFile(
-                        "w",
-                        encoding="utf-8",
-                        suffix=".no_frontmatter.md",
-                        dir=md_dir_abs,
-                        delete=False,
-                    ) as tf:
-                        tf.write(strip_yaml_frontmatter(pdf_md))
-                        tmp = tf.name
-                    generate_pdf_from_markdown(md_path=tmp, pdf_path=out_pdf, allow_file_access=args.pdf_allow_file_access)
-                finally:
-                    if tmp and os.path.isfile(tmp):
-                        try:
-                            os.remove(tmp)
-                        except OSError:
-                            pass
-            else:
-                generate_pdf_from_markdown(md_path=out_md, pdf_path=out_pdf, allow_file_access=args.pdf_allow_file_access)
 
     if args.validate:
         result = validate_markdown(out_md, assets_dir)

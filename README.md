@@ -2,6 +2,8 @@
 
 一个功能强大的 Python 工具，用于抓取网页并转换为干净的 Markdown 格式。
 
+> 当前版本：0.4.0
+
 ## 功能特性
 
 - ✅ **智能正文抽取**：自动识别 article/main/body，过滤导航噪音
@@ -12,6 +14,7 @@
 - ✅ **SSR 数据提取**：自动从 Next.js / Modern.js 的 SSR 数据中提取正文（腾讯云开发者、火山引擎文档等）
 - ✅ **Notion 公开页面**：自动检测 Notion URL（`notion.so` 和 `*.notion.site`），通过内部 API 递归获取全部 Block 并转换（无需浏览器）
 - ✅ **通用 JSON 富文本转换**：兼容 ProseMirror / Slate / Editor.js / Lexical / Quill Delta 五种 Schema，零依赖自动兜底
+- ✅ **浏览器获取模式**：`--browser-fetch` 调用系统 Chrome/Edge headless 绕过 JS 反爬（无需额外 pip 依赖）
 - ✅ **反爬支持**：Cookie/Header/UA 定制
 - ✅ **YAML Frontmatter**：兼容 Obsidian/Hugo/Jekyll
 - ✅ **数据安全**：URL 脱敏、跨域凭据隔离、流式下载防 OOM
@@ -40,29 +43,31 @@ Claude Code 会自动识别并调用此 Skill 完成网页抓取任务。
 
 ## 快速开始
 
+> **命令说明**：下方使用 `python3` / `pip3`（macOS/Linux 默认），Windows 用户请替换为 `python` / `pip`。脚本兼容 Python 3.8+。
+
 ```bash
 # 安装依赖
-pip install requests
+pip3 install requests
 
 # 单页导出
-python skills/webpage-to-md/scripts/grab_web_to_md.py "https://example.com/article" --out article.md
+python3 skills/webpage-to-md/scripts/grab_web_to_md.py "https://example.com/article" --out article.md
 
 # 自动按页面标题命名（例如：如何学Python/如何学Python.md）
-python skills/webpage-to-md/scripts/grab_web_to_md.py "https://example.com/article" --auto-title
+python3 skills/webpage-to-md/scripts/grab_web_to_md.py "https://example.com/article" --auto-title
 
 # 离线微信 HTML 也支持自动标题（无需 --base-url 即可提取微信标题）
-python skills/webpage-to-md/scripts/grab_web_to_md.py --local-html wechat.html --auto-title
+python3 skills/webpage-to-md/scripts/grab_web_to_md.py --local-html wechat.html --auto-title
 
 # 微信公众号（自动检测）
-python skills/webpage-to-md/scripts/grab_web_to_md.py "https://mp.weixin.qq.com/s/xxx"
+python3 skills/webpage-to-md/scripts/grab_web_to_md.py "https://mp.weixin.qq.com/s/xxx"
 
 # Wiki 批量爬取
-python skills/webpage-to-md/scripts/grab_web_to_md.py "https://wiki.example.com/index" \
+python3 skills/webpage-to-md/scripts/grab_web_to_md.py "https://wiki.example.com/index" \
   --crawl --crawl-pattern 'page=' \
   --merge --toc --merge-output wiki.md
 ```
 
-## 五种典型使用场景
+## 六种典型使用场景
 
 | 场景 | 说明 |
 |------|------|
@@ -71,19 +76,20 @@ python skills/webpage-to-md/scripts/grab_web_to_md.py "https://wiki.example.com/
 | **Wiki 批量** | `--crawl --merge --clean-wiki-noise` 爬取合并 |
 | **Docs 站点** | `--docs-preset mintlify` 一键导出，自动剥离导航 |
 | **SSR 动态站点** | 自动提取 JS 渲染站点正文（两阶段：精确匹配 → JSON 兜底扫描） |
+| **JS 保护站点** | `--browser-fetch` 使用系统浏览器绕过 Cloudflare 等 JS 反爬 |
 
 ### Docs 站点导出示例
 
 ```bash
 # 使用预设导出 Mintlify 文档站点（如 OpenClaw）
-python skills/webpage-to-md/scripts/grab_web_to_md.py "https://docs.example.com/" \
+python3 skills/webpage-to-md/scripts/grab_web_to_md.py "https://docs.example.com/" \
   --crawl \
   --merge --toc \
   --docs-preset mintlify \
   --merge-output docs-export.md
 
 # 双版本输出：同时生成合并版和分文件版
-python skills/webpage-to-md/scripts/grab_web_to_md.py "https://docs.example.com/" \
+python3 skills/webpage-to-md/scripts/grab_web_to_md.py "https://docs.example.com/" \
   --crawl --merge --toc \
   --docs-preset mintlify \
   --merge-output output/merged.md \
@@ -91,7 +97,7 @@ python skills/webpage-to-md/scripts/grab_web_to_md.py "https://docs.example.com/
   --download-images
 
 # 支持的预设：mintlify, docusaurus, gitbook, vuepress, mkdocs, readthedocs, sphinx, notion, confluence, generic
-python skills/webpage-to-md/scripts/grab_web_to_md.py --list-presets
+python3 skills/webpage-to-md/scripts/grab_web_to_md.py --list-presets
 ```
 
 ### SSR 动态站点导出示例
@@ -99,36 +105,55 @@ python skills/webpage-to-md/scripts/grab_web_to_md.py --list-presets
 ```bash
 # 腾讯云开发者文章（Next.js + ProseMirror）— 自动提取
 # 单页模式默认下载图片，无需 --download-images
-python skills/webpage-to-md/scripts/grab_web_to_md.py \
+python3 skills/webpage-to-md/scripts/grab_web_to_md.py \
   "https://cloud.tencent.com/developer/article/2624003" \
   --auto-title
 
 # 火山引擎文档（Modern.js + MDContent）— 自动提取
-python skills/webpage-to-md/scripts/grab_web_to_md.py \
+python3 skills/webpage-to-md/scripts/grab_web_to_md.py \
   "https://www.volcengine.com/docs/6396/2189942" \
   --auto-title --best-effort-images
 
 # 禁用 SSR 提取（回退到普通 HTML 解析）
-python skills/webpage-to-md/scripts/grab_web_to_md.py "https://example.com" --no-ssr
+python3 skills/webpage-to-md/scripts/grab_web_to_md.py "https://example.com" --no-ssr
 ```
 
 ### Notion 公开页面导出示例
 
 ```bash
 # Notion 公开页面 — 自动检测并通过 API 提取（支持 notion.so 和 *.notion.site）
-python skills/webpage-to-md/scripts/grab_web_to_md.py \
+python3 skills/webpage-to-md/scripts/grab_web_to_md.py \
   "https://www.notion.so/Kiro-29cbd3b8020080d5a1e5f7cd300576dd" \
   --auto-title
 
 # *.notion.site 域名同样支持
-python skills/webpage-to-md/scripts/grab_web_to_md.py \
+python3 skills/webpage-to-md/scripts/grab_web_to_md.py \
   "https://team.notion.site/Guide-abcdef0123456789abcdef0123456789" \
   --auto-title
 
 # 禁用 Notion 自动检测（强制走普通 HTTP 请求）
-python skills/webpage-to-md/scripts/grab_web_to_md.py \
+python3 skills/webpage-to-md/scripts/grab_web_to_md.py \
   "https://www.notion.so/Page-ID" --no-notion
 ```
+
+### 浏览器获取模式（JS 保护站点）
+
+```bash
+# 遇到 Cloudflare 等 JS 反爬时，使用系统浏览器获取（需安装 Chrome/Edge）
+python3 skills/webpage-to-md/scripts/grab_web_to_md.py \
+  "https://protected-site.com/page" \
+  --browser-fetch --auto-title
+
+# 批量爬取时也可使用浏览器模式
+python3 skills/webpage-to-md/scripts/grab_web_to_md.py \
+  "https://protected-site.com/index" \
+  --crawl --merge --toc --browser-fetch \
+  --merge-output docs.md
+```
+
+**工作原理**：两阶段策略——Phase 1 启动 Chrome headless 访问目标页面，等待 JS 挑战自动通过并存储 cookie；Phase 2 用同一浏览器 profile 重新获取，此时已有 clearance cookie，直接获得真实页面。
+
+**适用范围**：需要 JS 执行的站点、基本的 Cloudflare JS Challenge。对使用 Turnstile 等高级人机验证的站点，headless 浏览器可能仍被检测，此时建议使用 `--local-html` 手动保存。
 
 ## 常用参数
 
@@ -151,6 +176,7 @@ python skills/webpage-to-md/scripts/grab_web_to_md.py \
 | `--split-output DIR` | 同时输出分文件版本（与 --merge 配合使用） | 合并 |
 | `--strip-nav` | 移除导航元素（侧边栏等） | 全部 |
 | `--strip-page-toc` | 移除页内目录 | 全部 |
+| `--browser-fetch` | 使用系统 Chrome/Edge headless 获取页面（绕过 JS 反爬） | 全部 |
 | `--no-ssr` | 禁用 SSR 数据自动提取（默认启用） | 全部 |
 | `--no-notion` | 禁用 Notion 公开页面 API 自动提取 | 全部 |
 
@@ -168,24 +194,24 @@ python skills/webpage-to-md/scripts/grab_web_to_md.py \
 | **流式下载** | 图片采用流式写入，避免大图导致内存溢出（OOM） | 自动生效 |
 | **单图大小限制** | 默认限制单张图片 25MB，防止恶意/超大响应 | `--max-image-bytes` |
 | **映射文件可选** | 可选择不生成 `*.assets.json` 映射文件（并清理已存在的旧映射文件） | `--no-map-json` |
-| **PDF 本地访问** | 生成 PDF 时默认关闭 `--allow-file-access-from-files` | `--pdf-allow-file-access` 可开启 |
 | **HTML 属性净化** | 保留 HTML 时自动过滤 `on*` 事件属性和 `javascript:` 协议（含无引号写法） | 自动生效 |
 
 ### 安全相关参数
 
 ```bash
 # 保留完整 URL（含 query 参数）
-python grab_web_to_md.py URL --no-redact-url
+python3 grab_web_to_md.py URL --no-redact-url
 
 # 不生成图片 URL 映射文件
-python grab_web_to_md.py URL --no-map-json
+python3 grab_web_to_md.py URL --no-map-json
 
 # 调整单图大小限制（0 表示不限制）
-python grab_web_to_md.py URL --max-image-bytes 52428800  # 50MB
-
-# 生成 PDF 时允许访问本地文件（有安全风险）
-python grab_web_to_md.py URL --with-pdf --pdf-allow-file-access
+python3 grab_web_to_md.py URL --max-image-bytes 52428800  # 50MB
 ```
+
+### 导出 PDF
+
+本 Skill 专注“网页 → Markdown + assets”，不内置 PDF 生成。需要 PDF 时，先用本工具生成 Markdown，再交给 `pdf` skill 或文档/PDF 工具转换。
 
 ### 典型场景
 
@@ -204,7 +230,7 @@ skills-webpage-to-md/
 │       ├── SKILL.md                    # Skills 核心文件
 │       ├── scripts/
 │       │   ├── grab_web_to_md.py       # CLI 入口（参数解析 + 流程调度）
-│       │   └── webpage_to_md/          # 核心功能包（10 个子模块）
+│       │   └── webpage_to_md/          # 核心功能包（9 个子模块）
 │       │       ├── __init__.py         # 包入口，导出数据模型
 │       │       ├── models.py           # 数据模型（BatchConfig / BatchPageResult 等）
 │       │       ├── security.py         # URL 脱敏 / JS challenge 检测 / 校验
@@ -214,8 +240,7 @@ skills-webpage-to-md/
 │       │       ├── images.py           # 图片下载、格式嗅探与路径替换
 │       │       ├── extractors.py       # 正文 / 标题 / 链接提取 + docs 框架预设 + 导航剥离
 │       │       ├── markdown_conv.py    # HTML→Markdown 转换 + 噪音清理 + 链接改写
-│       │       ├── output.py           # 合并 / 分文件 / 索引 / frontmatter 输出
-│       │       └── pdf_utils.py        # Markdown→HTML→PDF 渲染（Edge/Chrome headless）
+│       │       └── output.py           # 合并 / 分文件 / 索引 / frontmatter 输出
 │       └── references/
 │           └── full-guide.md           # 完整参考手册
 ├── tests/
@@ -232,14 +257,13 @@ skills-webpage-to-md/
 |------|------|------|
 | `models.py` | ~70 | 数据模型定义（BatchConfig、BatchPageResult、JSChallengeResult 等） |
 | `security.py` | ~240 | URL 脱敏、JS 反爬检测、Markdown 校验 |
-| `http_client.py` | ~200 | UA 预设、Session 创建、HTML 抓取（含重试/大小限制） |
+| `http_client.py` | ~350 | UA 预设、Session 创建、HTML 抓取（含重试/大小限制）、浏览器 headless 获取 |
 | `images.py` | ~500 | 图片下载（流式/跨域隔离）、格式嗅探、路径替换 |
 | `extractors.py` | ~1210 | 正文/标题/链接提取、10 种 Docs 框架预设、导航剥离、微信异步提取 |
 | `markdown_conv.py` | ~940 | HTML→Markdown 解析器、LaTeX 公式、表格、噪音清理 |
 | `ssr_extract.py` | ~530 | SSR 数据检测/提取 + 通用 JSON 富文本→HTML 转换器 + 两阶段兜底 |
 | `notion.py` | ~500 | Notion 公开页面 API 提取（Block 递归获取 + Block→HTML 转换） |
 | `output.py` | ~450 | Frontmatter 生成、合并/分文件/索引输出、锚点管理 |
-| `pdf_utils.py` | ~420 | Markdown→HTML 渲染、PDF 打印（Edge/Chrome headless） |
 
 依赖关系：`models` ← `security` ← `markdown_conv` / `images` / `output`，无循环依赖。
 
@@ -252,20 +276,20 @@ skills-webpage-to-md/
 
 ```bash
 # 运行全部测试
-python -m pytest tests/ -v
+python3 -m pytest tests/ -v
 
 # 快速验证导入
-python -c "import sys; sys.path.insert(0, 'skills/webpage-to-md/scripts'); import grab_web_to_md; print('OK')"
+python3 -c "import sys; sys.path.insert(0, 'skills/webpage-to-md/scripts'); import grab_web_to_md; print('OK')"
 ```
 
 ## 依赖
 
 - **必需**：`requests`（HTTP 请求）
-- **可选**：`markdown`（PDF 导出时使用）
+- **可选**：系统 Chrome/Edge 浏览器（`--browser-fetch` 使用）
 - **测试**：`pytest`（可选）
 
 ```bash
-pip install requests
+pip3 install requests
 ```
 
 ## 输出结构

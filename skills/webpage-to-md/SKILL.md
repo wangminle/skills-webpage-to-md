@@ -1,11 +1,13 @@
 ---
 name: webpage-to-md
-description: "Web scraping and Markdown conversion toolkit for extracting web content with images. Use when the agent needs to: (1) Save web articles/blogs as Markdown files, (2) Export WeChat articles (mp.weixin.qq.com), (3) Batch crawl Wiki/Docs sites and merge into single document, (4) Download webpage images locally, (5) Convert HTML tables/code blocks to Markdown format, (6) Export Notion public pages (notion.so / *.notion.site). Do NOT use for: generating Markdown from scratch (no URL involved), editing existing Markdown files, or browser automation tasks (Playwright/Selenium)."
+description: "Use when saving web articles, WeChat posts, public Notion pages, Wiki/Docs sites, or JS-protected pages as Markdown with local images; batch crawling and merging URL lists; downloading webpage images; or converting HTML tables, code blocks, and rich text into clean Markdown."
 ---
 
 # Web to Markdown Grabber
 
 Extract web content and convert to clean Markdown with local images.
+
+Current version: 0.4.0.
 
 ## Script Location
 
@@ -14,17 +16,16 @@ This skill uses a modular Python package:
 ```
 scripts/
 ├── grab_web_to_md.py       # CLI entry point (argument parsing + orchestration)
-└── webpage_to_md/          # Core package (10 submodules)
+└── webpage_to_md/          # Core package (9 submodules)
     ├── models.py           # Data models (BatchConfig, BatchPageResult, etc.)
     ├── security.py         # URL redaction / JS challenge detection / validation
-    ├── http_client.py      # HTTP session creation and HTML fetching
+    ├── http_client.py      # HTTP session + HTML fetching + browser headless fetch
     ├── ssr_extract.py      # SSR data extraction (Next.js/Modern.js → HTML/Markdown)
     ├── notion.py           # Notion public page API extraction (Block→HTML)
     ├── images.py           # Image download, format sniffing, path replacement
     ├── extractors.py       # Content/title/link extraction + docs presets + nav stripping
     ├── markdown_conv.py    # HTML→Markdown converter + noise cleanup + link rewriting
-    ├── output.py           # Merged/split/index/frontmatter output generation
-    └── pdf_utils.py        # Markdown→HTML→PDF rendering (Edge/Chrome headless)
+    └── output.py           # Merged/split/index/frontmatter output generation
 ```
 
 When using this skill, replace `SKILL_DIR` with the actual skill installation path:
@@ -33,21 +34,23 @@ When using this skill, replace `SKILL_DIR` with the actual skill installation pa
 
 ## Quick Start
 
+> **Note**: Commands below use `python3` / `pip3` (macOS/Linux default). Windows users should use `python` / `pip` instead. Requires Python 3.8+.
+
 ```bash
 # Single page export
-python SKILL_DIR/scripts/grab_web_to_md.py "https://example.com/article" --out output.md --validate
+python3 SKILL_DIR/scripts/grab_web_to_md.py "https://example.com/article" --out output.md --validate
 
 # Auto-name from page title (e.g. "如何学Python" → 如何学Python/如何学Python.md)
-python SKILL_DIR/scripts/grab_web_to_md.py "https://example.com/article" --auto-title
+python3 SKILL_DIR/scripts/grab_web_to_md.py "https://example.com/article" --auto-title
 
 # Local WeChat HTML offline (title can still be extracted without --base-url)
-python SKILL_DIR/scripts/grab_web_to_md.py --local-html wechat_saved.html --auto-title
+python3 SKILL_DIR/scripts/grab_web_to_md.py --local-html wechat_saved.html --auto-title
 
 # WeChat article (auto-detected)
-python SKILL_DIR/scripts/grab_web_to_md.py "https://mp.weixin.qq.com/s/xxx" --out article.md
+python3 SKILL_DIR/scripts/grab_web_to_md.py "https://mp.weixin.qq.com/s/xxx" --out article.md
 
 # Wiki batch crawl + merge
-python SKILL_DIR/scripts/grab_web_to_md.py "https://wiki.example.com/index" \
+python3 SKILL_DIR/scripts/grab_web_to_md.py "https://wiki.example.com/index" \
   --crawl --crawl-pattern 'page=' \
   --merge --toc --merge-output wiki.md
 ```
@@ -57,15 +60,15 @@ python SKILL_DIR/scripts/grab_web_to_md.py "https://wiki.example.com/index" \
 ```bash
 # Tencent Cloud developer article (Next.js + ProseMirror) — auto-extracted
 # Single-page mode downloads images by default, no need for --download-images
-python SKILL_DIR/scripts/grab_web_to_md.py "https://cloud.tencent.com/developer/article/xxx" \
+python3 SKILL_DIR/scripts/grab_web_to_md.py "https://cloud.tencent.com/developer/article/xxx" \
   --auto-title
 
 # Volcengine docs (Modern.js + MDContent) — auto-extracted
-python SKILL_DIR/scripts/grab_web_to_md.py "https://www.volcengine.com/docs/xxx" \
+python3 SKILL_DIR/scripts/grab_web_to_md.py "https://www.volcengine.com/docs/xxx" \
   --auto-title --best-effort-images
 
 # Disable SSR extraction if needed
-python SKILL_DIR/scripts/grab_web_to_md.py "URL" --no-ssr
+python3 SKILL_DIR/scripts/grab_web_to_md.py "URL" --no-ssr
 ```
 
 **Auto behavior**: Detects `__NEXT_DATA__` (Next.js) or `window._ROUTER_DATA` (Modern.js) in HTML → extracts embedded article content → converts ProseMirror JSON to HTML or uses raw MDContent directly. Skips JS anti-scraping warnings when SSR data is available.
@@ -74,17 +77,17 @@ python SKILL_DIR/scripts/grab_web_to_md.py "URL" --no-ssr
 
 ```bash
 # Notion public page — auto-detected via notion.so / *.notion.site domains
-python SKILL_DIR/scripts/grab_web_to_md.py \
+python3 SKILL_DIR/scripts/grab_web_to_md.py \
   "https://www.notion.so/Page-Title-29cbd3b8020080d5a1e5f7cd300576dd" \
   --auto-title
 
 # *.notion.site domains also supported
-python SKILL_DIR/scripts/grab_web_to_md.py \
+python3 SKILL_DIR/scripts/grab_web_to_md.py \
   "https://team.notion.site/Guide-abcdef0123456789abcdef0123456789" \
   --auto-title
 
 # Disable Notion API extraction
-python SKILL_DIR/scripts/grab_web_to_md.py "https://www.notion.so/..." --no-notion
+python3 SKILL_DIR/scripts/grab_web_to_md.py "https://www.notion.so/..." --no-notion
 ```
 
 **Auto behavior**: Detects `notion.so` and `*.notion.site` URLs → fetches all blocks via Notion internal API (`loadPageChunk` + `syncRecordValues`) → converts block tree to HTML → runs standard HTML→Markdown pipeline. Supports 15+ block types including text, headings, lists, code, quotes, toggles, to-do items, images, bookmarks. Only works for **publicly shared** pages. If API extraction fails, the tool **reports an error** instead of silently falling back to HTTP (which would yield empty Notion shell HTML).
@@ -98,13 +101,13 @@ Verify the skill is installed correctly using a local HTML file:
 echo '<html><head><title>Smoke Test</title></head><body><h1>Hello</h1><p>Skill works.</p></body></html>' > /tmp/smoke.html
 
 # 2. Convert local HTML → Markdown (no network needed)
-python SKILL_DIR/scripts/grab_web_to_md.py --local-html /tmp/smoke.html --out /tmp/smoke.md
+python3 SKILL_DIR/scripts/grab_web_to_md.py --local-html /tmp/smoke.html --out /tmp/smoke.md
 
 # 3. Verify output contains expected content
 grep -q "# Hello" /tmp/smoke.md && grep -q "Skill works" /tmp/smoke.md && echo "✅ PASS" || echo "❌ FAIL"
 
 # 4. Run unit tests (also offline)
-python -m pytest SKILL_DIR/../../tests/ -q
+python3 -m pytest SKILL_DIR/../../tests/ -q
 ```
 
 Expected: exit code 0, output file contains `# Hello` and `Skill works.`.
@@ -125,7 +128,7 @@ Expected: exit code 0, output file contains `# Hello` and `Skill works.`.
 ### 1. Single Page Export (Blog/News)
 
 ```bash
-python SKILL_DIR/scripts/grab_web_to_md.py "URL" \
+python3 SKILL_DIR/scripts/grab_web_to_md.py "URL" \
   --out output.md \
   --keep-html \
   --tags "topic1,topic2" \
@@ -137,7 +140,7 @@ python SKILL_DIR/scripts/grab_web_to_md.py "URL" \
 ### 2. WeChat Article Export
 
 ```bash
-python SKILL_DIR/scripts/grab_web_to_md.py "https://mp.weixin.qq.com/s/xxx" \
+python3 SKILL_DIR/scripts/grab_web_to_md.py "https://mp.weixin.qq.com/s/xxx" \
   --out article.md
 ```
 
@@ -150,7 +153,7 @@ Supports two WeChat article formats:
 ### 3. Wiki Batch Crawl + Merge
 
 ```bash
-python SKILL_DIR/scripts/grab_web_to_md.py "https://wiki.example.com/index" \
+python3 SKILL_DIR/scripts/grab_web_to_md.py "https://wiki.example.com/index" \
   --crawl \
   --crawl-pattern 'page=wiki' \
   --merge \
@@ -175,7 +178,7 @@ python SKILL_DIR/scripts/grab_web_to_md.py "https://wiki.example.com/index" \
 
 ```bash
 # Using preset for Mintlify docs (e.g., OpenClaw)
-python SKILL_DIR/scripts/grab_web_to_md.py "https://docs.example.com/" \
+python3 SKILL_DIR/scripts/grab_web_to_md.py "https://docs.example.com/" \
   --crawl \
   --merge --toc \
   --docs-preset mintlify \
@@ -183,7 +186,7 @@ python SKILL_DIR/scripts/grab_web_to_md.py "https://docs.example.com/" \
   --download-images
 
 # Dual output: merged + split files
-python SKILL_DIR/scripts/grab_web_to_md.py "https://docs.example.com/" \
+python3 SKILL_DIR/scripts/grab_web_to_md.py "https://docs.example.com/" \
   --crawl --merge --toc \
   --docs-preset mintlify \
   --merge-output output/merged.md \
@@ -191,7 +194,7 @@ python SKILL_DIR/scripts/grab_web_to_md.py "https://docs.example.com/" \
   --download-images
 
 # Manual stripping without preset
-python SKILL_DIR/scripts/grab_web_to_md.py "https://docs.example.com/" \
+python3 SKILL_DIR/scripts/grab_web_to_md.py "https://docs.example.com/" \
   --crawl \
   --merge --toc \
   --strip-nav \
@@ -253,29 +256,43 @@ python SKILL_DIR/scripts/grab_web_to_md.py "https://docs.example.com/" \
 | `--no-redact-url` | - | Keep full URLs including query params |
 | `--no-map-json` | False | Skip generating *.assets.json mapping file (and remove existing one) |
 | `--max-image-bytes` | 25MB | Max size per image (0=unlimited) |
-| `--pdf-allow-file-access` | False | Allow file:// access when generating PDF |
 
 **Built-in security** (always active): cross-origin session isolation, Referer redaction, HTML sanitization, streaming download. For details see [references/full-guide.md](references/full-guide.md) §数据安全与隐私.
+
+## PDF Export
+
+This skill intentionally outputs Markdown only. If the user wants a PDF, first generate the Markdown with this skill, then use the `pdf` skill or a dedicated document/PDF tool to convert the generated Markdown.
 
 ## Anti-Scraping Support
 
 ```bash
 # With cookies
-python SKILL_DIR/scripts/grab_web_to_md.py "URL" --cookie "session=xxx"
+python3 SKILL_DIR/scripts/grab_web_to_md.py "URL" --cookie "session=xxx"
 
 # With custom headers
-python SKILL_DIR/scripts/grab_web_to_md.py "URL" --header "Authorization: Bearer xxx"
+python3 SKILL_DIR/scripts/grab_web_to_md.py "URL" --header "Authorization: Bearer xxx"
 
 # Change User-Agent
-python SKILL_DIR/scripts/grab_web_to_md.py "URL" --ua-preset firefox-win
+python3 SKILL_DIR/scripts/grab_web_to_md.py "URL" --ua-preset firefox-win
 ```
 
-## JS Challenge & Local HTML Fallback
+## JS Challenge & Browser Fetch
 
-JS-protected sites (Cloudflare, etc.) are auto-detected (exit code **4**). Workaround:
+JS-protected sites (Cloudflare, etc.) are auto-detected (exit code **4**).
+
+**Preferred approach — Browser fetch** (requires system Chrome/Edge):
 
 ```bash
-python SKILL_DIR/scripts/grab_web_to_md.py \
+# Use system browser headless mode to bypass JS anti-scraping
+python3 SKILL_DIR/scripts/grab_web_to_md.py "URL" --browser-fetch --out output.md
+```
+
+Two-phase strategy: Phase 1 launches Chrome headless to pass JS challenge and store clearance cookies. Phase 2 re-fetches with the same profile to get real page content. Works for sites requiring JS execution; Cloudflare Turnstile (advanced human verification) may still block headless browsers.
+
+**Fallback — Local HTML** (always works):
+
+```bash
+python3 SKILL_DIR/scripts/grab_web_to_md.py \
   --local-html saved_page.html \
   --base-url "https://original-url.com/page" \
   --out output.md
@@ -283,6 +300,7 @@ python SKILL_DIR/scripts/grab_web_to_md.py \
 
 | Parameter | Purpose |
 |-----------|---------|
+| `--browser-fetch` | Use system Chrome/Edge headless to fetch pages (bypasses JS anti-scraping) |
 | `--local-html FILE` | Read from local HTML file (skip network request) |
 | `--base-url URL` | Base URL for downloading images (used with --local-html) |
 | `--force` | Force continue even when JS challenge detected (content may be empty) |
@@ -328,9 +346,9 @@ My-Article/
 ## Dependencies
 
 - **Required**: `requests` (HTTP requests)
-- **Optional**: `markdown` (for PDF export with `--with-pdf`)
+- **Optional**: System Chrome/Edge browser (for `--browser-fetch`)
 
-Install: `pip install requests`
+Install: `pip3 install requests`
 
 ## References
 

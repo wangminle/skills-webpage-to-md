@@ -159,19 +159,19 @@ POST https://www.notion.so/api/v3/getSignedFileUrls
 
 ## Step 4：集成式 CLI 用法（当前版本）
 
-Notion 功能已完整集成到 `grab_web_to_md.py` 中。传入 Notion 链接时，CLI 会自动检测并走 API 路径：
+Notion 功能已完整集成到 `skills/webpage-to-md/scripts/grab_web_to_md.py` 中。传入 Notion 链接时，CLI 会自动检测并走 API 路径：
 
 ```bash
 # 单页导出（自动检测 Notion URL，无需额外参数）
-python grab_web_to_md.py "https://www.notion.so/Kiro-29cbd3b8020080d5a1e5f7cd300576dd" \
+python3 skills/webpage-to-md/scripts/grab_web_to_md.py "https://www.notion.so/Kiro-29cbd3b8020080d5a1e5f7cd300576dd" \
   --out output/kiro-guide.md
 
 # 自动标题模式
-python grab_web_to_md.py "https://team.notion.site/Guide-abcdef0123456789abcdef0123456789" \
+python3 skills/webpage-to-md/scripts/grab_web_to_md.py "https://team.notion.site/Guide-abcdef0123456789abcdef0123456789" \
   --auto-title
 
 # 禁用 Notion 自动检测（强制走普通 HTTP）
-python grab_web_to_md.py "https://notion.so/xxx" --no-notion
+python3 skills/webpage-to-md/scripts/grab_web_to_md.py "https://notion.so/xxx" --no-notion
 ```
 
 ### 支持的域名
@@ -224,7 +224,7 @@ python grab_web_to_md.py "https://notion.so/xxx" --no-notion
 直接传入 Notion 公开链接即可，CLI 会自动检测：
 
 ```bash
-python grab_web_to_md.py "https://www.notion.so/Your-Page-ID" --out output.md
+python3 skills/webpage-to-md/scripts/grab_web_to_md.py "https://www.notion.so/Your-Page-ID" --out output.md
 ```
 
 ---

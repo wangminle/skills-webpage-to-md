@@ -3,7 +3,10 @@ from __future__ import annotations
 import argparse
 import codecs
 import json
+import os
 import re
+import shutil
+import subprocess
 import sys
 import time
 from typing import Dict, Optional, Sequence
@@ -157,6 +160,208 @@ def fetch_html(
                 except Exception:
                     pass
     raise last_err or RuntimeError("fetch failed")
+
+
+# ---------------------------------------------------------------------------
+# Browser-based HTML fetching (--browser-fetch)
+# ---------------------------------------------------------------------------
+
+def _find_browser() -> Optional[str]:
+    """查找系统安装的 Chromium 系浏览器。
+
+    检测顺序：PATH 中的可执行文件 → macOS 常见路径 → Windows 常见路径。
+    用于 --browser-fetch；PDF 导出由专门的 PDF/文档 skill 处理。
+    """
+    path_names = [
+        "google-chrome", "google-chrome-stable", "chrome",
+        "chromium", "chromium-browser", "msedge",
+    ]
+    candidates = [shutil.which(n) for n in path_names]
+    # macOS
+    candidates += [
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        "/Applications/Chromium.app/Contents/MacOS/Chromium",
+        "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+    ]
+    # Windows
+    candidates += [
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+    ]
+    for c in candidates:
+        if c and os.path.isfile(c):
+            return c
+    return None
+
+
+_CF_CHALLENGE_HINTS = (
+    "just a moment", "checking your browser", "cf-browser-verification",
+    "cf_chl_opt", "__cf_chl", "cloudflare", "安全验证", "正在进行安全",
+    "请稍候", "please wait",
+)
+
+
+def _is_challenge_html(html: str) -> bool:
+    """粗判 HTML 是否仍然是 Cloudflare 等挑战页面。"""
+    lower = html[:4000].lower()
+    return any(h in lower for h in _CF_CHALLENGE_HINTS) and len(html) < 15000
+
+
+def browser_fetch_html(url: str, *, timeout_s: int = 60) -> str:
+    """使用系统 Chrome/Edge headless 获取 JS 渲染后的页面 HTML。
+
+    采用两阶段策略处理 Cloudflare 等 JS 挑战：
+
+    1. **Phase 1 — 验证**：启动 Chrome（带远程调试端口），导航到目标 URL，
+       通过 HTTP API 轮询页面状态直到 JS 挑战完成并重定向到真实页面。
+       期间浏览器的 cookie 会写入临时 ``user-data-dir``。
+    2. **Phase 2 — 获取**：用同一 ``user-data-dir`` 重新运行
+       ``chrome --dump-dom``，此时 CF clearance cookie 已存在，
+       直接获得真实页面 DOM。
+
+    对不需要挑战的普通站点，Phase 1 检测到页面已就绪后直接进入 Phase 2，
+    额外开销约 2–3 秒。
+
+    不引入任何新 pip 依赖——仅使用系统浏览器 + 标准库。
+
+    Raises:
+        RuntimeError: 浏览器未找到、超时或输出异常。
+    """
+    import socket
+    import tempfile
+    import urllib.request
+
+    browser = _find_browser()
+    if not browser:
+        raise RuntimeError(
+            "未找到可用的 Chromium 系浏览器（Chrome / Edge / Chromium）。\n"
+            "--browser-fetch 需要系统安装上述浏览器之一。\n"
+            "替代方案：在浏览器中手动保存页面后使用 --local-html 处理。"
+        )
+
+    print(f"  浏览器路径：{browser}")
+
+    tmpdir = tempfile.mkdtemp(prefix="wmd_browser_")
+
+    # 分配空闲端口
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as _s:
+        _s.bind(("127.0.0.1", 0))
+        port = _s.getsockname()[1]
+
+    _base_flags = [
+        "--headless=new",
+        "--disable-gpu",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--disable-extensions",
+        f"--user-data-dir={tmpdir}",
+    ]
+
+    # ── Phase 1: 让 Chrome 完成 JS 挑战 ────────────────────
+    proc = subprocess.Popen(
+        [browser] + _base_flags + [
+            f"--remote-debugging-port={port}",
+            "--disable-blink-features=AutomationControlled",
+            "--window-size=1280,720",
+            url,
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+    challenge_detected = False
+    try:
+        deadline = time.time() + timeout_s
+        stable_url: Optional[str] = None
+        stable_count = 0
+        phase1_ok = False
+
+        print("  Phase 1：等待页面加载（若有 JS 挑战会自动通过）...")
+
+        while time.time() < deadline:
+            time.sleep(1)
+            try:
+                resp = urllib.request.urlopen(
+                    f"http://127.0.0.1:{port}/json/list", timeout=2,
+                )
+                pages = json.loads(resp.read())
+                # 只关注 type=page，过滤扩展 background 等
+                real = [p for p in pages if p.get("type") == "page"]
+                if not real:
+                    continue
+
+                cur_url = real[0].get("url", "")
+                title = real[0].get("title", "")
+
+                # 仍在挑战页
+                title_lower = title.lower()
+                if any(h in title_lower for h in _CF_CHALLENGE_HINTS):
+                    challenge_detected = True
+                    stable_count = 0
+                    continue
+
+                # 跳过空白页
+                if cur_url in ("", "about:blank") or not title:
+                    continue
+
+                if cur_url == stable_url:
+                    stable_count += 1
+                    if stable_count >= 2:
+                        phase1_ok = True
+                        break
+                else:
+                    stable_url = cur_url
+                    stable_count = 0
+            except Exception:
+                pass
+
+        if challenge_detected and not phase1_ok:
+            print(
+                "  ⚠ JS 挑战未在超时时间内通过（站点可能使用了 Turnstile 等"
+                "高级人机验证，headless 浏览器无法自动完成）"
+            )
+
+        # 多等 1 秒确保 cookie 写入磁盘
+        time.sleep(1)
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            proc.kill()
+
+    # ── Phase 2: 用持久化的 cookie 获取 DOM ─────────────────
+    print("  Phase 2：使用持久化 cookie 获取页面内容...")
+    try:
+        proc2 = subprocess.run(
+            [browser] + _base_flags + ["--dump-dom", url],
+            capture_output=True,
+            text=True,
+            timeout=timeout_s + 15,
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"浏览器获取超时（{timeout_s}s）：{url}")
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+    html = proc2.stdout or ""
+
+    if _is_challenge_html(html):
+        raise RuntimeError(
+            "浏览器两阶段获取后仍为挑战页面。可能原因：\n"
+            "  • 站点需要真人交互验证（如 CAPTCHA）\n"
+            "  • 浏览器 headless 模式被检测\n"
+            "建议：在浏览器中手动保存页面后使用 --local-html 处理。"
+        )
+
+    if len(html.strip()) < 100:
+        raise RuntimeError(
+            "浏览器返回的 HTML 内容为空或过短，可能站点需要登录或有更强的反爬保护。"
+        )
+
+    return html
 
 
 def _parse_cookies_file(filepath: str) -> Dict[str, str]:

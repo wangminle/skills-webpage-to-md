@@ -179,7 +179,7 @@ def _evaluate(case: Case, exit_code: int, merged_output: str, out_md: Path) -> t
     if expected_fail:
         if exit_code == 0:
             return "FAIL", "该场景预期失败并提示，但实际返回成功", size
-        hints = ("--local-html", "反爬", "HTTP 403", "JavaScript 反爬")
+        hints = ("--local-html", "--browser-fetch", "反爬", "HTTP 403", "JavaScript 反爬")
         if any(h in merged_output for h in hints):
             return "PASS", "符合预期：失败并给出可操作提示", size
         return "FAIL", "失败了但未检测到明确提示文案", size
@@ -232,6 +232,7 @@ def run(args: argparse.Namespace) -> int:
     suite_md = Path(args.suite).resolve()
     if not suite_md.exists():
         print(f"错误：回归测试清单不存在：{suite_md}", file=sys.stderr)
+        print("请创建该文件，或通过 --suite 指定已有的回归测试清单。", file=sys.stderr)
         return 2
     if not GRABBER.exists():
         print(f"错误：找不到抓取脚本：{GRABBER}", file=sys.stderr)

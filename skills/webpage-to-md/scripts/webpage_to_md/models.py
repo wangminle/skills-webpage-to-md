@@ -15,10 +15,11 @@ class JSChallengeResult:
     def get_suggestions(self, url: str) -> List[str]:
         """根据检测结果生成建议"""
         return [
-            "1. 在浏览器中打开该 URL，等待页面完全加载",
-            "2. 右键点击页面 → 「另存为」或「存储为」→ 保存为 .html 文件",
-            "3. 使用 --local-html 参数处理本地文件：",
-            f"   python grab_web_to_md.py --local-html saved.html --base-url \"{url}\" --out output.md",
+            "1. 尝试添加 --browser-fetch 使用系统浏览器获取（需安装 Chrome/Edge）",
+            "2. 如仍失败，在浏览器中手动打开该 URL，等待页面完全加载",
+            "3. 右键点击页面 → 「另存为」或「存储为」→ 保存为 .html 文件",
+            "4. 使用 --local-html 参数处理本地文件：",
+            f"   python3 grab_web_to_md.py --local-html saved.html --base-url \"{url}\" --out output.md",
         ]
 
 
@@ -71,3 +72,4 @@ class BatchConfig:
     force: bool = False  # 检测到 JS 反爬时强制继续
     no_ssr: bool = False  # 禁用 SSR 数据自动提取
     no_notion: bool = False  # 禁用 Notion 公开页面 API 提取
+    browser_fetch: bool = False  # 使用系统浏览器 headless 获取页面（绕过 Cloudflare 等 JS 反爬）

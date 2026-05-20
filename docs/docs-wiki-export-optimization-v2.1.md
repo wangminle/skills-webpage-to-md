@@ -160,7 +160,7 @@
 ### 修复 OpenClaw 文档（Phase 1 完成后）
 
 ```bash
-python grab_web_to_md.py "https://docs.openclaw.ai/" \
+python3 skills/webpage-to-md/scripts/grab_web_to_md.py "https://docs.openclaw.ai/" \
   --crawl \
   --merge --toc \
   --strip-nav \
@@ -173,7 +173,7 @@ python grab_web_to_md.py "https://docs.openclaw.ai/" \
 ### Phase 2 使用预设（推荐方式）
 
 ```bash
-python grab_web_to_md.py "https://docs.openclaw.ai/" \
+python3 skills/webpage-to-md/scripts/grab_web_to_md.py "https://docs.openclaw.ai/" \
   --crawl --merge --toc \
   --docs-preset mintlify \
   --merge-output output/openclaw-clean.md
@@ -182,7 +182,7 @@ python grab_web_to_md.py "https://docs.openclaw.ai/" \
 ### Phase 2 自动识别（高置信度时）
 
 ```bash
-python grab_web_to_md.py "https://docs.openclaw.ai/" \
+python3 skills/webpage-to-md/scripts/grab_web_to_md.py "https://docs.openclaw.ai/" \
   --crawl --merge --toc \
   --auto-detect \
   --merge-output output/openclaw-clean.md
@@ -191,7 +191,7 @@ python grab_web_to_md.py "https://docs.openclaw.ai/" \
 ### Phase 3-B 双版本输出（已实现）
 
 ```bash
-python grab_web_to_md.py "https://docs.openclaw.ai/" \
+python3 skills/webpage-to-md/scripts/grab_web_to_md.py "https://docs.openclaw.ai/" \
   --crawl --merge --toc \
   --docs-preset mintlify \
   --merge-output output/openclaw-merged.md \
