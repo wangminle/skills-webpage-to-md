@@ -194,21 +194,17 @@ cython_debug/
 # URL-to-local mapping files
 *.md.assets.json
 
-# Generated PDF files
-# *.pdf
-
 # Test output files
 test_output/
 output/
+tests/regression_output/
 
 # Local regression checklist (personal/untracked)
 tests/待测试列表.md
 tests/回归测试集.md
 
-# Temporary HTML files (used during PDF generation)
-*.no_frontmatter.md
-
 # Cookie files (may contain sensitive data)
 cookies.txt
 *.cookies.txt
 .DS_Store
+.vscode/settings.json

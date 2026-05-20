@@ -431,6 +431,57 @@ class TestHttpErrorGuidance(unittest.TestCase):
         self.assertIn("--local-html", stderr_text)
 
 
+class TestPdfFeatureRemoved(unittest.TestCase):
+    """PDF 生成交给专门的 PDF/文档 skill，本 CLI 不再暴露 PDF 参数。"""
+
+    def test_help_does_not_expose_pdf_options(self):
+        out_buf = io.StringIO()
+        err_buf = io.StringIO()
+        with self.assertRaises(SystemExit) as cm:
+            with redirect_stdout(out_buf), redirect_stderr(err_buf):
+                grab.main(["--help"])
+        self.assertEqual(cm.exception.code, 0)
+        help_text = out_buf.getvalue()
+        self.assertNotIn("--with-pdf", help_text)
+        self.assertNotIn("--pdf-allow-file-access", help_text)
+
+
+class TestCliGuidance(unittest.TestCase):
+    def test_js_challenge_suggestion_uses_python3(self):
+        result = grab.JSChallengeResult(
+            is_challenge=True,
+            confidence="high",
+            signals=["challenge"],
+        )
+        suggestions = "\n".join(result.get_suggestions("https://example.com/p"))
+        self.assertIn("python3 grab_web_to_md.py", suggestions)
+        self.assertNotIn("python grab_web_to_md.py", suggestions)
+
+
+class TestRegressionSuiteMissingFile(unittest.TestCase):
+    def test_missing_regression_suite_reports_error(self):
+        import importlib.util
+
+        root = pathlib.Path(__file__).resolve().parents[1]
+        runner_path = root / "tests" / "run_regression_suite.py"
+        spec = importlib.util.spec_from_file_location("run_regression_suite", runner_path)
+        assert spec and spec.loader
+        runner = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = runner
+        spec.loader.exec_module(runner)
+
+        args = runner.build_parser().parse_args([
+            "--suite", str(pathlib.Path("/private/tmp/definitely-missing-regression-suite.md")),
+            "--dry-run",
+        ])
+        out_buf = io.StringIO()
+        err_buf = io.StringIO()
+        with redirect_stdout(out_buf), redirect_stderr(err_buf):
+            code = runner.run(args)
+        self.assertEqual(code, 2)
+        self.assertIn("回归测试清单不存在", err_buf.getvalue())
+
+
 # ---------------------------------------------------------------------------
 #  编码检测 —— _detect_meta_charset
 # ---------------------------------------------------------------------------

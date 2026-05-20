@@ -1,12 +1,16 @@
 # Web to Markdown Grabber 完整参考手册
 
+> 当前版本：0.4.0
+
+> **命令说明**：文中使用 `python3` / `pip3`（macOS/Linux 默认），Windows 用户请替换为 `python` / `pip`。脚本兼容 Python 3.8+。
+
 抓取网页并转换为 Markdown 格式的 Python 工具。支持单页抓取、批量处理、从索引页爬取整个子目录，并可下载图片到本地。
 
 ## 目录
 
 - [功能特性](#功能特性)
 - [安装](#安装)
-- [参数完整说明](#参数完整说明)（基础 / 网络 / HTTP / Frontmatter / 内容提取 / 导航剥离 / 批量 / 合并 / 爬取 / PDF / 安全）
+- [参数完整说明](#参数完整说明)（基础 / 网络 / HTTP / Frontmatter / 内容提取 / 导航剥离 / 批量 / 合并 / 爬取 / 安全）
 - [参数支持矩阵](#参数支持矩阵)
 - [使用场景](#使用场景)（单页 / 批量 / 爬取 / 内容过滤 / 反爬 / 微信 / Docs / SSR / Notion / 安全）
 - [实战案例](#实战案例)（微信 / 博客 / Wiki）
@@ -30,7 +34,9 @@
 
 **Notion 公开页面**：自动检测 `notion.so` 和 `*.notion.site` URL，通过内部 API 递归获取所有 Block 并转换为 HTML，支持标题/段落/列表/代码/引用/折叠/待办/图片等 Block 类型
 
-**其他**：YAML Frontmatter、反爬支持、PDF 导出、Windows 路径安全、模块化架构（10 个子模块）
+**浏览器获取**：`--browser-fetch` 使用系统 Chrome/Edge headless 获取页面，绕过 JS 反爬（Cloudflare 等），无需额外 pip 依赖
+
+**其他**：YAML Frontmatter、反爬支持、Windows 路径安全、模块化架构
 
 ---
 
@@ -38,13 +44,14 @@
 
 ```bash
 # Python 3.8+（兼容 Python <3.10）
-pip install requests
+pip3 install requests
 
-# 可选：用于 PDF 导出的 Markdown 渲染
-pip install markdown
+# 可选：--browser-fetch 需要系统安装 Chrome 或 Edge
+# macOS: 安装 Google Chrome 或 Microsoft Edge
+# Linux: apt install google-chrome-stable 或 microsoft-edge-stable
 
 # 可选：运行测试
-pip install pytest
+pip3 install pytest
 ```
 
 ---
@@ -71,6 +78,18 @@ pip install pytest
 | `--retries` | 重试次数 | `3` |
 | `--max-html-bytes` | 单页 HTML 最大字节数（0 表示不限制） | `10MB` |
 | `--best-effort-images` | 图片失败仅警告 | `False` |
+
+### 浏览器获取参数
+
+| 参数 | 说明 | 默认值 |
+|------|------|--------|
+| `--browser-fetch` | 使用系统 Chrome/Edge headless 获取页面（绕过 JS 反爬） | `False` |
+
+**工作原理**：两阶段策略——
+1. **Phase 1（验证）**：启动 Chrome headless + `--remote-debugging-port`，访问目标 URL，等待 JS challenge 自动通过，cookie 持久化到临时 `user-data-dir`
+2. **Phase 2（获取）**：用同一 profile 重启 Chrome + `--dump-dom`，此时 clearance cookie 已存在，直接获得真实页面 HTML
+
+**适用范围**：需要 JS 执行的站点、基本的 Cloudflare JS Challenge。对使用 Turnstile 等高级人机验证的站点，headless 浏览器可能仍被检测，此时建议使用 `--local-html` 手动保存。
 
 ### HTTP 请求定制
 
@@ -164,12 +183,6 @@ pip install pytest
 | `--same-domain` | 仅同域名 | `True` |
 | `--no-same-domain` | 允许跨域 | - |
 
-### PDF 导出
-
-| 参数 | 说明 |
-|------|------|
-| `--with-pdf` | 生成 PDF（需 Edge/Chrome） |
-
 ### 安全参数
 
 | 参数 | 说明 | 默认值 |
@@ -178,7 +191,6 @@ pip install pytest
 | `--no-redact-url` | 关闭 URL 脱敏（保留完整 URL） | - |
 | `--no-map-json` | 不生成 `*.assets.json` 映射文件（并清理已存在的旧映射文件） | `False` |
 | `--max-image-bytes` | 单张图片最大字节数（0 表示不限制） | `25MB` |
-| `--pdf-allow-file-access` | 生成 PDF 时允许 file:// 访问本地文件 | `False` |
 
 ---
 
@@ -196,11 +208,11 @@ pip install pytest
 | `--download-images` | ❌（默认下载） | ✅ | ✅ | 批量模式默认不下载图片 |
 | `--clean-wiki-noise` | ✅ | ✅ | ✅ | 清理 Wiki 噪音 |
 | `--target-id` / `--target-class` | ✅ | ✅ | ✅ | 内容选择器 |
+| `--browser-fetch` | ✅ | ✅ | ✅ | 使用系统浏览器获取页面 |
 | `--local-html` | ✅ | ❌ | ❌ | 从本地文件读取 |
 | `--urls-file` | ❌ | ✅ | ✅ | 批量 URL 文件 |
 | `--merge` | ❌ | ✅ | - | 启用合并输出 |
 | `--crawl` | ❌ | ✅ | ✅ | 启用爬取模式 |
-| `--with-pdf` | ✅ | ❌ | ❌ | 生成 PDF |
 | `--redact-url` | ✅ | ✅ | ✅ | URL 脱敏（仅影响输出文本） |
 | `--no-notion` | ✅ | ✅ | ✅ | 禁用 Notion 公开页面 API 提取 |
 
@@ -214,20 +226,20 @@ pip install pytest
 
 ```bash
 # 基础用法
-python scripts/grab_web_to_md.py https://example.com/article
+python3 scripts/grab_web_to_md.py https://example.com/article
 
 # 指定输出和标签
-python scripts/grab_web_to_md.py https://example.com/article \
+python3 scripts/grab_web_to_md.py https://example.com/article \
   --out my-article.md --tags "ai,tutorial"
 
 # 自动按标题命名（例如：学习笔记/学习笔记.md）
-python scripts/grab_web_to_md.py https://example.com/article --auto-title
+python3 scripts/grab_web_to_md.py https://example.com/article --auto-title
 
 # 图片失败不中断
-python scripts/grab_web_to_md.py https://example.com/gallery --best-effort-images
+python3 scripts/grab_web_to_md.py https://example.com/gallery --best-effort-images
 
 # 复杂表格保留 HTML
-python scripts/grab_web_to_md.py https://docs.example.com/api --keep-html
+python3 scripts/grab_web_to_md.py https://docs.example.com/api --keep-html
 ```
 
 ### 场景 2：批量导出（从文件）
@@ -241,22 +253,22 @@ https://example.com/page2
 
 ```bash
 # 独立文件
-python scripts/grab_web_to_md.py --urls-file urls.txt --output-dir ./docs
+python3 scripts/grab_web_to_md.py --urls-file urls.txt --output-dir ./docs
 
 # 合并为单文件
-python scripts/grab_web_to_md.py --urls-file urls.txt --merge --toc --merge-output handbook.md
+python3 scripts/grab_web_to_md.py --urls-file urls.txt --merge --toc --merge-output handbook.md
 ```
 
 ### 场景 3：爬取索引页
 
 ```bash
 # 爬取并合并
-python scripts/grab_web_to_md.py "https://wiki.example.com/index" \
+python3 scripts/grab_web_to_md.py "https://wiki.example.com/index" \
   --crawl --crawl-pattern 'page=wiki' \
   --merge --toc --merge-output wiki.md
 
 # 爬取为独立文件
-python scripts/grab_web_to_md.py "https://wiki.example.com/index" \
+python3 scripts/grab_web_to_md.py "https://wiki.example.com/index" \
   --crawl --crawl-pattern 'page=wiki' \
   --output-dir ./wiki_docs
 ```
@@ -265,10 +277,10 @@ python scripts/grab_web_to_md.py "https://wiki.example.com/index" \
 
 ```bash
 # 指定正文容器
-python scripts/grab_web_to_md.py "https://wiki.example.com/page" --target-id body
+python3 scripts/grab_web_to_md.py "https://wiki.example.com/page" --target-id body
 
 # 清理 Wiki 噪音
-python scripts/grab_web_to_md.py "https://wiki.example.com/page" \
+python3 scripts/grab_web_to_md.py "https://wiki.example.com/page" \
   --target-id body --clean-wiki-noise
 ```
 
@@ -285,16 +297,21 @@ python scripts/grab_web_to_md.py "https://wiki.example.com/page" \
 
 ```bash
 # Cookie
-python scripts/grab_web_to_md.py URL --cookie "session=abc"
+python3 scripts/grab_web_to_md.py URL --cookie "session=abc"
 
 # 请求头
-python scripts/grab_web_to_md.py URL --header "Authorization: Bearer xxx"
+python3 scripts/grab_web_to_md.py URL --header "Authorization: Bearer xxx"
 
 # 切换 UA
-python scripts/grab_web_to_md.py URL --ua-preset firefox-win
+python3 scripts/grab_web_to_md.py URL --ua-preset firefox-win
 ```
 
-**JS Challenge 检测**：工具会自动识别 JavaScript 反爬保护（Cloudflare、Akamai 等），检测到时返回 exit code **4** 并提示使用 `--local-html` 处理本地保存的 HTML。
+**JS Challenge 检测**：工具会自动识别 JavaScript 反爬保护（Cloudflare、Akamai 等），检测到时返回 exit code **4** 并提示使用 `--browser-fetch` 或 `--local-html`。
+
+**三层应对策略**（由工具自动/半自动处理）：
+1. **SSR/API 自动提取**：腾讯云、火山引擎、Notion 等——零配置
+2. **`--browser-fetch` 浏览器获取**：适用于需要 JS 执行或基本 Cloudflare JS Challenge 的站点
+3. **`--local-html` 手动兜底**：适用于 Turnstile 等高级人机验证（headless 无法通过）
 
 **已知 JS 保护站点**：
 
@@ -303,22 +320,25 @@ python scripts/grab_web_to_md.py URL --ua-preset firefox-win
 | 腾讯云开发者 | Next.js SSR | **自动处理**（SSR 提取） |
 | 火山引擎文档 | Modern.js SSR | **自动处理**（SSR 提取） |
 | Notion 公开页面 | SPA（无 SSR） | **自动处理**（Notion API 提取） |
-| 知乎 | 高强度 JS | 使用 `--local-html` |
-| PyPI | Cloudflare | 使用 `--local-html` |
-| 部分 GitHub 页面 | Cloudflare | 使用 `--local-html` |
-| 新闻站点 | 多种类型 | 先试 `--ua-preset`，再试 `--local-html` |
+| 一般 JS 渲染站点 | 需要 JS 执行 | 使用 `--browser-fetch` |
+| Cloudflare JS Challenge | 基本 JS 验证 | 使用 `--browser-fetch` |
+| 知乎 | 高强度 JS | 先试 `--browser-fetch`，再试 `--local-html` |
+| Cloudflare Turnstile | 高级人机验证 | 使用 `--local-html`（headless 被检测） |
+| PyPI | Cloudflare | 先试 `--browser-fetch`，再试 `--local-html` |
+| 部分 GitHub 页面 | Cloudflare | 先试 `--browser-fetch`，再试 `--local-html` |
+| 新闻站点 | 多种类型 | 先试 `--ua-preset`，再试 `--browser-fetch`，最后 `--local-html` |
 
 ### 场景 6：微信公众号
 
 ```bash
 # 自动检测
-python scripts/grab_web_to_md.py "https://mp.weixin.qq.com/s/xxx"
+python3 scripts/grab_web_to_md.py "https://mp.weixin.qq.com/s/xxx"
 
 # 强制启用
-python scripts/grab_web_to_md.py "URL" --wechat
+python3 scripts/grab_web_to_md.py "URL" --wechat
 
 # 离线 HTML（未提供 URL 也可从微信页面特征提取标题）
-python scripts/grab_web_to_md.py --local-html wechat_saved.html --auto-title
+python3 scripts/grab_web_to_md.py --local-html wechat_saved.html --auto-title
 ```
 
 **自动处理**：
@@ -329,7 +349,7 @@ python scripts/grab_web_to_md.py --local-html wechat_saved.html --auto-title
 
 ```bash
 # 使用预设导出 Mintlify 文档
-python scripts/grab_web_to_md.py "https://docs.example.com/" \
+python3 scripts/grab_web_to_md.py "https://docs.example.com/" \
   --crawl \
   --merge --toc \
   --docs-preset mintlify \
@@ -337,7 +357,7 @@ python scripts/grab_web_to_md.py "https://docs.example.com/" \
   --download-images
 
 # 双版本输出：同时生成合并版和分文件版
-python scripts/grab_web_to_md.py "https://docs.example.com/" \
+python3 scripts/grab_web_to_md.py "https://docs.example.com/" \
   --crawl --merge --toc \
   --docs-preset mintlify \
   --merge-output output/merged.md \
@@ -345,7 +365,7 @@ python scripts/grab_web_to_md.py "https://docs.example.com/" \
   --download-images
 
 # 手动配置导航剥离
-python scripts/grab_web_to_md.py "https://docs.example.com/" \
+python3 scripts/grab_web_to_md.py "https://docs.example.com/" \
   --crawl \
   --merge --toc \
   --strip-nav \
@@ -354,14 +374,14 @@ python scripts/grab_web_to_md.py "https://docs.example.com/" \
   --merge-output docs.md
 
 # 自动检测框架
-python scripts/grab_web_to_md.py "https://docs.example.com/" \
+python3 scripts/grab_web_to_md.py "https://docs.example.com/" \
   --crawl \
   --merge --toc \
   --auto-detect \
   --merge-output docs.md
 
 # 查看可用预设
-python scripts/grab_web_to_md.py --list-presets
+python3 scripts/grab_web_to_md.py --list-presets
 ```
 
 **预设优势**：
@@ -381,17 +401,17 @@ python scripts/grab_web_to_md.py --list-presets
 ```bash
 # 腾讯云开发者文章 — Next.js SSR 自动提取 ProseMirror JSON
 # 单页模式默认下载图片，无需 --download-images
-python scripts/grab_web_to_md.py \
+python3 scripts/grab_web_to_md.py \
   "https://cloud.tencent.com/developer/article/2624003" \
   --auto-title
 
 # 火山引擎文档 — Modern.js SSR 自动提取 MDContent
-python scripts/grab_web_to_md.py \
+python3 scripts/grab_web_to_md.py \
   "https://www.volcengine.com/docs/6396/2189942" \
   --auto-title --best-effort-images
 
 # 禁用 SSR 提取，回退到普通 HTML 解析
-python scripts/grab_web_to_md.py URL --no-ssr
+python3 scripts/grab_web_to_md.py URL --no-ssr
 ```
 
 **检测逻辑**：工具会自动扫描 HTML 中的 SSR 数据标记：
@@ -410,17 +430,17 @@ python scripts/grab_web_to_md.py URL --no-ssr
 
 ```bash
 # Notion 公开页面 — 自动检测 notion.so 和 *.notion.site 域名
-python scripts/grab_web_to_md.py \
+python3 scripts/grab_web_to_md.py \
   "https://www.notion.so/Kiro-29cbd3b8020080d5a1e5f7cd300576dd" \
   --auto-title
 
 # *.notion.site 域名同样支持
-python scripts/grab_web_to_md.py \
+python3 scripts/grab_web_to_md.py \
   "https://team.notion.site/Guide-abcdef0123456789abcdef0123456789" \
   --auto-title
 
 # 禁用 Notion 自动检测
-python scripts/grab_web_to_md.py \
+python3 scripts/grab_web_to_md.py \
   "https://www.notion.so/Page-ID" --no-notion
 ```
 
@@ -455,19 +475,19 @@ python scripts/grab_web_to_md.py \
 
 ```bash
 # 默认行为：URL 脱敏开启，分享给他人时不会泄露 token/签名
-python scripts/grab_web_to_md.py "https://mp.weixin.qq.com/s/xxx?token=secret&..."
+python3 scripts/grab_web_to_md.py "https://mp.weixin.qq.com/s/xxx?token=secret&..."
 
 # 调试用途：保留完整 URL
-python scripts/grab_web_to_md.py URL --no-redact-url
+python3 scripts/grab_web_to_md.py URL --no-redact-url
 
 # 不生成映射文件（减少敏感信息输出；并会清理已存在的旧 *.assets.json，避免残留）
-python scripts/grab_web_to_md.py URL --no-map-json
+python3 scripts/grab_web_to_md.py URL --no-map-json
 
 # 处理大图站点：调整单图上限为 50MB
-python scripts/grab_web_to_md.py URL --max-image-bytes 52428800
+python3 scripts/grab_web_to_md.py URL --max-image-bytes 52428800
 
 # 不限制图片大小（谨慎使用）
-python scripts/grab_web_to_md.py URL --max-image-bytes 0
+python3 scripts/grab_web_to_md.py URL --max-image-bytes 0
 ```
 
 **安全特性（默认生效）**：
@@ -485,7 +505,7 @@ python scripts/grab_web_to_md.py URL --max-image-bytes 0
 ### 案例 1：微信公众号文章
 
 ```bash
-python scripts/grab_web_to_md.py \
+python3 scripts/grab_web_to_md.py \
   "https://mp.weixin.qq.com/s/xxx" \
   --out output/wechat.md --validate --overwrite
 ```
@@ -495,7 +515,7 @@ python scripts/grab_web_to_md.py \
 ### 案例 2：技术博客（带代码块）
 
 ```bash
-python scripts/grab_web_to_md.py \
+python3 scripts/grab_web_to_md.py \
   "https://claude.com/blog/xxx" \
   --out output/blog.md --keep-html \
   --tags "ai,agents" --validate --overwrite
@@ -506,7 +526,7 @@ python scripts/grab_web_to_md.py \
 ### 案例 3：Wiki 批量导出
 
 ```bash
-python scripts/grab_web_to_md.py \
+python3 scripts/grab_web_to_md.py \
   "https://wiki.example.com/index" \
   --crawl --crawl-pattern 'page=wiki' \
   --no-same-domain \
@@ -596,7 +616,6 @@ output/
 - **图片检测**：Content-Type + 二进制嗅探
 - **噪音过滤**：跳过 script/style/svg/video/按钮
 - **表格**：简单→Markdown，复杂→保留 HTML
-- **PDF**：Edge/Chrome headless `--print-to-pdf`
 - **路径**：自动截断避免 Windows 260 字符限制
 - **安全**：
   - URL 脱敏：`urllib.parse` 解析后移除 query/fragment
@@ -608,23 +627,22 @@ output/
 
 ### 模块化架构（v2.0.0+）
 
-项目从单文件重构为模块化包，总计约 5400 行代码：
+项目从单文件重构为模块化包，核心功能按职责拆分：
 
 ```
 scripts/
 ├── grab_web_to_md.py       # CLI 入口（~1450 行）：参数解析 + 流程调度
-└── webpage_to_md/          # 核心功能包（~4600 行）
+└── webpage_to_md/          # 核心功能包
     ├── __init__.py          # 包入口，导出数据模型
     ├── models.py            # 数据模型（~70 行）
     ├── security.py          # URL 脱敏 / JS 检测 / 校验（~240 行）
-    ├── http_client.py       # HTTP 会话与 HTML 抓取（~200 行）
+    ├── http_client.py       # HTTP 会话 + HTML 抓取 + 浏览器 headless 获取（~350 行）
     ├── ssr_extract.py       # SSR 数据提取：Next.js/Modern.js（~260 行）
     ├── notion.py            # Notion 公开页面 API 提取（~500 行）
     ├── images.py            # 图片下载与路径替换（~500 行）
     ├── extractors.py        # 正文提取 + 框架预设 + 导航剥离 + 微信异步提取（~1210 行）
     ├── markdown_conv.py     # HTML→Markdown + 噪音清理（~940 行）
-    ├── output.py            # 合并/分文件/索引/frontmatter（~450 行）
-    └── pdf_utils.py         # Markdown→PDF 渲染（~420 行）
+    └── output.py            # 合并/分文件/索引/frontmatter（~450 行）
 ```
 
 **依赖关系**（无循环依赖）：
@@ -638,7 +656,6 @@ extractors (无包内依赖)
 markdown_conv → security
 images → models, security
 output → markdown_conv, models, security
-pdf_utils (无包内依赖)
 ```
 
 **设计原则**：
@@ -649,6 +666,29 @@ pdf_utils (无包内依赖)
 ---
 
 ## 更新日志
+
+### v0.4.0 (2026-05-20)
+- ✅ **发布版本对齐**：README、Skill 说明和完整手册统一标注当前版本为 `0.4.0`
+- ✅ **PDF 职责拆分**：移除内置 PDF 导出入口和维护代码，本 Skill 只负责生成 Markdown 与本地 assets；需要 PDF 时，先生成 Markdown，再交给 `pdf` skill 或专门的文档/PDF 工具转换
+- ✅ **回归测试行为收敛**：测试集缺失时直接报告失败原因，不再依赖 fallback 示例文件
+- ✅ **Skill 元数据规范化**：frontmatter 保持 `name` / `description` 两项，description 改为 `Use when...` 触发条件描述
+
+> 注：`0.4.0` 为当前 Skill 发布版本；下方 `v2.x` 为早期内部功能迭代记录。
+
+### v2.2.0 (2026-04-10)
+- ✨ **`--browser-fetch` 浏览器获取模式**：
+  - 新增 `--browser-fetch` 参数，使用系统 Chrome/Edge headless 获取页面
+  - 两阶段策略：Phase 1 启动浏览器等待 JS challenge 通过并持久化 cookie → Phase 2 用同一 profile `--dump-dom` 获取真实内容
+  - 自动检测系统安装的 Chromium 浏览器（macOS Applications / Windows Program Files / PATH）
+  - 包含 Cloudflare challenge 检测（支持中英文关键词：`请稍候`/`Just a moment`/`cf-browser-verification` 等）
+  - 反检测优化：`--disable-blink-features=AutomationControlled`、标准窗口尺寸
+  - 适用于需要 JS 执行和基本 Cloudflare JS Challenge 的站点
+  - 对 Cloudflare Turnstile 等高级人机验证的站点，headless 仍会被检测，自动提示使用 `--local-html`
+  - 无需额外 pip 依赖，使用系统浏览器检测逻辑
+  - 单页模式和批量/爬取模式均支持
+- 🐛 **JS challenge 提示优化**：
+  - `JSChallengeResult.get_suggestions()` 现在优先推荐 `--browser-fetch`，其次是 `--local-html`
+  - 回归测试套件更新，识别 `--browser-fetch` 提示为有效的预期失败处理
 
 ### v2.1.3 (2026-03-25)
 - 🐛 **修复单页 `--out` 路径被改写问题**：
@@ -699,7 +739,6 @@ pdf_utils (无包内依赖)
   - `extractors.py`：正文/标题/链接提取、10 种 Docs 框架预设、导航剥离
   - `markdown_conv.py`：HTML→Markdown 解析器、LaTeX 公式、表格转换、噪音清理
   - `output.py`：Frontmatter 生成、合并/分文件/索引输出、锚点冲突管理
-  - `pdf_utils.py`：Markdown→HTML 渲染、Edge/Chrome headless PDF 打印
 - 🏗️ **CLI 入口精简**：`grab_web_to_md.py` 仅保留参数解析和流程调度（~1220 行）
 - 🏗️ **依赖链清晰**：`models` ← `security` ← `markdown_conv`/`images`/`output`，无循环依赖
 - ✅ **新增单元测试**：`tests/test_grab_web_to_md.py`
@@ -768,9 +807,8 @@ pdf_utils (无包内依赖)
   - URL 脱敏默认开启（`--no-redact-url` 可关闭）
   - 跨域图片下载不再携带 Cookie/Authorization（凭据隔离）
   - 图片流式写入 + 单图大小限制（默认 25MB）
-  - PDF 生成默认关闭 `--allow-file-access-from-files`
   - HTML 属性净化：过滤 `on*` 事件、`javascript:` 协议
-- ✨ 新增参数：`--no-redact-url`、`--no-map-json`、`--max-image-bytes`、`--pdf-allow-file-access`
+- ✨ 新增参数：`--no-redact-url`、`--no-map-json`、`--max-image-bytes`
 
 ### v1.3.4 (2026-01-26)
 - ✨ 微信公众号支持：自动检测、正文提取、噪音清理
