@@ -65,10 +65,12 @@ def sniff_ext(data: bytes) -> Optional[str]:
     if len(data) >= 12 and data[4:8] == b"ftyp" and data[8:12] in (b"avif", b"avis"):
         return ".avif"
     head = data[:512].lstrip()
-    if head.startswith(b"<svg") or (head.startswith(b"<?xml") and b"<svg" in head[:256]):
-        return ".svg"
-    if b"<svg" in head[:100]:
-        return ".svg"
+    # SVG 检测：仅当内容确实是 SVG（以 <svg 或 <?xml...<svg 开头），
+    # 且不含 <html>/<body>/<head> 等 HTML 标志（避免把内联 SVG 的 HTML
+    # 错误页误判为 .svg）
+    if not any(tag in data[:2048].lower() for tag in (b"<html", b"<body", b"<head", b"<!doctype html")):
+        if head.startswith(b"<svg") or (head.startswith(b"<?xml") and b"<svg" in head[:256]):
+            return ".svg"
     return None
 
 
@@ -296,6 +298,14 @@ def download_images(
                         os.remove(tmp_path)
                     except OSError:
                         pass
+
+            # 空响应体（200 但 0 字节）视为失败，不落盘空文件
+            if size == 0:
+                try:
+                    os.remove(local_path)
+                except OSError:
+                    pass
+                raise RuntimeError("空响应体（0 字节），服务端返回了空内容")
         except Exception as e:
             if best_effort:
                 print(f"警告：图片保存失败，已跳过：{img_url}\n  - 错误：{e}", file=sys.stderr)
@@ -309,7 +319,11 @@ def download_images(
 
         local_abs = os.path.abspath(local_path)
         md_dir_abs = os.path.abspath(md_dir or ".")
-        rel = os.path.relpath(local_abs, start=md_dir_abs)
+        try:
+            rel = os.path.relpath(local_abs, start=md_dir_abs)
+        except ValueError:
+            # Windows 跨盘符时 relpath 抛 ValueError，回退为绝对路径
+            rel = local_abs
         url_to_local[img_url] = rel.replace("\\", "/")
 
     return url_to_local
@@ -448,6 +462,14 @@ def batch_download_images(
                         os.remove(tmp_path)
                     except OSError:
                         pass
+
+            # 空响应体（200 但 0 字节）视为失败，不落盘空文件
+            if size == 0:
+                try:
+                    os.remove(local_path)
+                except OSError:
+                    pass
+                raise RuntimeError("空响应体（0 字节），服务端返回了空内容")
         except Exception as e:
             if best_effort:
                 print(f"  警告：图片保存失败，已跳过：{img_url[:60]}...\n    错误：{e}", file=sys.stderr)
@@ -461,7 +483,11 @@ def batch_download_images(
 
         local_abs = os.path.abspath(local_path)
         md_dir_abs = os.path.abspath(md_dir or ".")
-        rel = os.path.relpath(local_abs, start=md_dir_abs)
+        try:
+            rel = os.path.relpath(local_abs, start=md_dir_abs)
+        except ValueError:
+            # Windows 跨盘符时 relpath 抛 ValueError，回退为绝对路径
+            rel = local_abs
         url_to_local[img_url] = rel.replace("\\", "/")
 
     return url_to_local

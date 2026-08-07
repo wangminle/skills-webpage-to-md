@@ -1560,6 +1560,7 @@ class TestWechatAsyncIntegration(unittest.TestCase):
 from webpage_to_md.notion import (
     _blocks_to_html,
     _extract_page_id,
+    _render_notion_table,
     _rich_text_to_html,
     is_notion_url,
 )
@@ -1789,6 +1790,616 @@ class TestNotionAPIFailureNoFallback(unittest.TestCase):
                     ])
                 self.assertEqual(code, grab.EXIT_ERROR)
                 self.assertIn("Notion API", err_buf.getvalue())
+
+
+# ============================================================================
+# P1 Bug 回归测试
+# ============================================================================
+
+class TestP1BugFixes(unittest.TestCase):
+    """9 个 P1 bug 修复的回归测试，防止未来再次引入。"""
+
+    # ── Bug1: clean_wechat_noise 误删正文中的「取消/允许」 ──────────────
+    def test_bug1_wechat_noise_preserves_body_text(self):
+        """微信噪音清理不应删除正文句子中的「允许/取消」等同名词。"""
+        md = "该设置允许用户取消订阅。\n\n正文继续"
+        result = grab.clean_wechat_noise(md)
+        self.assertIn("允许用户取消订阅", result)
+
+    def test_bug1_wechat_noise_strips_standalone_buttons(self):
+        """独占整行的按钮噪音（Cancel/Allow/Share 等）应被清理。"""
+        md = "正文\n\nCancel\n\nAllow\n\nShare\n\n正文继续"
+        result = grab.clean_wechat_noise(md)
+        self.assertNotIn("Cancel", result)
+        self.assertNotIn("Share", result)
+        self.assertIn("正文", result)
+
+    def test_bug1_wechat_noise_strips_button_link_form(self):
+        """链接形式的按钮 [阅读原文](url) 应被清理。"""
+        md = "正文\n\n[阅读原文](https://mp.weixin.qq.com/s?xxx)\n\n正文继续"
+        result = grab.clean_wechat_noise(md)
+        self.assertNotIn("阅读原文", result)
+
+    # ── Bug2: 合并模式标题降级破坏代码块 ──────────────────────────────
+    def test_bug2_merge_demote_preserves_code_block_comments(self):
+        """合并模式标题降级不应把代码块内的 # 注释行改成标题。"""
+        md_content = "```bash\n# 安装依赖\npip install foo\n```\n\n# 页面标题"
+        result_obj = grab.BatchPageResult(
+            url="https://docs.example.com/x", title="Test",
+            md_content=md_content, success=True,
+        )
+        merged, _ = grab.generate_merged_markdown(
+            [result_obj], include_toc=False, main_title="Doc", redact_urls=False,
+        )
+        self.assertIn("# 安装依赖", merged)
+        self.assertNotIn("### 安装依赖", merged)
+        # 页面标题应被降级（# → ###）
+        self.assertIn("### 页面标题", merged)
+
+    def test_bug2_html_to_markdown_preserves_code_fence_content(self):
+        """html_to_markdown 后处理不应折叠/删除代码块内的空行和注释。"""
+        html = "<pre><code># comment\n\n\nblank above</code></pre>"
+        md = grab.html_to_markdown(html, base_url="https://x.com/", url_to_local={})
+        self.assertIn("# comment", md)
+
+    # ── Bug3: 目标容器 void 元素泄漏页脚 ──────────────────────────────
+    def test_bug3_target_extractor_void_no_leak(self):
+        """void 元素（br/img/hr）不应使深度计数器永不归零，避免泄漏页脚。"""
+        html = (
+            '<div id="content"><p>正文</p><br><img src="x.png"><hr></div>'
+            "<footer><p>页脚不应出现</p></footer>"
+        )
+        result = grab.extract_target_html(html, target_id="content", target_class=None)
+        self.assertIsNotNone(result)
+        self.assertNotIn("页脚", result)
+        self.assertIn("正文", result)
+
+    def test_bug3_target_extractor_nested_div_closes(self):
+        """嵌套 div 应正确归零，不泄漏后续内容。"""
+        html = '<div id="c"><div><p>深层</p></div></div><footer>页脚</footer>'
+        result = grab.extract_target_html(html, target_id="c", target_class=None)
+        self.assertNotIn("页脚", result)
+        self.assertIn("深层", result)
+
+    # ── Bug4: <a> 包 <img> 多出垃圾链接 ────────────────────────────────
+    def test_bug4_a_wrapping_img_no_bare_link(self):
+        """<a> 内仅含图片时不应输出回退裸链接。"""
+        html = '<a href="https://x.com/page"><img src="https://x.com/img.png" alt="pic"></a>'
+        md = grab.html_to_markdown(html, base_url="https://x.com/", url_to_local={})
+        # 应只有图片，无裸链接 [https://x.com/page](https://x.com/page)
+        self.assertEqual(md.count("]("), 1)
+        self.assertIn("![pic]", md)
+
+    def test_bug4_a_with_img_and_text(self):
+        """<a> 内含图片+文字时两者都应保留。"""
+        html = '<a href="https://x.com/p"><img src="https://x.com/i.png" alt="img">点击</a>'
+        md = grab.html_to_markdown(html, base_url="https://x.com/", url_to_local={})
+        self.assertIn("![img]", md)
+        self.assertIn("点击", md)
+
+    # ── Bug5: Editor.js header level 非数字崩溃 ────────────────────────
+    def test_bug5_editorjs_header_non_numeric_level(self):
+        """Editor.js header 的 level 为非数字字符串时不应崩溃。"""
+        blocks = [{"type": "header", "data": {"text": "标题", "level": "high"}}]
+        html = ssr._convert_editorjs_blocks(blocks)
+        self.assertIn("标题", html)
+        self.assertIn("<h2>", html)  # 回退到默认 2
+
+    def test_bug5_editorjs_header_none_level(self):
+        blocks = [{"type": "header", "data": {"text": "标题", "level": None}}]
+        html = ssr._convert_editorjs_blocks(blocks)
+        self.assertIn("标题", html)
+
+    # ── Bug6: Quill Delta header 转换错误 ──────────────────────────────
+    def test_bug6_quill_header_correct(self):
+        """Quill header 是行级属性，应正确产出 <hN> 而非空标题。"""
+        ops = [
+            {"insert": "标题", "attributes": {"header": 2}},
+            {"insert": "\n", "attributes": {"header": 2}},
+            {"insert": "段落\n"},
+        ]
+        html = ssr._convert_quill_ops(ops)
+        self.assertIn("<h2>标题</h2>", html)
+        self.assertIn("<p>段落</p>", html)
+        self.assertNotIn("<h2>\n</h2>", html)
+
+    def test_bug6_quill_list(self):
+        """Quill list 属性应正确产出 <ul>/<ol>。"""
+        ops = [
+            {"insert": "a"}, {"insert": "\n", "attributes": {"list": "bullet"}},
+            {"insert": "b"}, {"insert": "\n", "attributes": {"list": "bullet"}},
+        ]
+        html = ssr._convert_quill_ops(ops)
+        self.assertIn("<ul>", html)
+        self.assertIn("<li>a</li>", html)
+
+    # ── Bug7: Notion 原生表格丢失 ──────────────────────────────────────
+    def test_bug7_notion_table_rendered(self):
+        """Notion table + table_row 应渲染为 <table>，不丢失数据。"""
+        all_blocks = {
+            "t": {
+                "id": "t", "type": "table",
+                "content": ["r1", "r2"],
+                "format": {"table_block_column_header": True},
+            },
+            "r1": {"id": "r1", "type": "table_row", "properties": {
+                "c0": [["Name"]], "c1": [["Age"]],
+            }},
+            "r2": {"id": "r2", "type": "table_row", "properties": {
+                "c0": [["Alice"]], "c1": [["30"]],
+            }},
+        }
+        html = _render_notion_table(all_blocks, all_blocks["t"])
+        self.assertIn("<table>", html)
+        self.assertIn("Alice", html)
+        self.assertIn("30", html)
+
+    def test_bug7_notion_table_empty(self):
+        """空表格应返回空字符串。"""
+        all_blocks = {"t": {"id": "t", "type": "table", "content": []}}
+        self.assertEqual(_render_notion_table(all_blocks, all_blocks["t"]), "")
+
+    # ── Bug8: JS 反爬检测误杀正常页面 ──────────────────────────────────
+    def test_bug8_challenge_title_not_false_positive(self):
+        """标题含 'Challenge' 的正常页面（正文足够长）不应被判为反爬。"""
+        body = "<article><p>" + "正常内容" * 60 + "</p></article>"
+        html = f"<html><head><title>Weekly Challenge 314 - LeetCode</title></head><body>{body}</body></html>"
+        result = grab.detect_js_challenge(html)
+        self.assertFalse(result.is_challenge)
+
+    def test_bug8_real_cloudflare_still_detected(self):
+        """真实 Cloudflare 挑战页仍应被检测为 high。"""
+        html = (
+            '<html><head><title>Just a moment...</title></head>'
+            '<body>Checking<div></div>'
+            '<script>__cf_chl_opt={};</script></body></html>'
+        )
+        result = grab.detect_js_challenge(html)
+        self.assertTrue(result.is_challenge)
+        self.assertEqual(result.confidence, "high")
+
+    def test_bug8_spa_placeholder_still_detected(self):
+        """SPA 占位页（短正文 + noscript）仍应被检测。"""
+        html = (
+            '<html><head></head><body>'
+            '<noscript>请启用 JavaScript</noscript>'
+            '<div id="root">Loading...</div></body></html>'
+        )
+        result = grab.detect_js_challenge(html)
+        self.assertTrue(result.is_challenge)
+
+    # ── Bug9: 批量模式 --browser-fetch 不可用 ──────────────────────────
+    def test_bug9_batch_browser_fetch_skips_js_detection(self):
+        """browser-fetch 模式下不应因 noscript 触发 JS 反爬拦截。"""
+        html = (
+            '<html><head><title>文章</title></head><body>'
+            '<noscript>请启用 JavaScript</noscript>'
+            '<article><p>正文内容，足够长以通过质量检查' + "填充" * 30 + '</p></article>'
+            '</body></html>'
+        )
+        config = grab.BatchConfig(
+            browser_fetch=True, no_ssr=True, no_notion=True, force=False,
+        )
+        with mock.patch.object(grab, "browser_fetch_html", return_value=html):
+            result = grab.process_single_url(
+                session=mock.MagicMock(), url="https://example.com/a", config=config,
+            )
+        self.assertTrue(result.success, f"browser-fetch 被误拦截: {result.error}")
+
+    # ── Bug6 残留: 无尾部 \n 的 Quill header 不应双重输出 ──────────────
+    def test_bug6_quill_header_without_trailing_newline(self):
+        """块属性直接挂在文本 op、无尾部 \\n 时，只应产出一次标题。"""
+        ops = [{"insert": "Title", "attributes": {"header": 2}}]
+        html = ssr._convert_quill_ops(ops)
+        self.assertEqual(html.count("Title"), 1)
+        self.assertIn("<h2>Title</h2>", html)
+        self.assertNotIn("<p>Title</p>", html)
+
+
+# ============================================================================
+# P2 高价值修复回归测试
+# ============================================================================
+
+class TestP2BugFixes(unittest.TestCase):
+    """高价值 P2：阈值统一 / local-html 编码 / HttpOnly cookie / str.find / js:空白。"""
+
+    def test_auto_detect_threshold_unified(self):
+        """单页与批量 auto-detect 应共用同一置信度阈值常量。"""
+        self.assertTrue(hasattr(grab, "AUTO_DETECT_CONFIDENCE_THRESHOLD"))
+        self.assertEqual(grab.AUTO_DETECT_CONFIDENCE_THRESHOLD, 0.6)
+
+    def test_batch_auto_detect_respects_unified_threshold(self):
+        """批量模式置信度 0.55 时不应应用预设（与单页 0.6 对齐）。"""
+        html = (
+            '<html><head><title>Docs</title></head><body>'
+            '<div class="theme-doc-markdown markdown">'
+            '<p>' + ("正文内容" * 40) + '</p></div></body></html>'
+        )
+        config = grab.BatchConfig(
+            auto_detect=True, no_ssr=True, no_notion=True, download_images=False,
+        )
+        with mock.patch.object(grab, "fetch_html", return_value=html):
+            with mock.patch.object(
+                grab, "detect_docs_framework",
+                return_value=("docusaurus", 0.55, ["signal"]),
+            ):
+                with mock.patch.object(grab, "detect_js_challenge") as mock_js:
+                    mock_js.return_value = grab.JSChallengeResult(
+                        is_challenge=False, confidence="none", signals=[],
+                    )
+                    with mock.patch.object(
+                        grab, "extract_target_html_multi",
+                    ) as mock_target:
+                        result = grab.process_single_url(
+                            session=mock.MagicMock(),
+                            url="https://docs.example.com/page",
+                            config=config,
+                        )
+        self.assertTrue(result.success, result.error)
+        # 置信度 0.55 < 0.6：不应套用 docusaurus 的 target 提取
+        mock_target.assert_not_called()
+
+    def test_decode_html_bytes_respects_meta_charset(self):
+        """本地 HTML 应按 meta charset 解码（Shift_JIS），而非强制 UTF-8。"""
+        from webpage_to_md.http_client import decode_html_bytes
+
+        body = "日本語テスト"
+        raw = (
+            b'<html><head><meta charset="Shift_JIS"></head><body>'
+            + body.encode("shift_jis")
+            + b"</body></html>"
+        )
+        text = decode_html_bytes(raw)
+        self.assertIn(body, text)
+        # 若误用 UTF-8 replace，日文会变成替换字符
+        self.assertNotIn("\ufffd", text)
+
+    def test_read_local_html_file_shift_jis(self):
+        """read_local_html_file 应正确读取 Shift_JIS 存档页。"""
+        from webpage_to_md.http_client import read_local_html_file
+
+        body = "ShiftJIS本文"
+        raw = (
+            b'<html><head><meta http-equiv="Content-Type" '
+            b'content="text/html; charset=Shift_JIS"></head><body>'
+            + body.encode("shift_jis")
+            + b"</body></html>"
+        )
+        with tempfile.NamedTemporaryFile(suffix=".html", delete=False) as f:
+            f.write(raw)
+            path = f.name
+        try:
+            text = read_local_html_file(path)
+            self.assertIn(body, text)
+        finally:
+            os.unlink(path)
+
+    def test_httponly_cookies_loaded(self):
+        """cookies.txt 中 #HttpOnly_ 前缀条目应被加载，而非当注释丢弃。"""
+        from webpage_to_md.http_client import _parse_cookies_file
+
+        content = (
+            "# Netscape HTTP Cookie File\n"
+            ".example.com\tTRUE\t/\tFALSE\t0\tnormal\tabc\n"
+            "#HttpOnly_.example.com\tTRUE\t/\tTRUE\t0\tsession\tsecret\n"
+            "# This is a real comment\n"
+        )
+        with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8") as f:
+            f.write(content)
+            path = f.name
+        try:
+            cookies = _parse_cookies_file(path)
+            self.assertEqual(cookies.get("normal"), "abc")
+            self.assertEqual(cookies.get("session"), "secret")
+        finally:
+            os.unlink(path)
+
+    def test_iter_script_bodies_uses_str_find(self):
+        """script 扫描应基于 str.find，正确提取多个 script 正文。"""
+        html = (
+            "<html><body>"
+            "<script type='application/json'>{\"a\":1}</script>"
+            "<script>var x = 2;</script>"
+            "<SCRIPT>UPPER</SCRIPT>"
+            "</body></html>"
+        )
+        bodies = list(ssr._iter_script_bodies(html))
+        self.assertEqual(len(bodies), 3)
+        self.assertIn('{"a":1}', bodies[0])
+        self.assertIn("var x = 2;", bodies[1])
+        self.assertIn("UPPER", bodies[2])
+
+    def test_scan_scripts_no_catastrophic_backtracking_regex(self):
+        """确认 _scan_scripts_for_richtext 不再依赖带 .*? 的全局 script 正则。"""
+        self.assertFalse(hasattr(ssr, "_SCRIPT_TAG_RE") and ssr._SCRIPT_TAG_RE is not None
+                         and ".*?" in getattr(ssr._SCRIPT_TAG_RE, "pattern", ""))
+        # 超大近似 script 内容仍应能完成扫描（不挂起）
+        big = "<script>" + ("{" * 5000) + ("}" * 5000) + "</script>"
+        result = ssr._scan_scripts_for_richtext(big)
+        self.assertIsNone(result)
+
+    def test_sanitize_js_href_leading_whitespace(self):
+        """href 值前导空白的 javascript: 协议也应被清除。"""
+        dirty = '<a href=" javascript:alert(1)">x</a>'
+        clean = ssr._sanitize_editorjs_html(dirty)
+        self.assertNotIn("javascript:", clean.lower())
+        self.assertIn("href=", clean)
+
+    # ── P2-3: 孤儿标题正则误删无关标题 ─────────────────────────────────
+    def test_p2_3_consecutive_titles_not_deleted(self):
+        """剥离锚点列表后，连续的章节标题不应被孤儿清理误删。"""
+        links = "".join(f"- [l{i}](u{i})\n" for i in range(1, 22))
+        md = f"正文。\n\n{links}\n### 参考资料\n\n#### 官方文档\n\n参考内容。"
+        result, _ = grab.strip_anchor_lists(md, threshold=20)
+        self.assertIn("### 参考资料", result)
+        self.assertIn("#### 官方文档", result)
+        self.assertIn("参考内容", result)
+
+    def test_p2_3_title_before_hr_not_deleted(self):
+        """标题后跟 --- 不应被当孤儿删除。"""
+        links = "".join(f"- [l{i}](u{i})\n" for i in range(1, 22))
+        md = f"{links}\n### 重要章节\n\n---\n\n后续内容"
+        result, _ = grab.strip_anchor_lists(md, threshold=20)
+        self.assertIn("### 重要章节", result)
+        self.assertIn("---", result)
+
+    def test_p2_3_real_orphan_at_eof_deleted(self):
+        """文档末尾的真正孤儿标题（标题+空行+EOF）应被清理。"""
+        links = "".join(f"- [l{i}](u{i})\n" for i in range(1, 22))
+        md = f"正文。\n\n{links}\n### 孤立标题\n\n\n"
+        result, _ = grab.strip_anchor_lists(md, threshold=20)
+        self.assertNotIn("### 孤立标题", result)
+
+    # ── P2-4: 懒加载图 src=data: 时 data-src 被丢弃 ────────────────────
+    def test_p2_4_lazy_image_data_src_collected(self):
+        """src=data: 占位时 data-src 真实 URL 应被 ImageURLCollector 收集。"""
+        html = ('<img src="data:image/gif;base64,R0lGODlh" '
+                'data-src="https://example.com/real.jpg" alt="r">')
+        c = grab.ImageURLCollector(base_url="https://example.com/")
+        c.feed(html)
+        self.assertIn("https://example.com/real.jpg", c.image_urls)
+
+    def test_p2_4_lazy_image_markdown_uses_data_src(self):
+        """html_to_markdown 中 data: 占位图应回退到 data-src。"""
+        html = ('<img src="data:image/gif;base64,xxx" '
+                'data-src="https://example.com/real.jpg" alt="图">')
+        md = grab.html_to_markdown(html, base_url="https://example.com/", url_to_local={})
+        self.assertIn("https://example.com/real.jpg", md)
+        self.assertNotIn("data:image/gif", md)
+
+    def test_p2_4_normal_src_unchanged(self):
+        """正常 src（非 data:）不应受懒加载回退影响。"""
+        html = '<img src="https://example.com/normal.png" alt="n">'
+        md = grab.html_to_markdown(html, base_url="https://example.com/", url_to_local={})
+        self.assertIn("https://example.com/normal.png", md)
+
+    # ── P2-7: 4xx 客户端错误不重试（确定性失败） ────────────────────────
+    def test_p2_7_404_not_retried(self):
+        """404 等确定性 4xx 错误不应被重试。"""
+        import requests as req_mod
+        from webpage_to_md.http_client import fetch_html
+
+        call_count = [0]
+        fake_resp = mock.MagicMock()
+        fake_resp.status_code = 404
+        fake_resp.raise_for_status.side_effect = req_mod.exceptions.HTTPError(
+            response=fake_resp,
+        )
+
+        def fake_get(*a, **kw):
+            call_count[0] += 1
+            return fake_resp
+
+        session = mock.MagicMock()
+        session.get.side_effect = fake_get
+        with self.assertRaises(req_mod.exceptions.HTTPError):
+            fetch_html(session, "https://x.com/missing", timeout_s=5, retries=3)
+        self.assertEqual(call_count[0], 1, "404 不应被重试")
+
+    def test_p2_7_429_retried(self):
+        """429 限流应被重试（临时性错误）。"""
+        import requests as req_mod
+        from webpage_to_md.http_client import fetch_html
+
+        call_count = [0]
+        fake_resp_429 = mock.MagicMock()
+        fake_resp_429.status_code = 429
+        fake_resp_429.raise_for_status.side_effect = req_mod.exceptions.HTTPError(
+            response=fake_resp_429,
+        )
+        fake_resp_ok = mock.MagicMock()
+        fake_resp_ok.status_code = 200
+        fake_resp_ok.headers = {}
+        fake_resp_ok.raise_for_status.return_value = None
+        fake_resp_ok.iter_content.return_value = iter([b"<html>OK</html>"])
+        fake_resp_ok.encoding = "utf-8"
+
+        def fake_get(*a, **kw):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return fake_resp_429
+            return fake_resp_ok
+
+        session = mock.MagicMock()
+        session.get.side_effect = fake_get
+        result = fetch_html(session, "https://x.com/rate", timeout_s=5, retries=3)
+        self.assertGreater(call_count[0], 1, "429 应被重试")
+        self.assertIn("OK", result)
+
+    # ── P2-8: redact_url 剥离 userinfo 凭据 ────────────────────────────
+    def test_p2_8_redact_strips_userinfo(self):
+        """URL 中的 user:password@ 凭据应被脱敏剥离。"""
+        r = grab.redact_url("https://user:password@host.com/path?secret=1")
+        self.assertNotIn("password", r)
+        self.assertNotIn("user", r)
+        self.assertEqual(r, "https://host.com/path")
+
+    def test_p2_8_redact_preserves_port(self):
+        """剥离 userinfo 时应保留端口号。"""
+        r = grab.redact_url("http://admin:pass@host.com:8080/p?q=1")
+        self.assertNotIn("admin", r)
+        self.assertIn(":8080", r)
+
+    def test_p2_8_redact_only_username(self):
+        """仅有 username 也应被剥离。"""
+        r = grab.redact_url("https://token@host.com/p")
+        self.assertNotIn("token", r)
+        self.assertEqual(r, "https://host.com/p")
+
+    # ── P2-6: relpath 跨盘符回退 ────────────────────────────────────────
+    def test_p2_6_relpath_cross_drive_fallback(self):
+        """跨盘符时 relpath 回退为绝对路径，不抛 ValueError。"""
+        from webpage_to_md.output import batch_save_individual
+        from webpage_to_md.models import BatchPageResult
+
+        result = BatchPageResult(
+            url="https://x.com/a", title="Test",
+            md_content="![img](test.assets/01.png)", success=True,
+        )
+        with tempfile.TemporaryDirectory() as td:
+            # 模拟跨盘符场景：shared_assets_dir 无法 relpath 到 output_dir
+            # 使用 mock 让 relpath 抛 ValueError
+            with mock.patch("os.path.relpath", side_effect=ValueError("cross-drive")):
+                saved = batch_save_individual(
+                    results=[result],
+                    output_dir=os.path.join(td, "out"),
+                    shared_assets_dir="D:/shared.assets",
+                    redact_urls=False,
+                )
+            self.assertEqual(len(saved), 1)
+            with open(saved[0], "r", encoding="utf-8") as f:
+                content = f.read()
+            # 图片路径应被改写为绝对路径（而非丢失）
+            self.assertIn("shared.assets/01.png", content)
+
+    # ── BUG-013: 合并模式文件存在检查应在抓取前提前 ─────────────────────
+    def test_p2_013_merge_exists_check_before_fetch(self):
+        """合并模式输出文件已存在时，应在抓取开始前提前返回，不浪费抓取配额。"""
+        with tempfile.TemporaryDirectory() as td:
+            urls_file = os.path.join(td, "urls.txt")
+            with open(urls_file, "w") as f:
+                f.write("https://example.com/page1\n")
+            merged = os.path.join(td, "merged.md")
+            with open(merged, "w") as f:
+                f.write("existing content")
+
+            fetch_called = [False]
+            def fake_fetch(**kw):
+                fetch_called[0] = True
+                return "<html></html>"
+
+            out_buf = io.StringIO()
+            err_buf = io.StringIO()
+            with redirect_stdout(out_buf), redirect_stderr(err_buf):
+                with mock.patch.object(grab, "fetch_html", side_effect=fake_fetch):
+                    code = grab.main([
+                        "--urls-file", urls_file,
+                        "--merge", "--merge-output", merged,
+                    ])
+            self.assertEqual(code, grab.EXIT_FILE_EXISTS)
+            # 关键断言：fetch_html 不应被调用（提前退出了）
+            self.assertFalse(fetch_called[0], "文件已存在时不应发起抓取")
+
+    def test_p2_013_merge_overwrite_proceeds(self):
+        """--overwrite 时合并模式应正常进行（不因文件存在而退出）。"""
+        with tempfile.TemporaryDirectory() as td:
+            urls_file = os.path.join(td, "urls.txt")
+            with open(urls_file, "w") as f:
+                f.write("https://example.com/page1\n")
+            merged = os.path.join(td, "out", "merged.md")
+            os.makedirs(os.path.dirname(merged), exist_ok=True)
+            with open(merged, "w") as f:
+                f.write("old")
+
+            html = "<html><head><title>T</title></head><body><article><p>正文</p></article></body></html>"
+            out_buf = io.StringIO()
+            err_buf = io.StringIO()
+            with redirect_stdout(out_buf), redirect_stderr(err_buf):
+                with mock.patch.object(grab, "fetch_html", return_value=html):
+                    with mock.patch.object(grab, "detect_js_challenge") as mj:
+                        mj.return_value = grab.JSChallengeResult(
+                            is_challenge=False, confidence="none", signals=[])
+                        code = grab.main([
+                            "--urls-file", urls_file,
+                            "--merge", "--merge-output", merged,
+                            "--overwrite",
+                        ])
+            self.assertEqual(code, grab.EXIT_SUCCESS)
+
+    # ── BUG-030: _append_text 空格启发式割裂 CJK 文本 ──────────────────
+    def test_p2_030_cjk_no_space_insertion(self):
+        """CJK 字符之间的内联标签不应插入空格（你好<span>世界 → 你好世界）。"""
+        html = "<article><p>你好<strong>世界</strong></p></article>"
+        md = grab.html_to_markdown(html, base_url="https://x.com/", url_to_local={})
+        self.assertIn("你好**世界**", md)
+        self.assertNotIn("你好 **世界**", md)
+
+    def test_p2_030_english_keeps_space(self):
+        """英文单词之间的内联标签仍应插入空格（hello <b>world）。"""
+        html = "<article><p>hello <strong>world</strong></p></article>"
+        md = grab.html_to_markdown(html, base_url="https://x.com/", url_to_local={})
+        self.assertIn("hello **world**", md)
+
+    def test_p2_030_cjk_english_boundary(self):
+        """CJK 与英文交界处仍可插空格（不割裂任一侧）。"""
+        html = "<article><p>中文<strong>English</strong></p></article>"
+        md = grab.html_to_markdown(html, base_url="https://x.com/", url_to_local={})
+        # CJK(中文) + English 交界：不应割裂中文，但 English 前可有空格
+        self.assertIn("中文", md)
+        self.assertIn("**English**", md)
+        self.assertNotIn("中 文", md)
+
+    # ── BUG-035: _attrs_to_str / <a> 协议过滤绕过 ─────────────────────
+    def test_p2_035_javascript_protocol_blocked(self):
+        """<a href='javascript:...'> 的脚本协议不应出现在输出中。"""
+        html = '<a href="javascript:alert(1)">x</a>'
+        md = grab.html_to_markdown(html, base_url="https://x.com/", url_to_local={})
+        self.assertNotIn("javascript", md.lower())
+
+    def test_p2_035_control_char_variant_blocked(self):
+        """含控制字符的 java\\tscript: 变体也应被拦截。"""
+        html = '<a href="java\tscript:alert(1)">x</a>'
+        md = grab.html_to_markdown(html, base_url="https://x.com/", url_to_local={})
+        # 去除控制字符后不应含 javascript
+        clean = md.replace("\t", "").replace("\n", "").lower()
+        self.assertNotIn("javascript", clean)
+
+    def test_p2_035_data_text_html_blocked(self):
+        """data:text/html 在 href 中可执行脚本，应被拦截。"""
+        html = '<a href="data:text/html,<script>x</script>">y</a>'
+        md = grab.html_to_markdown(html, base_url="https://x.com/", url_to_local={})
+        self.assertNotIn("data:text/html", md.lower())
+
+    def test_p2_035_table_link_filtered(self):
+        """表格内的不安全协议链接也应被过滤。"""
+        html = '<table><tr><td><a href="javascript:alert(1)">bad</a></td></tr></table>'
+        md = grab.html_to_markdown(html, base_url="https://x.com/", url_to_local={})
+        self.assertNotIn("javascript", md.lower())
+
+    def test_p2_035_normal_link_preserved(self):
+        """正常 https 链接不应受协议过滤影响。"""
+        html = '<a href="https://example.com/page">正常</a>'
+        md = grab.html_to_markdown(html, base_url="https://x.com/", url_to_local={})
+        self.assertIn("https://example.com/page", md)
+
+    # ── BUG-036: sniff_ext SVG 启发式误判 HTML ─────────────────────────
+    def test_p2_036_html_with_svg_not_misdetected(self):
+        """开头含 <svg 的 HTML 错误页不应被误判为 .svg。"""
+        from webpage_to_md.images import sniff_ext
+        data = b'<svg onload="x"></svg>\n<html><body>error</body></html>'
+        self.assertNotEqual(sniff_ext(data), ".svg")
+
+    def test_p2_036_real_svg_detected(self):
+        """真正的 SVG 文件应被识别为 .svg。"""
+        from webpage_to_md.images import sniff_ext
+        svg = b'<svg xmlns="http://www.w3.org/2000/svg"><rect/></svg>'
+        self.assertEqual(sniff_ext(svg), ".svg")
+
+    def test_p2_036_xml_svg_detected(self):
+        """XML 声明 + SVG 应被识别。"""
+        from webpage_to_md.images import sniff_ext
+        xml_svg = b'<?xml version="1.0"?><svg xmlns="http://www.w3.org/2000/svg"><rect/></svg>'
+        self.assertEqual(sniff_ext(xml_svg), ".svg")
 
 
 if __name__ == "__main__":

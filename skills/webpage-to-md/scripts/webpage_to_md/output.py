@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
-from .markdown_conv import rewrite_internal_links
+from .markdown_conv import _demote_headings_outside_code, rewrite_internal_links
 from .models import BatchPageResult
 from .security import redact_url, redact_urls_in_markdown
 
@@ -51,11 +51,27 @@ def generate_frontmatter(title: str, url: str, tags: Optional[List[str]] = None)
     return "\n".join(lines)
 
 
+# Windows 保留文件名（不区分大小写，不含扩展名时仍保留）
+_WIN_RESERVED_NAMES = frozenset(
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"COM{i}" for i in range(1, 10)}
+    | {f"LPT{i}" for i in range(1, 10)}
+)
+
+
 def _sanitize_filename_part(text: str) -> str:
     text = text.strip()
     text = re.sub(r"[^\w.\-]+", "-", text, flags=re.UNICODE)
     text = re.sub(r"-{2,}", "-", text)
-    return text.strip("-") or "untitled"
+    text = text.strip("-") or "untitled"
+    # Windows 保留名（CON/NUL/PRN/AUX/COM1-9/LPT1-9）加下划线后缀避免冲突
+    stem = text
+    # 去掉扩展名后检查（CON.txt 仍然是保留名）
+    dot_pos = stem.rfind(".")
+    check_name = stem[:dot_pos] if dot_pos > 0 else stem
+    if check_name.upper() in _WIN_RESERVED_NAMES:
+        text = "_" + text
+    return text
 
 
 def auto_wrap_output_dir(output_path: str) -> str:
@@ -191,18 +207,24 @@ def build_url_to_anchor_map_with_manager(
 
         url_to_anchor[result.url] = anchor
         parsed = urlparse(result.url)
-        if parsed.port:
+        # parsed.port 在非法端口（:99999/:abc）时抛 ValueError，需安全访问
+        try:
+            port = parsed.port
+        except ValueError:
+            port = None
+
+        if port:
             no_port_url = f"{parsed.scheme}://{parsed.hostname}{parsed.path}"
             if parsed.query:
                 no_port_url += f"?{parsed.query}"
             url_to_anchor[no_port_url] = anchor
 
-        if parsed.scheme == "https" and not parsed.port:
+        if parsed.scheme == "https" and not port:
             with_port = f"{parsed.scheme}://{parsed.hostname}:443{parsed.path}"
             if parsed.query:
                 with_port += f"?{parsed.query}"
             url_to_anchor[with_port] = anchor
-        elif parsed.scheme == "http" and not parsed.port:
+        elif parsed.scheme == "http" and not port:
             with_port = f"{parsed.scheme}://{parsed.hostname}:80{parsed.path}"
             if parsed.query:
                 with_port += f"?{parsed.query}"
@@ -304,7 +326,9 @@ def generate_merged_markdown(
         parts.append("")
 
         content = result.md_content
-        content = re.sub(r"^(#{1,4})\s+", lambda m: "#" * (len(m.group(1)) + 2) + " ", content, flags=re.MULTILINE)
+        # 合并模式：把每页的标题下移 2 级，避免与合并文档顶层标题冲突。
+        # 注意必须在代码围栏（```/~~~）外执行，否则会把代码块内的 # 注释行也降级。
+        content = _demote_headings_outside_code(content, 2)
         if rewrite_links and url_to_anchor:
             content, count = rewrite_internal_links(content, url_to_anchor)
             total_rewrite_count += count
@@ -416,6 +440,8 @@ def batch_save_individual(
             filepath = f"{base}_{counter}{ext}"
             counter += 1
             is_base = False
+        if not is_base:
+            print(f"警告：文件已存在，已重命名为：{os.path.basename(filepath)}", file=sys.stderr)
         used_paths.add(filepath)
 
         content = result.md_content
@@ -423,18 +449,19 @@ def batch_save_individual(
             try:
                 rel_assets_path = os.path.relpath(shared_assets_dir, output_dir)
                 rel_assets_path = rel_assets_path.replace("\\", "/")
-                content = re.sub(
-                    r"(\!\[[^\]]*\]\()([^/)]+\.assets/)([^)]+\))",
-                    lambda m: m.group(1) + rel_assets_path + "/" + m.group(3),
-                    content,
-                )
-                content = re.sub(
-                    r'(<img[^>]+src=["\'])([^"\'/]+\.assets/)([^"\']+)',
-                    lambda m: m.group(1) + rel_assets_path + "/" + m.group(3),
-                    content,
-                )
             except ValueError:
-                pass
+                # Windows 跨盘符时 relpath 抛 ValueError；回退为绝对路径
+                rel_assets_path = shared_assets_dir.replace("\\", "/")
+            content = re.sub(
+                r"(\!\[[^\]]*\]\()([^/)]+\.assets/)([^)]+\))",
+                lambda m: m.group(1) + rel_assets_path + "/" + m.group(3),
+                content,
+            )
+            content = re.sub(
+                r'(<img[^>]+src=["\'])([^"\'/]+\.assets/)([^"\']+)',
+                lambda m: m.group(1) + rel_assets_path + "/" + m.group(3),
+                content,
+            )
 
         if redact_urls:
             content = redact_urls_in_markdown(content)

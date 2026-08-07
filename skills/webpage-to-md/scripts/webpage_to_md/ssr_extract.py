@@ -87,14 +87,15 @@ _DANGEROUS_TAG_RE = re.compile(
 )
 # 事件属性：匹配带引号和无引号两种写法
 # onclick="alert(1)" / onclick='alert(1)' / onclick=alert(1)
+# 也匹配 <img/onerror=...> 等 / 分隔属性的情况
 _EVENT_ATTR_RE = re.compile(
-    r'''\s+on\w+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)''',
+    r'''[\s/]+on\w+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)''',
     re.IGNORECASE,
 )
-# javascript: 协议：匹配带引号和无引号两种写法
-# href="javascript:..." / href='javascript:...' / href=javascript:...
+# javascript: 协议：匹配带引号和无引号两种写法；允许引号后/协议前有空白
+# href="javascript:..." / href=' javascript:...' / href=javascript:...
 _JS_HREF_RE = re.compile(
-    r'''href\s*=\s*(?:"javascript:[^"]*"|'javascript:[^']*'|javascript:[^\s>]+)''',
+    r'''href\s*=\s*(?:"\s*javascript:[^"]*"|'\s*javascript:[^']*'|javascript:[^\s>]+)''',
     re.IGNORECASE,
 )
 
@@ -135,9 +136,15 @@ def richtext_json_to_html(node: Any) -> str:
 
     # ── 子节点：不同框架使用不同 key ──
     children = node.get("content") or node.get("children") or []
+    # content/children 必须是 list，dict 时迭代键名会输出垃圾
+    if not isinstance(children, list):
+        children = []
 
     # ── 文本节点 ──
     text = node.get("text", "")
+    # text 非字符串时 html_escape 会 TypeError，统一转为 str
+    if not isinstance(text, str):
+        text = str(text) if text else ""
     if node_type == "text" or (text and not children and not node_type):
         return _apply_marks(text, node)
 
@@ -405,9 +412,12 @@ def _get_cell_attrs(node: dict) -> str:
     extra = ""
     colspan = attrs.get("colspan", 1) or node.get("colspan", 1)
     rowspan = attrs.get("rowspan", 1) or node.get("rowspan", 1)
-    if colspan and colspan > 1:
+    # colspan/rowspan 可能为字符串（如 "3"），直接比较会 TypeError
+    colspan = _safe_int(colspan, 1)
+    rowspan = _safe_int(rowspan, 1)
+    if colspan > 1:
         extra += f' colspan="{colspan}"'
-    if rowspan and rowspan > 1:
+    if rowspan > 1:
         extra += f' rowspan="{rowspan}"'
     return extra
 
@@ -431,7 +441,7 @@ def _convert_editorjs_blocks(blocks: list) -> str:
         if btype in ("paragraph", "p"):
             parts.append(f'<p>{_sanitize_editorjs_html(data.get("text", ""))}</p>\n')
         elif btype in ("header", "heading"):
-            level = min(max(int(data.get("level", 2)), 1), 6)
+            level = min(max(_safe_int(data.get("level", 2), 2), 1), 6)
             parts.append(f'<h{level}>{_sanitize_editorjs_html(data.get("text", ""))}</h{level}>\n')
         elif btype == "list":
             style = data.get("style", "unordered")
@@ -478,9 +488,41 @@ def _convert_editorjs_blocks(blocks: list) -> str:
 # 两阶段兜底：从 <script> 中扫描 JSON 富文本数据
 # ═══════════════════════════════════════════════════════════════════════════
 
-_SCRIPT_TAG_RE = re.compile(
-    r"<script[^>]*>(.*?)</script>", re.DOTALL
-)
+def _find_ci(haystack: str, needle: str, start: int = 0) -> int:
+    """大小写不敏感的 ``str.find``，避免正则回溯。"""
+    idx = haystack.lower().find(needle.lower(), start)
+    return idx
+
+
+def _iter_script_bodies(page_html: str):
+    """用 ``str.find`` 迭代提取所有 ``<script>...</script>`` 正文。
+
+    相对 ``.*?`` 非贪婪正则，在超大 HTML 上不会触发灾难性回溯。
+    大小写不敏感；不解析属性中的 ``>`` 边界情况（与常见 HTML 一致）。
+    """
+    pos = 0
+    n = len(page_html)
+    while pos < n:
+        start = _find_ci(page_html, "<script", pos)
+        if start < 0:
+            break
+        # 确认是标签边界（`<script` 后应为空白、`>` 或 `/`）
+        after = start + len("<script")
+        if after < n and page_html[after] not in " \t\r\n/>":
+            pos = after
+            continue
+        tag_end = page_html.find(">", after)
+        if tag_end < 0:
+            break
+        # 自闭合 <script ... /> 无正文
+        if page_html[tag_end - 1] == "/":
+            pos = tag_end + 1
+            continue
+        close = _find_ci(page_html, "</script>", tag_end + 1)
+        if close < 0:
+            break
+        yield page_html[tag_end + 1 : close]
+        pos = close + len("</script>")
 
 
 def _scan_scripts_for_richtext(page_html: str) -> Optional[str]:
@@ -495,10 +537,10 @@ def _scan_scripts_for_richtext(page_html: str) -> Optional[str]:
     Returns:
         转换后的 HTML 字符串，或 None。
     """
-    # 收集所有有内容的 script 标签
+    # 收集所有有内容的 script 标签（str.find，避免 .*? 回溯）
     candidates: list[str] = []
-    for m in _SCRIPT_TAG_RE.finditer(page_html):
-        body = m.group(1).strip()
+    for body in _iter_script_bodies(page_html):
+        body = body.strip()
         # 只关注包含 JSON 特征的脚本（至少有花括号且足够长）
         if len(body) > 200 and "{" in body:
             candidates.append(body)
@@ -518,7 +560,7 @@ def _try_parse_richtext_from_script(script_body: str) -> Optional[str]:
 
     # 策略 2：寻找赋值语句中的 JSON (如 window.xxx = {...})
     if json_data is None:
-        for m in re.finditer(r'=\s*(\{.{200,})', script_body):
+        for m in re.finditer(r'=\s*(\{)', script_body):
             json_str = _extract_json_object_str(script_body, m.start(1))
             if json_str:
                 json_data = _try_parse_json(json_str)
@@ -591,38 +633,117 @@ def _find_and_convert_richtext(data: Any, depth: int = 0) -> Optional[str]:
 
 
 def _convert_quill_ops(ops: list) -> Optional[str]:
-    """将 Quill Delta ops 数组转换为 HTML。"""
-    parts: list[str] = []
+    """将 Quill Delta ops 数组转换为 HTML。
+
+    正确处理 Quill 的行级块格式（header/list/blockquote/code-block）。
+    Quill 中块级属性附加在包含 ``\\n`` 的 op 上，作用于该换行符结束的整行；
+    行内属性（bold/italic/link）附加在文本片段上。
+    """
+    # 第一步：遍历 ops，按 \\n 切分为"行"。每个 \n 携带的 attributes
+    # 就是该行的块格式。行内格式在文本片段上就地应用。
+    lines: list[tuple[str, dict]] = []  # [(formatted_line_html, block_attrs)]
+    cur: list[str] = []  # 当前行已格式化的文本片段
+
+    def _apply_inline(raw: str, attrs: dict) -> str:
+        seg = html_escape(raw)
+        if attrs.get("bold"):
+            seg = f"<strong>{seg}</strong>"
+        if attrs.get("italic"):
+            seg = f"<em>{seg}</em>"
+        if attrs.get("code"):
+            seg = f"<code>{seg}</code>"
+        if "link" in attrs:
+            seg = f'<a href="{html_escape(str(attrs["link"]))}">{seg}</a>'
+        return seg
+
+    def _is_block_attr(attrs: dict) -> bool:
+        return any(
+            k in attrs
+            for k in ("header", "list", "blockquote", "code-block", "code_block")
+        )
+
+    last_attrs: dict = {}  # 记录最后一个 op 的属性（用于无 \n 结尾的块格式）
     for op in ops:
         if not isinstance(op, dict):
             continue
         insert = op.get("insert", "")
-        attrs = op.get("attributes", {})
+        attrs = op.get("attributes", {}) or {}
+        last_attrs = attrs
+
         if isinstance(insert, str):
-            text = html_escape(insert)
-            if isinstance(attrs, dict):
-                if attrs.get("bold"):
-                    text = f"<strong>{text}</strong>"
-                if attrs.get("italic"):
-                    text = f"<em>{text}</em>"
-                if attrs.get("code"):
-                    text = f"<code>{text}</code>"
-                if "link" in attrs:
-                    text = f'<a href="{html_escape(attrs["link"])}">{text}</a>'
-                if attrs.get("header"):
-                    level = min(max(_safe_int(attrs["header"]), 1), 6)
-                    text = f"<h{level}>{text}</h{level}>\n"
-            parts.append(text)
+            # 按 \n 切分：每段文本后跟一个换行点。
+            # split 会把 "a\nb\nc" → ["a","b","c"]，
+            # 即 len-1 个换行，每段后各一个换行（除最后一段）。
+            pieces = insert.split("\n")
+            for idx, piece in enumerate(pieces):
+                if idx > 0:
+                    # 此处产生一个换行：当前 cur 的内容构成一行，
+                    # 其块格式取自触发该换行的 op（即本 op 的 attrs）。
+                    lines.append(("".join(cur), dict(attrs)))
+                    cur = []
+                if piece:
+                    cur.append(_apply_inline(piece, attrs))
         elif isinstance(insert, dict):
             if insert.get("image"):
-                parts.append(f'<img src="{html_escape(str(insert["image"]))}">\n')
+                cur.append(f'<img src="{html_escape(str(insert["image"]))}">')
+
+    # 末尾残留的当前行（无尾部 \n）。
+    # 若最后一个 op 带有块级属性（header/list 等），应用于该行——
+    # 兼容部分非标准数据（块属性未通过 \n op 传递）。
+    if cur:
+        tail_block = last_attrs if _is_block_attr(last_attrs) else {}
+        lines.append(("".join(cur), tail_block))
+
+    # 第二步：根据块格式包裹每行
+    parts: list[str] = []
+    list_type: Optional[str] = None  # "ordered" | "bullet"
+    list_items: list[str] = []
+
+    def _close_list() -> None:
+        nonlocal list_type, list_items
+        if list_type and list_items:
+            tag = "ol" if list_type == "ordered" else "ul"
+            parts.append(f"<{tag}>\n{''.join(list_items)}</{tag}>\n")
+        list_type = None
+        list_items = []
+
+    for text, block in lines:
+        if not text and not _is_block_attr(block):
+            continue
+
+        if "header" in block:
+            _close_list()
+            level = min(max(_safe_int(block["header"], 2), 1), 6)
+            parts.append(f"<h{level}>{text}</h{level}>\n")
+        elif "list" in block:
+            lt = "ordered" if block["list"] == "ordered" else "bullet"
+            if lt != list_type:
+                _close_list()
+                list_type = lt
+            checked = block.get("checked")
+            if checked is True:
+                list_items.append(f'<li><input type="checkbox" checked>{text}</li>\n')
+            elif checked is False:
+                list_items.append(f'<li><input type="checkbox">{text}</li>\n')
+            else:
+                list_items.append(f"<li>{text}</li>\n")
+        elif "blockquote" in block:
+            _close_list()
+            parts.append(f"<blockquote>{text}</blockquote>\n")
+        elif "code-block" in block or "code_block" in block:
+            _close_list()
+            parts.append(f"<pre><code>{text}</code></pre>\n")
+        else:
+            _close_list()
+            if text:
+                parts.append(f"<p>{text}</p>\n")
+
+    _close_list()
 
     body = "".join(parts)
     if not body.strip():
         return None
-    # 段落化
-    paragraphs = body.split("\n\n")
-    return "\n".join(f"<p>{p}</p>" for p in paragraphs if p.strip())
+    return body
 
 
 def _try_parse_json(s: str) -> Any:
@@ -681,19 +802,29 @@ def try_ssr_extract(page_html: str, url: str = "") -> Optional[SSRContent]:
 # Next.js  ──  __NEXT_DATA__
 # ═══════════════════════════════════════════════════════════════════════════
 
-_NEXT_DATA_RE = re.compile(
-    r'<script\s+id="__NEXT_DATA__"\s+type="application/json">(.*?)</script>',
-    re.DOTALL,
-)
-
 
 def _extract_nextjs(page_html: str, url: str) -> Optional[SSRContent]:
     """从 Next.js ``__NEXT_DATA__`` 中提取文章内容。"""
-    m = _NEXT_DATA_RE.search(page_html)
-    if not m:
+    # 用 str.find 定位，避免对超大 JSON 使用 .*? 回溯正则
+    marker = 'id="__NEXT_DATA__"'
+    idx = page_html.find(marker)
+    if idx < 0:
+        idx = page_html.find("id='__NEXT_DATA__'")
+        if idx < 0:
+            return None
+    # 回退到最近的 <script
+    script_start = page_html.rfind("<script", 0, idx)
+    if script_start < 0:
         return None
+    tag_end = page_html.find(">", idx)
+    if tag_end < 0:
+        return None
+    close = _find_ci(page_html, "</script>", tag_end + 1)
+    if close < 0:
+        return None
+    raw_json = page_html[tag_end + 1 : close]
     try:
-        data = json.loads(m.group(1))
+        data = json.loads(raw_json)
     except (json.JSONDecodeError, ValueError):
         return None
 
@@ -933,7 +1064,12 @@ def _quill_content_to_html(content_raw: str, title: str) -> Optional[str]:
         return None
 
     all_ops: list[dict] = []
-    for _key, section in sorted(data.items(), key=lambda x: str(x[0])):
+    # 键全为数字时按 int 排序（否则 "10" < "2"），否则保持 JSON 原始顺序
+    try:
+        sorted_items = sorted(data.items(), key=lambda x: int(x[0]))
+    except (ValueError, TypeError):
+        sorted_items = list(data.items())
+    for _key, section in sorted_items:
         ops = section.get("ops", []) if isinstance(section, dict) else []
         all_ops.extend(ops)
 

@@ -12,15 +12,25 @@ from .models import JSChallengeResult, ValidationResult
 
 def redact_url(url: str) -> str:
     """
-    URL 脱敏：默认仅保留 scheme://host/path，移除 query/fragment。
+    URL 脱敏：默认仅保留 scheme://host/path，移除 userinfo/query/fragment。
 
     - 仅对 http/https 且含 netloc 的 URL 生效
+    - 剥离 URL 中嵌入的凭据（``user:password@host``）以防泄露
     - 其他形式（相对路径、空字符串等）原样返回
     """
     try:
         p = urlparse(url)
         if p.scheme in ("http", "https") and p.netloc:
-            return p._replace(query="", fragment="").geturl()
+            # 剥离 userinfo（username:password@）——属于凭据，不应出现在输出中。
+            # 注意：ParseResult 的 username/password 是只读 property，只能通过
+            # 重建 netloc（仅保留 host[:port]）来移除。
+            host_info = p.hostname or ""
+            if p.port:
+                host_info += f":{p.port}"
+            return p._replace(
+                netloc=host_info,
+                query="", fragment="",
+            ).geturl()
     except Exception:
         pass
     return url
@@ -113,10 +123,11 @@ def detect_js_challenge(html: str, title: Optional[str] = None) -> JSChallengeRe
         signals.append("发现 Cloudflare 挑战域名引用")
 
     challenge_titles = [
-        ("challenge", "标题包含 'Challenge'"),
+        # 注意："challenge" 单独作为子串过于宽泛，会误杀 LeetCode 周赛
+        # ("Weekly Challenge 314") 等正常页面，故不纳入。
+        # 只保留 Cloudflare/Akamai 等反爬挑战页特有的完整标题。
         ("just a moment", "标题包含 'Just a moment'"),
         ("checking your browser", "标题包含 'Checking your browser'"),
-        ("please wait", "标题包含 'Please wait'"),
         ("attention required", "标题包含 'Attention Required'"),
         ("ddos protection", "标题包含 'DDoS Protection'"),
     ]
@@ -168,7 +179,10 @@ def detect_js_challenge(html: str, title: Optional[str] = None) -> JSChallengeRe
     if not signals:
         return JSChallengeResult(is_challenge=False, confidence="none", signals=[])
 
-    high_confidence_keywords = ["cloudflare", "akamai", "perimeterx", "challenge", "just a moment"]
+    # 注意：移除了 "challenge" 这个宽泛关键词——它曾导致标题含 "Challenge"
+    # 的正常页面（如 LeetCode 周赛）被误判为反爬。真正的反爬挑战页都有
+    # 更具体的厂商特征（cloudflare/akamai 等）或特定标题（just a moment 等）。
+    high_confidence_keywords = ["cloudflare", "akamai", "perimeterx", "just a moment", "attention required", "ddos"]
     has_high_signal = any(any(kw in sig.lower() for kw in high_confidence_keywords) for sig in signals)
     if has_high_signal or len(signals) >= 2:
         confidence = "high"
@@ -213,7 +227,16 @@ def validate_markdown(md_path: str, assets_dir: str) -> ValidationResult:
         text = f.read()
 
     refs = re.findall(r"!\[[^\]]*\]\(([^)]+)\)", text)
-    refs = [r.strip() for r in refs]
+    # 剥离可选 title（path "title"）和尖括号包裹（<path>）
+    cleaned_refs: List[str] = []
+    for r in refs:
+        r = r.strip()
+        if r.startswith("<") and r.endswith(">"):
+            r = r[1:-1].strip()
+        # 去除末尾 title: 'path "title"' -> 'path'
+        r = re.sub(r'\s+["\']([^"\']*)["\']\s*$', '', r).strip()
+        cleaned_refs.append(r)
+    refs = cleaned_refs
     local_refs = [r for r in refs if not re.match(r"^[a-z]+://", r, re.IGNORECASE)]
 
     missing: List[str] = []

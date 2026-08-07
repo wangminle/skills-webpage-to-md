@@ -106,7 +106,7 @@ python3 SKILL_DIR/scripts/grab_web_to_md.py --local-html /tmp/smoke.html --out /
 # 3. Verify output contains expected content
 grep -q "# Hello" /tmp/smoke.md && grep -q "Skill works" /tmp/smoke.md && echo "✅ PASS" || echo "❌ FAIL"
 
-# 4. Run unit tests (also offline)
+# 4. Run unit tests (only in source repo layout, not after skill installation)
 python3 -m pytest SKILL_DIR/../../tests/ -q
 ```
 

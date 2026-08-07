@@ -161,10 +161,13 @@ def _fetch_all_blocks(
         missing: List[str] = []
         for block in list(all_blocks.values()):
             for child_id in block.get("content", []):
-                if child_id not in all_blocks:
+                if child_id not in all_blocks and child_id not in missing:
                     missing.append(child_id)
         if not missing:
             break
+
+        # 记录本轮获取前的 block 数量，用于检测是否有进展
+        prev_count = len(all_blocks)
 
         # 批量获取
         for i in range(0, len(missing), _SYNC_BATCH_SIZE):
@@ -179,6 +182,15 @@ def _fetch_all_blocks(
                     all_blocks[bid] = value
             if i + _SYNC_BATCH_SIZE < len(missing):
                 time.sleep(0.2)
+
+        # 连续一轮无进展（获取不到任何新 block）则提前退出，避免无效重试
+        if len(all_blocks) == prev_count:
+            print(
+                f"警告：Notion Block 递归获取第 {round_idx + 1} 轮无进展，"
+                f"仍有 {len(missing)} 个子 Block 未获取，提前退出",
+                file=sys.stderr,
+            )
+            break
     else:
         if missing:
             print(
@@ -299,6 +311,48 @@ def _blocks_to_html(
         f"<h1>{html_escape(page_title)}</h1>\n{body_html}</body></html>"
     )
     return full_html, page_title
+
+
+def _render_notion_table(all_blocks: Dict[str, Dict], table_block: Dict) -> str:
+    """渲染 Notion 原生表格为 HTML <table>。
+
+    Notion 的 table block 通过 content 字段持有 table_row block id 列表；
+    每个 table_row 的 properties 以列标识符（列名或数字索引）为 key，
+    value 为富文本数组 ``[[text, [[fmt], ...]], ...]``。
+
+    是否有表头由 table block 的 format.table_block_column_header 或
+    首行的特殊标记决定；这里保守地把第一行渲染为 <th>（与多数表格语义一致），
+    其余为 <td>。
+    """
+    content_ids = table_block.get("content", [])
+    if not content_ids:
+        return ""
+
+    fmt = table_block.get("format", {}) or {}
+    has_header = bool(fmt.get("table_block_column_header"))
+
+    rows_html: List[str] = []
+    first_row = True
+    for rid in content_ids:
+        row_block = all_blocks.get(rid, {})
+        if row_block.get("type") != "table_row":
+            continue
+        props = row_block.get("properties", {})
+        if not isinstance(props, dict) or not props:
+            continue
+        # 保持列顺序：优先用 format 中声明的列顺序，否则按 properties 出现顺序
+        cells = [_rich_text_to_html(props[k]) for k in props if isinstance(props.get(k), list)]
+        if not cells:
+            continue
+        use_header = first_row and (has_header or fmt.get("table_block_column_header"))
+        tag = "th" if use_header else "td"
+        row = "".join(f"<{tag}>{c}</{tag}>" for c in cells)
+        rows_html.append(f"<tr>{row}</tr>\n")
+        first_row = False
+
+    if not rows_html:
+        return ""
+    return f"<table>\n{''.join(rows_html)}</table>\n"
 
 
 def _render_block_children(
@@ -461,6 +515,23 @@ def _render_single_block(all_blocks: Dict[str, Dict], block: Dict) -> str:
 
     if btype == "table_of_contents":
         return ""
+
+    # Notion 原生表格：table 的 content 是 table_row block id 列表。
+    # table_row 的 properties 以列为 key（列名或列序号），值为富文本数组。
+    if btype == "table":
+        return _render_notion_table(all_blocks, block)
+
+    if btype == "table_row":
+        # 单独遇到的 table_row（理论上由 _render_notion_table 处理，
+        # 这里作为兜底：把每列渲染为单元格行）
+        props = block.get("properties", {})
+        if not isinstance(props, dict) or not props:
+            return ""
+        cells = [_rich_text_to_html(props[k]) for k in props if isinstance(props.get(k), list)]
+        if not cells:
+            return ""
+        row = "".join(f"<td>{c}</td>" for c in cells)
+        return f"<table>\n<tr>{row}</tr>\n</table>\n"
 
     if btype == "page":
         if title:

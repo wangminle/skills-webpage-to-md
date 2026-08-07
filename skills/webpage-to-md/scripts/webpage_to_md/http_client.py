@@ -55,7 +55,7 @@ UA_PRESETS: Dict[str, str] = {
 # 仅扫描 HTML 前 4KB 的 ASCII 安全区域来寻找 <meta charset="..."> 或
 # <meta http-equiv="Content-Type" content="...; charset=...">
 _META_CHARSET_RE = re.compile(
-    rb'<meta[^>]+charset=["\']?\s*([A-Za-z0-9_.:-]+)',
+    rb'<meta[^>]+charset\s*=\s*["\']?\s*([A-Za-z0-9_.:-]+)',
     re.IGNORECASE,
 )
 
@@ -77,6 +77,23 @@ def _detect_meta_charset(raw: bytes, limit: int = 4096) -> Optional[str]:
         return codecs.lookup(charset).name
     except LookupError:
         return None
+
+
+def decode_html_bytes(raw: bytes) -> str:
+    """按 HTML <meta charset> 解码原始字节；未声明时回退 UTF-8。
+
+    与 ``fetch_html`` 的编码策略对齐，供 ``--local-html`` 复用，
+    避免 Shift_JIS / EUC-JP 等存档页被强制按 UTF-8 读成乱码。
+    """
+    encoding = _detect_meta_charset(raw) or "utf-8"
+    return raw.decode(encoding, errors="replace")
+
+
+def read_local_html_file(filepath: str) -> str:
+    """读取本地 HTML 文件并按 meta charset 正确解码。"""
+    with open(filepath, "rb") as f:
+        raw = f.read()
+    return decode_html_bytes(raw)
 
 
 def _resolve_user_agent(user_agent: Optional[str], ua_preset: str) -> str:
@@ -142,14 +159,20 @@ def fetch_html(
                 or http_encoding.lower().replace("-", "") in ("iso88591", "latin1")
             )
             if is_default:
-                meta_enc = _detect_meta_charset(raw)
-                encoding = meta_enc or "utf-8"
-            else:
-                encoding = http_encoding  # type: ignore[assignment]
-
-            return raw.decode(encoding, errors="replace")
+                return decode_html_bytes(raw)
+            return raw.decode(http_encoding, errors="replace")  # type: ignore[arg-type]
         except Exception as e:
             last_err = e
+            # 确定性失败不重试：RuntimeError（含响应超限等）
+            if isinstance(e, RuntimeError):
+                raise
+            if isinstance(e, requests.exceptions.HTTPError):
+                status = e.response.status_code if e.response is not None else 0
+                # 4xx 客户端错误（除 429 Too Many Requests）是确定性的——
+                # 服务器明确拒绝（401/403/404/410 等），重试不会改变结果。
+                # 429 是临时限流，重试有意义。
+                if 400 <= status < 500 and status != 429:
+                    raise
             if attempt >= retries:
                 raise
             time.sleep(min(3.0, 0.6 * attempt))
@@ -244,133 +267,145 @@ def browser_fetch_html(url: str, *, timeout_s: int = 60) -> str:
     print(f"  浏览器路径：{browser}")
 
     tmpdir = tempfile.mkdtemp(prefix="wmd_browser_")
-
-    # 分配空闲端口
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as _s:
-        _s.bind(("127.0.0.1", 0))
-        port = _s.getsockname()[1]
-
-    _base_flags = [
-        "--headless=new",
-        "--disable-gpu",
-        "--no-first-run",
-        "--no-default-browser-check",
-        "--disable-extensions",
-        f"--user-data-dir={tmpdir}",
-    ]
-
-    # ── Phase 1: 让 Chrome 完成 JS 挑战 ────────────────────
-    proc = subprocess.Popen(
-        [browser] + _base_flags + [
-            f"--remote-debugging-port={port}",
-            "--disable-blink-features=AutomationControlled",
-            "--window-size=1280,720",
-            url,
-        ],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-
-    challenge_detected = False
     try:
-        deadline = time.time() + timeout_s
-        stable_url: Optional[str] = None
-        stable_count = 0
-        phase1_ok = False
+        # 分配空闲端口
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as _s:
+            _s.bind(("127.0.0.1", 0))
+            port = _s.getsockname()[1]
 
-        print("  Phase 1：等待页面加载（若有 JS 挑战会自动通过）...")
+        _base_flags = [
+            "--headless=new",
+            "--disable-gpu",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-extensions",
+            f"--user-data-dir={tmpdir}",
+        ]
 
-        while time.time() < deadline:
-            time.sleep(1)
-            try:
-                resp = urllib.request.urlopen(
-                    f"http://127.0.0.1:{port}/json/list", timeout=2,
+        # ── Phase 1: 让 Chrome 完成 JS 挑战 ────────────────────
+        proc = subprocess.Popen(
+            [browser] + _base_flags + [
+                f"--remote-debugging-port={port}",
+                "--disable-blink-features=AutomationControlled",
+                "--window-size=1280,720",
+                url,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+        challenge_detected = False
+        try:
+            deadline = time.time() + timeout_s
+            stable_url: Optional[str] = None
+            stable_count = 0
+            phase1_ok = False
+
+            print("  Phase 1：等待页面加载（若有 JS 挑战会自动通过）...")
+
+            while time.time() < deadline:
+                time.sleep(1)
+                try:
+                    resp = urllib.request.urlopen(
+                        f"http://127.0.0.1:{port}/json/list", timeout=2,
+                    )
+                    pages = json.loads(resp.read())
+                    # 只关注 type=page，过滤扩展 background 等
+                    real = [p for p in pages if p.get("type") == "page"]
+                    if not real:
+                        continue
+
+                    cur_url = real[0].get("url", "")
+                    title = real[0].get("title", "")
+
+                    # 仍在挑战页
+                    title_lower = title.lower()
+                    if any(h in title_lower for h in _CF_CHALLENGE_HINTS):
+                        challenge_detected = True
+                        stable_count = 0
+                        continue
+
+                    # 跳过空白页
+                    if cur_url in ("", "about:blank") or not title:
+                        continue
+
+                    if cur_url == stable_url:
+                        stable_count += 1
+                        if stable_count >= 2:
+                            phase1_ok = True
+                            break
+                    else:
+                        stable_url = cur_url
+                        stable_count = 0
+                except Exception:
+                    pass
+
+            if challenge_detected and not phase1_ok:
+                print(
+                    "  ⚠ JS 挑战未在超时时间内通过（站点可能使用了 Turnstile 等"
+                    "高级人机验证，headless 浏览器无法自动完成）"
                 )
-                pages = json.loads(resp.read())
-                # 只关注 type=page，过滤扩展 background 等
-                real = [p for p in pages if p.get("type") == "page"]
-                if not real:
-                    continue
 
-                cur_url = real[0].get("url", "")
-                title = real[0].get("title", "")
-
-                # 仍在挑战页
-                title_lower = title.lower()
-                if any(h in title_lower for h in _CF_CHALLENGE_HINTS):
-                    challenge_detected = True
-                    stable_count = 0
-                    continue
-
-                # 跳过空白页
-                if cur_url in ("", "about:blank") or not title:
-                    continue
-
-                if cur_url == stable_url:
-                    stable_count += 1
-                    if stable_count >= 2:
-                        phase1_ok = True
-                        break
-                else:
-                    stable_url = cur_url
-                    stable_count = 0
+            # 多等 1 秒确保 cookie 写入磁盘
+            time.sleep(1)
+        finally:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
             except Exception:
-                pass
+                proc.kill()
 
-        if challenge_detected and not phase1_ok:
-            print(
-                "  ⚠ JS 挑战未在超时时间内通过（站点可能使用了 Turnstile 等"
-                "高级人机验证，headless 浏览器无法自动完成）"
+        # ── Phase 2: 用持久化的 cookie 获取 DOM ─────────────────
+        print("  Phase 2：使用持久化 cookie 获取页面内容...")
+        try:
+            proc2 = subprocess.run(
+                [browser] + _base_flags + ["--dump-dom", url],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=timeout_s + 15,
+            )
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(f"浏览器获取超时（{timeout_s}s）：{url}")
+
+        html = proc2.stdout or ""
+
+        if _is_challenge_html(html):
+            raise RuntimeError(
+                "浏览器两阶段获取后仍为挑战页面。可能原因：\n"
+                "  • 站点需要真人交互验证（如 CAPTCHA）\n"
+                "  • 浏览器 headless 模式被检测\n"
+                "建议：在浏览器中手动保存页面后使用 --local-html 处理。"
             )
 
-        # 多等 1 秒确保 cookie 写入磁盘
-        time.sleep(1)
-    finally:
-        proc.terminate()
-        try:
-            proc.wait(timeout=5)
-        except Exception:
-            proc.kill()
+        if len(html.strip()) < 100:
+            raise RuntimeError(
+                "浏览器返回的 HTML 内容为空或过短，可能站点需要登录或有更强的反爬保护。"
+            )
 
-    # ── Phase 2: 用持久化的 cookie 获取 DOM ─────────────────
-    print("  Phase 2：使用持久化 cookie 获取页面内容...")
-    try:
-        proc2 = subprocess.run(
-            [browser] + _base_flags + ["--dump-dom", url],
-            capture_output=True,
-            text=True,
-            timeout=timeout_s + 15,
-        )
-    except subprocess.TimeoutExpired:
-        raise RuntimeError(f"浏览器获取超时（{timeout_s}s）：{url}")
+        return html
     finally:
+        # 最外层 try/finally：无论 Phase 1 还是 Phase 2 抛异常，都清理临时 profile
         shutil.rmtree(tmpdir, ignore_errors=True)
-
-    html = proc2.stdout or ""
-
-    if _is_challenge_html(html):
-        raise RuntimeError(
-            "浏览器两阶段获取后仍为挑战页面。可能原因：\n"
-            "  • 站点需要真人交互验证（如 CAPTCHA）\n"
-            "  • 浏览器 headless 模式被检测\n"
-            "建议：在浏览器中手动保存页面后使用 --local-html 处理。"
-        )
-
-    if len(html.strip()) < 100:
-        raise RuntimeError(
-            "浏览器返回的 HTML 内容为空或过短，可能站点需要登录或有更强的反爬保护。"
-        )
-
-    return html
 
 
 def _parse_cookies_file(filepath: str) -> Dict[str, str]:
-    """解析 Netscape 格式的 cookies.txt 文件。"""
+    """解析 Netscape 格式的 cookies.txt 文件。
+
+    支持浏览器导出常见的 ``#HttpOnly_`` 前缀行（HttpOnly cookie）；
+    真正的注释行（以 ``#`` 开头且非该前缀）仍被跳过。
+    """
     cookies: Dict[str, str] = {}
     with open(filepath, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
-            if not line or line.startswith("#"):
+            if not line:
+                continue
+            # Netscape 扩展：#HttpOnly_<domain>\t... 表示 HttpOnly cookie
+            if line.startswith("#HttpOnly_"):
+                line = line[len("#HttpOnly_"):]
+            elif line.startswith("#"):
                 continue
             parts = line.split("\t")
             if len(parts) >= 7:
