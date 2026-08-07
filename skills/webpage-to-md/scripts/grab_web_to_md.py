@@ -22,11 +22,13 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Optional, Sequence, Tuple, Callable
+from urllib.parse import urldefrag
 
 import requests
 
@@ -58,6 +60,7 @@ from webpage_to_md.http_client import (
     _create_session,
     browser_fetch_html,
     fetch_html,
+    read_local_html_file,
 )
 from webpage_to_md.extractors import (
     DOCS_PRESETS,
@@ -131,6 +134,10 @@ EXIT_ERROR = 1
 EXIT_FILE_EXISTS = 2
 EXIT_VALIDATION_FAILED = 3
 EXIT_JS_CHALLENGE = 4  # 检测到 JS 反爬保护，无法获取内容
+EXIT_PARTIAL_FAILURE = 5  # --skip-errors 模式下部分页面失败
+
+# auto-detect 置信度阈值：单页与批量共用，避免行为不一致
+AUTO_DETECT_CONFIDENCE_THRESHOLD = 0.6
 
 
 
@@ -182,22 +189,26 @@ def process_single_url(
         if not config.no_ssr:
             ssr_result = try_ssr_extract(page_html, url)
 
-        # 批量模式同样检测 JS 反爬挑战页，避免把验证页误当正文导出
-        js_detection = detect_js_challenge(page_html)
-        if js_detection.is_challenge and not config.force:
-            if ssr_result:
-                # SSR 数据可用，跳过反爬拦截（与单页模式行为一致）
-                pass
-            else:
-                suggestions = js_detection.get_suggestions(url)
-                suggestion_text = "\n".join(f"  {s}" for s in suggestions)
-                raise RuntimeError(
-                    "检测到 JavaScript 反爬保护，当前页面无法通过纯 HTTP 请求获取完整内容。\n"
-                    f"置信度：{js_detection.confidence}\n"
-                    "建议操作：\n"
-                    f"{suggestion_text}\n"
-                    "如需跳过该检查并强制继续，请添加 --force。"
-                )
+        # 批量模式同样检测 JS 反爬挑战页，避免把验证页误当正文导出。
+        # 但 browser-fetch 模式下浏览器已执行 JS 并通过了挑战（noscript 标签会
+        # 残留在渲染后 DOM 中，必然触发误判），故跳过检测——与单页模式
+        # (_fetch_page_html) 和爬取索引页模式的行为保持一致。
+        if not config.browser_fetch:
+            js_detection = detect_js_challenge(page_html)
+            if js_detection.is_challenge and not config.force:
+                if ssr_result:
+                    # SSR 数据可用，跳过反爬拦截（与单页模式行为一致）
+                    pass
+                else:
+                    suggestions = js_detection.get_suggestions(url)
+                    suggestion_text = "\n".join(f"  {s}" for s in suggestions)
+                    raise RuntimeError(
+                        "检测到 JavaScript 反爬保护，当前页面无法通过纯 HTTP 请求获取完整内容。\n"
+                        f"置信度：{js_detection.confidence}\n"
+                        "建议操作：\n"
+                        f"{suggestion_text}\n"
+                        "如需跳过该检查并强制继续，请添加 --force。"
+                    )
 
         # SSR Markdown 快速路径
         if ssr_result and ssr_result.is_markdown:
@@ -255,7 +266,7 @@ def process_single_url(
         detected_preset: Optional[str] = None
         if config.auto_detect and not config.docs_preset:
             detected_preset, confidence, signals = detect_docs_framework(page_html)
-            if detected_preset and confidence >= 0.5:
+            if detected_preset and confidence >= AUTO_DETECT_CONFIDENCE_THRESHOLD:
                 preset = DOCS_PRESETS.get(detected_preset)
                 if preset:
                     # 高置信度时应用预设
@@ -498,6 +509,14 @@ def _batch_main(args: argparse.Namespace) -> int:
                     return EXIT_JS_CHALLENGE
                 print("已添加 --force 参数，强制继续处理索引页...", file=sys.stderr)
         
+        # 预编译校验 --crawl-pattern 正则
+        if args.crawl_pattern:
+            try:
+                re.compile(args.crawl_pattern)
+            except re.error as e:
+                print(f"错误：--crawl-pattern 正则表达式无效：{e}", file=sys.stderr)
+                return EXIT_ERROR
+
         # 提取链接
         links = extract_links_from_html(
             html=index_html,
@@ -506,18 +525,27 @@ def _batch_main(args: argparse.Namespace) -> int:
             same_domain=args.same_domain,
         )
         
-        # 添加到 URL 列表（避免重复）
-        existing_urls = {u for u, _ in urls}
+        # 添加到 URL 列表（避免重复，先剥离 fragment 防同页重复抓取）
+        existing_urls = {urldefrag(u).url for u, _ in urls}
         for link_url, link_text in links:
-            if link_url not in existing_urls:
+            base = urldefrag(link_url).url
+            if base not in existing_urls:
                 urls.append((link_url, link_text))
-                existing_urls.add(link_url)
+                existing_urls.add(base)
         
         print(f"从索引页提取了 {len(links)} 个链接，总计 {len(urls)} 个 URL")
     
     if not urls:
         print("错误：没有要处理的 URL", file=sys.stderr)
         return EXIT_ERROR
+
+    # 合并模式：抓取前先检查输出文件是否已存在，避免浪费抓取配额
+    if args.merge and not args.overwrite:
+        output_file = args.merge_output or "merged.md"
+        output_file = auto_wrap_output_dir(output_file)
+        if os.path.exists(output_file):
+            print(f"文件已存在：{output_file}（如需覆盖请加 --overwrite）", file=sys.stderr)
+            return EXIT_FILE_EXISTS
     
     # 显示 URL 列表预览
     print("\n即将处理的 URL 列表：")
@@ -599,7 +627,15 @@ def _batch_main(args: argparse.Namespace) -> int:
     def progress_callback(current: int, total: int, url: str) -> None:
         short_url = url if len(url) <= 50 else url[:47] + "..."
         print(f"[{current}/{total}] 处理中：{short_url}")
-    
+
+    # 合并模式：在抓取开始前提前检查输出文件是否已存在，
+    # 避免抓取全部页面和下载图片后才发现冲突，浪费抓取配额和带宽。
+    if args.merge:
+        pre_output_file = auto_wrap_output_dir(args.merge_output or "merged.md")
+        if os.path.exists(pre_output_file) and not args.overwrite:
+            print(f"文件已存在：{pre_output_file}（如需覆盖请加 --overwrite）", file=sys.stderr)
+            return EXIT_FILE_EXISTS
+
     # 执行批量处理
     print(f"开始批量处理（并发数：{config.max_workers}，间隔：{config.delay}s）...\n")
     
@@ -653,23 +689,28 @@ def _batch_main(args: argparse.Namespace) -> int:
                 md_dir = args.output_dir
             
             print(f"\n发现 {unique_images} 张图片（去重后），开始下载到：{assets_dir}")
-            
+
             def img_progress(current: int, total: int, url: str) -> None:
                 short_url = url if len(url) <= 50 else url[:47] + "..."
                 print(f"  [{current}/{total}] 下载：{short_url}")
-            
-            url_to_local = batch_download_images(
-                session=session,
-                results=results,
-                assets_dir=assets_dir,
-                md_dir=md_dir,
-                timeout_s=args.timeout,
-                retries=args.retries,
-                best_effort=bool(args.best_effort_images),
-                progress_callback=img_progress,
-                redact_urls=args.redact_url,
-                max_image_bytes=args.max_image_bytes,
-            )
+
+            try:
+                url_to_local = batch_download_images(
+                    session=session,
+                    results=results,
+                    assets_dir=assets_dir,
+                    md_dir=md_dir,
+                    timeout_s=args.timeout,
+                    retries=args.retries,
+                    best_effort=bool(args.best_effort_images),
+                    progress_callback=img_progress,
+                    redact_urls=args.redact_url,
+                    max_image_bytes=args.max_image_bytes,
+                )
+            except Exception as e:
+                print(f"\n错误：图片下载失败：{e}", file=sys.stderr)
+                print("提示：使用 --best-effort-images 可跳过失败图片继续处理", file=sys.stderr)
+                return EXIT_ERROR
             
             print(f"  图片下载完成：{len(url_to_local)} 张成功")
             
@@ -776,9 +817,11 @@ def _batch_main(args: argparse.Namespace) -> int:
                 redact_urls=args.redact_url,
             )
             index_path = os.path.join(split_dir, "INDEX.md")
+            if os.path.exists(index_path):
+                print(f"警告：INDEX.md 已存在，将被覆盖：{index_path}", file=sys.stderr)
             with open(index_path, "w", encoding="utf-8") as f:
                 f.write(index_content)
-            
+
             print("\n📂 已同时生成分文件版本：")
             print(f"  • 目录：{split_dir}")
             print(f"  • 文件数：{len(saved_files)} 个")
@@ -813,9 +856,11 @@ def _batch_main(args: argparse.Namespace) -> int:
             redact_urls=args.redact_url,
         )
         index_path = os.path.join(args.output_dir, "INDEX.md")
+        if os.path.exists(index_path):
+            print(f"警告：INDEX.md 已存在，将被覆盖：{index_path}", file=sys.stderr)
         with open(index_path, "w", encoding="utf-8") as f:
             f.write(index_content)
-        
+
         print(f"\n已生成 {len(saved_files)} 个文件到：{args.output_dir}")
         print(f"索引文件：{index_path}")
     
@@ -847,9 +892,10 @@ def _batch_main(args: argparse.Namespace) -> int:
             else:
                 print("- 缺失文件：0")
         else:
+            # 非合并模式：图片统一存放在 output_dir/assets/ 共享目录
+            shared_a_dir = os.path.join(args.output_dir, "assets")
             for sf in saved_files:
-                a_dir = os.path.splitext(sf)[0] + ".assets"
-                vr = validate_markdown(sf, a_dir)
+                vr = validate_markdown(sf, shared_a_dir)
                 print(f"\n校验结果（{os.path.basename(sf)}）：")
                 print(f"- 图片引用数（总）：{vr.image_refs}")
                 print(f"- 图片引用数（本地）：{vr.local_image_refs}")
@@ -863,6 +909,10 @@ def _batch_main(args: argparse.Namespace) -> int:
                     print("- 缺失文件：0")
         if has_failure:
             return EXIT_VALIDATION_FAILED
+
+    # --skip-errors 模式下部分页面失败时返回非零退出码，便于 CI 感知
+    if fail_count > 0:
+        return EXIT_PARTIAL_FAILURE
 
     return EXIT_SUCCESS
 
@@ -922,6 +972,12 @@ def _fetch_page_html(
         print(f"错误：下载失败：{safe_url}", file=sys.stderr)
         print(f"详情：{exc}", file=sys.stderr)
         print("建议：可改用 --browser-fetch 或浏览器保存 HTML 后通过 --local-html 离线处理。", file=sys.stderr)
+        return None, EXIT_ERROR
+    except RuntimeError as exc:
+        # fetch_html 在响应体超限时抛 RuntimeError（HTTP Content-Length 超限或流式读取超限）
+        safe_url = redact_url(url) if args.redact_url else url
+        print(f"错误：{exc}", file=sys.stderr)
+        print(f"建议：增大 --max-html-bytes 限制，或使用 --local-html 离线处理。", file=sys.stderr)
         return None, EXIT_ERROR
 
     # JS 反爬检测（SSR 站点可能误报，先检查是否有 SSR 数据）
@@ -1092,7 +1148,7 @@ urls.txt 文件格式：
     batch_group.add_argument("--output-dir", default="./batch_output", help="批量输出目录（默认 ./batch_output）")
     batch_group.add_argument("--max-workers", type=int, default=3, help="并发线程数（默认 3，建议不超过 5）")
     batch_group.add_argument("--delay", type=float, default=1.0, help="请求间隔秒数（默认 1.0，避免被封）")
-    batch_group.add_argument("--skip-errors", action="store_true", help="跳过失败的 URL 继续处理")
+    batch_group.add_argument("--skip-errors", action="store_true", help="跳过失败的 URL 继续处理（仍有失败时退出码为 5）")
     batch_group.add_argument("--download-images", action="store_true", 
                              help="下载图片到本地 assets 目录（默认不下载，保留原始 URL）")
     
@@ -1120,7 +1176,11 @@ urls.txt 文件格式：
     crawl_group.add_argument("--no-same-domain", action="store_false", dest="same_domain", help="允许抓取跨域链接")
     
     args = ap.parse_args(argv)
-    
+
+    # 校验 --max-workers
+    if args.max_workers is not None and args.max_workers < 1:
+        ap.error("--max-workers 必须为正整数")
+
     # ========== 列出预设 ==========
     if args.list_presets:
         print("\n📦 可用的文档框架预设：\n")
@@ -1170,8 +1230,8 @@ urls.txt 文件格式：
         if not url:
             print("警告：未指定 --base-url 或 url，图片将无法下载（仅保留原始引用）", file=sys.stderr)
         
-        with open(args.local_html, "r", encoding="utf-8", errors="replace") as f:
-            page_html = f.read()
+        # 按 meta charset 解码（与 fetch_html 一致），避免 Shift_JIS 等存档乱码
+        page_html = read_local_html_file(args.local_html)
         print(f"从本地文件读取：{args.local_html}")
         
         # 输出文件名
@@ -1303,18 +1363,23 @@ urls.txt 文件格式：
         # 从 Markdown 中提取图片 URL
         image_urls = collect_md_image_urls(md_body, base_url=url)
         print(f"发现图片：{len(image_urls)} 张，开始下载到：{assets_dir}")
-        url_to_local = download_images(
-            session=session,
-            image_urls=image_urls,
-            assets_dir=assets_dir,
-            md_dir=md_dir,
-            timeout_s=args.timeout,
-            retries=args.retries,
-            best_effort=bool(args.best_effort_images),
-            page_url=url,
-            redact_urls=args.redact_url,
-            max_image_bytes=args.max_image_bytes,
-        )
+        try:
+            url_to_local = download_images(
+                session=session,
+                image_urls=image_urls,
+                assets_dir=assets_dir,
+                md_dir=md_dir,
+                timeout_s=args.timeout,
+                retries=args.retries,
+                best_effort=bool(args.best_effort_images),
+                page_url=url,
+                redact_urls=args.redact_url,
+                max_image_bytes=args.max_image_bytes,
+            )
+        except Exception as e:
+            print(f"错误：图片下载失败：{e}", file=sys.stderr)
+            print("提示：使用 --best-effort-images 可跳过失败图片继续处理", file=sys.stderr)
+            return EXIT_ERROR
         if url_to_local:
             md_body = replace_image_urls_in_markdown(md_body, url_to_local)
 
@@ -1399,7 +1464,7 @@ urls.txt 文件格式：
             # 单页模式：自动检测文档框架（Phase 2）
             elif hasattr(args, 'auto_detect') and args.auto_detect:
                 framework, confidence, signals = detect_docs_framework(page_html)
-                if framework and confidence >= 0.6:
+                if framework and confidence >= AUTO_DETECT_CONFIDENCE_THRESHOLD:
                     preset = DOCS_PRESETS.get(framework)
                     if preset:
                         print(f"🔍 自动检测到文档框架：{preset.name}（置信度：{confidence:.0%}）")
@@ -1462,18 +1527,23 @@ urls.txt 文件格式：
             image_urls = uniq_preserve_order(collector.image_urls)
 
             print(f"发现图片：{len(image_urls)} 张，开始下载到：{assets_dir}")
-            url_to_local = download_images(
-                session=session,
-                image_urls=image_urls,
-                assets_dir=assets_dir,
-                md_dir=md_dir,
-                timeout_s=args.timeout,
-                retries=args.retries,
-                best_effort=bool(args.best_effort_images),
-                page_url=url,
-                redact_urls=args.redact_url,
-                max_image_bytes=args.max_image_bytes,
-            )
+            try:
+                url_to_local = download_images(
+                    session=session,
+                    image_urls=image_urls,
+                    assets_dir=assets_dir,
+                    md_dir=md_dir,
+                    timeout_s=args.timeout,
+                    retries=args.retries,
+                    best_effort=bool(args.best_effort_images),
+                    page_url=url,
+                    redact_urls=args.redact_url,
+                    max_image_bytes=args.max_image_bytes,
+                )
+            except Exception as e:
+                print(f"错误：图片下载失败：{e}", file=sys.stderr)
+                print("提示：使用 --best-effort-images 可跳过失败图片继续处理", file=sys.stderr)
+                return EXIT_ERROR
 
             # 提取标题（微信模式下优先使用专用提取函数）
             if args.title:

@@ -6,7 +6,7 @@ import sys
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urldefrag, urljoin, urlparse
 
 
 @dataclass
@@ -469,6 +469,7 @@ class _HTMLElementStripper(HTMLParser):
         self.skip_depth = 0
         self.skip_tag: Optional[str] = None
         self.stats = NavStripStats()
+        self._raw_content_depth = 0  # script/style 内不转义 data
 
     def _should_skip(self, tag: str, attrs: Dict[str, Optional[str]]) -> Optional[str]:
         for matcher in self.matchers:
@@ -513,6 +514,9 @@ class _HTMLElementStripper(HTMLParser):
             self.buf.append(f"<{tag} {attr_str}>")
         else:
             self.buf.append(f"<{tag}>")
+        # 进入 script/style 时不转义 data（CDATA 内容，含 math/tex 公式）
+        if tag in ("script", "style"):
+            self._raw_content_depth += 1
 
     def handle_startendtag(self, tag: str, attrs_list: Sequence[Tuple[str, Optional[str]]]) -> None:
         tag = tag.lower()
@@ -543,11 +547,17 @@ class _HTMLElementStripper(HTMLParser):
             return
 
         self.buf.append(f"</{tag}>")
+        if tag in ("script", "style") and self._raw_content_depth > 0:
+            self._raw_content_depth -= 1
 
     def handle_data(self, data: str) -> None:
         if self.skip_depth > 0:
             return
-        self.buf.append(htmllib.escape(data, quote=False))
+        # script/style CDATA 内容不转义（避免污染 math/tex 公式）
+        if self._raw_content_depth > 0:
+            self.buf.append(data)
+        else:
+            self.buf.append(htmllib.escape(data, quote=False))
 
     def handle_comment(self, data: str) -> None:
         if self.skip_depth > 0:
@@ -591,6 +601,42 @@ def strip_html_elements(
     return result, stats
 
 
+def _apply_regex_outside_fences(
+    text: str, pattern: str, repl, flags: int = 0
+) -> str:
+    """对 text 应用 re.sub，但跳过代码围栏（``` / ~~~）内的内容。"""
+    fence_re = re.compile(r"^([`~]{3,})")
+    lines = text.split("\n")
+    parts: List[str] = []
+    in_fence = False
+    fence_char = ""
+    outside_buf: List[str] = []
+
+    def flush() -> None:
+        if outside_buf:
+            parts.append(re.sub(pattern, repl, "\n".join(outside_buf), flags=flags))
+            outside_buf.clear()
+
+    for line in lines:
+        m = fence_re.match(line.strip())
+        if m and (not in_fence or line.strip().startswith(fence_char * 3)):
+            flush()
+            if not in_fence:
+                in_fence = True
+                fence_char = m.group(1)[0]
+            else:
+                in_fence = False
+                fence_char = ""
+            parts.append(line)
+        elif in_fence:
+            parts.append(line)
+        else:
+            outside_buf.append(line)
+
+    flush()
+    return "\n".join(parts)
+
+
 def strip_anchor_lists(
     md_content: str,
     threshold: int = 20,
@@ -620,7 +666,9 @@ def strip_anchor_lists(
         removed_lines += lines
         return ""
 
-    result = re.sub(nav_section_pattern, replace_nav_section, result, flags=re.MULTILINE)
+    result = _apply_regex_outside_fences(
+        result, nav_section_pattern, replace_nav_section, flags=re.MULTILINE
+    )
 
     list_pattern = r"((?:^[ \t]*(?:[-*]|\d+\.)\s*\[[^\]]+\]\([^)]+\)\s*\n){" + str(threshold) + r",})"
 
@@ -632,13 +680,18 @@ def strip_anchor_lists(
         removed_lines += lines
         return ""
 
-    result = re.sub(list_pattern, replace_list, result, flags=re.MULTILINE)
+    result = _apply_regex_outside_fences(
+        result, list_pattern, replace_list, flags=re.MULTILINE
+    )
 
     if removed_count > 0:
-        orphan_title_pattern = r"#{3,6}\s+[^\n]+\n\n(?=#{3,6}\s+|$|\n*---)"
-        result = re.sub(orphan_title_pattern, "", result, flags=re.MULTILINE)
+        # 清理"孤儿标题"：原本紧跟被剥离锚点列表、现在后面无任何内容的标题。
+        # 仅当标题后面**仅**剩空行直至文档末尾时才删除——避免误删紧跟另一个
+        # 标题或分隔线的正常章节标题（这是此前的回归 bug）。
+        orphan_title_pattern = r"(?m)^[ \t]*#{3,6}\s+[^\n]+\n(?:[ \t]*\n)*\Z"
+        result = _apply_regex_outside_fences(result, orphan_title_pattern, "", flags=0)
 
-    result = re.sub(r"\n{4,}", "\n\n\n", result)
+    result = _apply_regex_outside_fences(result, r"\n{4,}", "\n\n\n", flags=0)
 
     stats.anchor_lists_removed += removed_count
     stats.anchor_lines_removed += removed_lines
@@ -679,8 +732,19 @@ class _TextLenExtractor(HTMLParser):
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
         self.n = 0
+        self._skip_depth = 0  # script/style 嵌套深度
+
+    def handle_starttag(self, tag: str, attrs) -> None:
+        if tag in ("script", "style"):
+            self._skip_depth += 1
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in ("script", "style") and self._skip_depth > 0:
+            self._skip_depth -= 1
 
     def handle_data(self, data: str) -> None:
+        if self._skip_depth > 0:
+            return
         if not data or data.isspace():
             return
         self.n += len(re.sub(r"\s+", " ", data.strip()))
@@ -744,14 +808,17 @@ class ImageURLCollector(HTMLParser):
                 self._picture_sources = []
                 return
 
+            # 懒加载场景：src 可能是 data: 占位图（base64 透明像素），
+            # 此时真实 URL 在 data-src / data-original / data-lazy-src 中。
+            # 过滤掉 data: URI 的候选，优先取真实懒加载属性。
             candidates = [
                 attrs.get("src"),
                 attrs.get("data-src"),
                 attrs.get("data-original"),
                 attrs.get("data-lazy-src"),
             ]
-            src = next((c for c in candidates if c), None)
-            if (not src) or (src and src.startswith("data:")):
+            src = next((c for c in candidates if c and not c.strip().lower().startswith("data:")), None)
+            if not src:
                 srcset = attrs.get("srcset")
                 if srcset:
                     src = srcset.split(",")[0].strip().split(" ")[0]
@@ -792,6 +859,15 @@ def extract_main_html(page_html: str) -> str:
     return page_html
 
 
+# void 元素：没有结束标签，深度计数器不应为其 +1
+_VOID_TAGS_EXTRACTOR = frozenset(
+    {
+        "area", "base", "br", "col", "embed", "hr", "img", "input",
+        "link", "meta", "param", "source", "track", "wbr",
+    }
+)
+
+
 class _TargetSectionExtractor(HTMLParser):
     def __init__(self, *, target_id: Optional[str], target_class: Optional[str]):
         super().__init__(convert_charrefs=True)
@@ -800,6 +876,7 @@ class _TargetSectionExtractor(HTMLParser):
         self.depth = 0
         self.done = False
         self.buf: List[str] = []
+        self._raw_content_depth = 0  # script/style 内不转义 data
 
     @staticmethod
     def _attrs_to_str(attrs_list: Sequence[Tuple[str, Optional[str]]]) -> str:
@@ -829,14 +906,25 @@ class _TargetSectionExtractor(HTMLParser):
         if self.depth == 0:
             if not self._match(attrs):
                 return
+            if tag in _VOID_TAGS_EXTRACTOR:
+                # 目标容器本身是 void 元素（如 <img id="content">）：
+                # 没有结束标签，写入后立即结束，避免吞入后续内容
+                attr_str = self._attrs_to_str(attrs_list)
+                self.buf.append(f"<{tag} {attr_str}>" if attr_str else f"<{tag}>")
+                self.done = True
+                return
             self.depth = 1
-        else:
+        elif tag not in _VOID_TAGS_EXTRACTOR:
+            # void 元素（br/img/hr 等）没有结束标签，不能计入深度
             self.depth += 1
         attr_str = self._attrs_to_str(attrs_list)
         if attr_str:
             self.buf.append(f"<{tag} {attr_str}>")
         else:
             self.buf.append(f"<{tag}>")
+        # 进入 script/style 时不转义 data
+        if tag in ("script", "style"):
+            self._raw_content_depth += 1
 
     def handle_startendtag(self, tag: str, attrs_list: Sequence[Tuple[str, Optional[str]]]) -> None:
         if self.done:
@@ -847,6 +935,7 @@ class _TargetSectionExtractor(HTMLParser):
             if not self._match(attrs):
                 return
             self.done = True
+        # 自闭合标签（含 void 元素的 <br/> 写法）不改变深度
         attr_str = self._attrs_to_str(attrs_list)
         if attr_str:
             self.buf.append(f"<{tag} {attr_str}/>")
@@ -858,6 +947,8 @@ class _TargetSectionExtractor(HTMLParser):
             return
         tag = tag.lower()
         self.buf.append(f"</{tag}>")
+        if tag in ("script", "style") and self._raw_content_depth > 0:
+            self._raw_content_depth -= 1
         self.depth -= 1
         if self.depth == 0:
             self.done = True
@@ -865,7 +956,11 @@ class _TargetSectionExtractor(HTMLParser):
     def handle_data(self, data: str) -> None:
         if self.done or self.depth == 0 or not data:
             return
-        self.buf.append(htmllib.escape(data, quote=False))
+        # script/style CDATA 内容不转义（避免污染 math/tex 公式）
+        if self._raw_content_depth > 0:
+            self.buf.append(data)
+        else:
+            self.buf.append(htmllib.escape(data, quote=False))
 
 
 def extract_target_html(page_html: str, *, target_id: Optional[str], target_class: Optional[str]) -> Optional[str]:
@@ -1076,8 +1171,10 @@ def extract_links_from_html(
     seen = set()
     unique_links = []
     for url, text in parser.links:
-        if url not in seen:
-            seen.add(url)
+        # 去重前先剥离 fragment，避免同一页面因 #anchor 不同而重复抓取
+        base_url = urldefrag(url).url
+        if base_url not in seen:
+            seen.add(base_url)
             unique_links.append((url, text))
     return unique_links
 
@@ -1085,7 +1182,7 @@ def extract_links_from_html(
 def read_urls_file(filepath: str) -> List[Tuple[str, Optional[str]]]:
     urls: List[Tuple[str, Optional[str]]] = []
     try:
-        f = open(filepath, "r", encoding="utf-8")
+        f = open(filepath, "r", encoding="utf-8", errors="replace")
     except FileNotFoundError:
         print(f"错误：URL 文件不存在：{filepath}", file=sys.stderr)
         return urls

@@ -31,6 +31,62 @@ def is_probable_icon(url: str) -> bool:
     )
 
 
+def _is_cjk(ch: str) -> bool:
+    """判断单个字符是否为 CJK 字符（中文/日文/韩文）。"""
+    if not ch:
+        return False
+    cp = ord(ch)
+    return (
+        0x3400 <= cp <= 0x9FFF      # CJK Unified Ideographs + Ext A
+        or 0x3040 <= cp <= 0x30FF    # Hiragana + Katakana
+        or 0xAC00 <= cp <= 0xD7AF    # Hangul Syllables
+        or 0xFF00 <= cp <= 0xFFEF    # Fullwidth Forms
+    )
+
+
+def _extract_img_src(attrs: Dict[str, Optional[str]]) -> str:
+    """从 img/picture 的属性中提取真实图片 URL。
+
+    优先级：src/data-src/data-original/data-lazy-src → srcset 第一项。
+    自动跳过 ``data:`` 占位 URI（base64 透明像素等懒加载占位图），
+    回退到真实懒加载属性。
+    """
+    candidates = [
+        attrs.get("src"),
+        attrs.get("data-src"),
+        attrs.get("data-original"),
+        attrs.get("data-lazy-src"),
+    ]
+    src = next(
+        (c for c in candidates if c and not c.strip().lower().startswith("data:")),
+        None,
+    )
+    if not src:
+        srcset = attrs.get("srcset")
+        if srcset:
+            src = srcset.split(",")[0].strip().split(" ")[0]
+    return src or ""
+
+
+_UNSAFE_URL_RE = re.compile(r"^(?:javascript|vbscript|file):", re.IGNORECASE)
+
+
+def _is_unsafe_link_url(raw: str) -> bool:
+    """判断 href 值是否含可执行脚本的不安全协议。
+
+    浏览器会忽略 URL 中的 tab/newline 等控制字符（``java\\tscript:`` 等变体），
+    因此先剥离控制字符再匹配。``data:text/html`` 在 href 中可执行脚本，也拦截。
+    """
+    if not raw:
+        return False
+    v_stripped = re.sub(r"[\x00-\x20]+", "", raw).lower()
+    if _UNSAFE_URL_RE.match(v_stripped):
+        return True
+    if v_stripped.startswith("data:"):
+        return True
+    return False
+
+
 VOID_TAGS = {
     "area",
     "base",
@@ -61,6 +117,15 @@ SKIP_TAGS = {
     "svg",
     "video",
     "audio",
+}
+
+# 块级标签：用于检测未闭合的行内元素（如 katex span）是否越界
+_BLOCK_LEVEL_TAGS = {
+    "p", "div", "h1", "h2", "h3", "h4", "h5", "h6",
+    "ul", "ol", "li", "table", "thead", "tbody", "tr", "td", "th",
+    "blockquote", "pre", "hr", "section", "article", "header",
+    "footer", "main", "aside", "nav", "figure", "figcaption",
+    "details", "summary", "form", "fieldset",
 }
 
 
@@ -109,6 +174,7 @@ class HTMLToMarkdown(HTMLParser):
         self.in_a = False
         self.a_href: Optional[str] = None
         self.a_text: List[str] = []
+        self.a_has_image: bool = False  # <a> 内是否已输出图片
 
         self.list_stack: List[Dict[str, Union[int, str]]] = []
 
@@ -122,9 +188,6 @@ class HTMLToMarkdown(HTMLParser):
         self.table_a_href: Optional[str] = None
         self.table_a_text: List[str] = []
 
-        self.raw_table_mode = False
-        self.raw_table_buf: List[str] = []
-        self.raw_table_depth = 0
         self.table_capture_html = False
         self.table_capture_buf: List[str] = []
         self.table_capture_depth = 0
@@ -154,9 +217,16 @@ class HTMLToMarkdown(HTMLParser):
 
             if value is not None and low in ("href", "src", "xlink:href", "srcset"):
                 v = str(value).strip()
-                if re.match(r"(?i)^(?:javascript|vbscript):", v):
+                # 浏览器会忽略 URL 中的 tab/newline 等控制字符，
+                # 因此 java\tscript: 等变体也需拦截
+                v_stripped = re.sub(r"[\x00-\x20]+", "", v).lower()
+                if re.match(r"^(?:javascript|vbscript):", v_stripped):
                     continue
-                if low in ("src", "xlink:href") and v.lower().startswith("file:"):
+                # data: 协议在 href 中可执行脚本（data:text/html），
+                # 在 src 中仅 img/data:image 安全
+                if low == "href" and v_stripped.startswith("data:"):
+                    continue
+                if low in ("src", "xlink:href") and v_stripped.startswith("file:"):
                     continue
 
             if value is None:
@@ -250,15 +320,12 @@ class HTMLToMarkdown(HTMLParser):
                 text = text.lstrip()
         if self.out:
             prev = self._tail()[-1:]
-            if prev and prev not in ("\n", " ", "(", "[", "*", "`", "_") and text[:1] not in (
-                " ",
-                "\n",
-                ".",
-                ",",
-                ":",
-                ";",
-                ")",
-                "]",
+            if (
+                prev
+                and prev not in ("\n", " ", "(", "[", "*", "`", "_")
+                and text[:1] not in (" ", "\n", ".", ",", ":", ";", ")", "]")
+                # 两侧均为 CJK 字符时不插入空格（避免割裂中文/日文/韩文文本）
+                and not (_is_cjk(prev) and _is_cjk(text[:1]))
             ):
                 self.out.append(" ")
         self.out.append(text)
@@ -311,6 +378,12 @@ class HTMLToMarkdown(HTMLParser):
             if is_katex_display:
                 self.katex_display_depth += 1
 
+        # 未闭合的 katex span 会吞掉后续所有文本；
+        # 遇块级标签起始时强制归零（katex 是行内元素，不应跨块）
+        if self.katex_depth > 0 and tag in _BLOCK_LEVEL_TAGS:
+            self.katex_depth = 0
+            self.katex_display_depth = 0
+
         if self.skip_stack:
             if self._should_skip(tag, attrs):
                 self._enter_skip(tag)
@@ -339,9 +412,6 @@ class HTMLToMarkdown(HTMLParser):
             self.in_table = True
             self.table_depth = 1
             self.table_rows = []
-            self.raw_table_mode = False
-            self.raw_table_buf = []
-            self.raw_table_depth = 1
             self.table_capture_html = bool(self.keep_html)
             self.table_is_complex = False
             if self.table_capture_html:
@@ -351,16 +421,6 @@ class HTMLToMarkdown(HTMLParser):
                 else:
                     self.table_capture_buf = ["<table>"]
                 self.table_capture_depth = 1
-            return
-
-        if self.raw_table_mode:
-            attr_str = self._attrs_to_str(attrs_list)
-            if attr_str:
-                self.raw_table_buf.append(f"<{tag} {attr_str}>")
-            else:
-                self.raw_table_buf.append(f"<{tag}>")
-            if tag == "table":
-                self.raw_table_depth += 1
             return
 
         if self.in_table:
@@ -398,17 +458,13 @@ class HTMLToMarkdown(HTMLParser):
                     self.cell_buf.append("<br>")
             elif tag == "a" and self.in_cell:
                 self.table_in_a = True
-                self.table_a_href = attrs.get("href")
+                thref = attrs.get("href")
+                if thref and _is_unsafe_link_url(thref):
+                    thref = None
+                self.table_a_href = thref
                 self.table_a_text = []
             elif tag == "img" and self.in_cell:
-                src = (
-                    attrs.get("src")
-                    or attrs.get("data-src")
-                    or attrs.get("data-original")
-                    or attrs.get("data-lazy-src")
-                )
-                if (not src) and attrs.get("srcset"):
-                    src = attrs["srcset"].split(",")[0].strip().split(" ")[0]
+                src = _extract_img_src(attrs)
                 if src:
                     img_url = urljoin(self.base_url, htmllib.unescape(src))
                     if not is_probable_icon(img_url):
@@ -468,18 +524,20 @@ class HTMLToMarkdown(HTMLParser):
             self.out.append("*")
         elif tag == "a":
             self.in_a = True
-            self.a_href = attrs.get("href")
+            href = attrs.get("href")
+            # 拦截不安全协议（javascript:/vbscript:/file:/data:text/html 等，
+            # 含控制字符变体）——避免输出可执行链接
+            if href and _is_unsafe_link_url(href):
+                href = None
+            self.a_href = href
             self.a_text = []
+            self.a_has_image = False
         elif tag == "img":
-            src = (
-                attrs.get("src")
-                or attrs.get("data-src")
-                or attrs.get("data-original")
-                or attrs.get("data-lazy-src")
-            )
-            if (not src) and attrs.get("srcset"):
-                src = attrs["srcset"].split(",")[0].strip().split(" ")[0]
+            src = _extract_img_src(attrs)
             if not src:
+                return
+            # 跳过 data: URI，与 ImageURLCollector 行为一致
+            if src.strip().lower().startswith("data:"):
                 return
             img_url = urljoin(self.base_url, htmllib.unescape(src))
             if is_probable_icon(img_url):
@@ -489,15 +547,30 @@ class HTMLToMarkdown(HTMLParser):
             local = self.url_to_local.get(img_url, img_url)
             # Encode spaces/parens in URL for valid Markdown
             safe_url = _safe_markdown_url(local)
-            self._ensure_blank_line()
-            self.out.append(f"![{alt}]({safe_url})\n")
+            if self.in_a:
+                # 图片在 <a> 内：行内输出（不独占一行），标记已产出图片
+                self.a_has_image = True
+                self.out.append(f"![{alt}]({safe_url})")
+            else:
+                self._ensure_blank_line()
+                self.out.append(f"![{alt}]({safe_url})\n")
         elif tag in ("ul", "ol"):
             if self.list_stack:
                 if not self._tail().endswith("\n"):
                     self.out.append("\n")
             else:
                 self._ensure_blank_line()
-            self.list_stack.append({"type": tag, "n": 0})
+            # <ol start="5"> 支持自定义起始编号
+            start_n = 0
+            if tag == "ol":
+                attrs = dict(attrs_list)
+                start_val = attrs.get("start")
+                if start_val:
+                    try:
+                        start_n = int(start_val) - 1  # -1 因为 li 处理时会 +1
+                    except (ValueError, TypeError):
+                        pass
+            self.list_stack.append({"type": tag, "n": start_n})
         elif tag == "li":
             if self.list_stack:
                 if self.out and (not self._tail().endswith("\n")):
@@ -540,22 +613,6 @@ class HTMLToMarkdown(HTMLParser):
         if self.skip_stack:
             if tag == self.skip_stack[-1]:
                 self.skip_stack.pop()
-            return
-
-        if self.raw_table_mode:
-            if tag == "table":
-                self.raw_table_depth -= 1
-                if self.raw_table_depth <= 0:
-                    self.raw_table_buf.append("</table>")
-                    self.out.append("\n".join(self.raw_table_buf))
-                    self.out.append("\n\n")
-                    self.raw_table_mode = False
-                    self.raw_table_buf = []
-                    self.in_table = False
-                else:
-                    self.raw_table_buf.append("</table>")
-            elif tag not in VOID_TAGS:
-                self.raw_table_buf.append(f"</{tag}>")
             return
 
         if self.in_table:
@@ -694,8 +751,22 @@ class HTMLToMarkdown(HTMLParser):
         elif tag in ("em", "i"):
             self.out.append("*")
         elif tag == "a":
-            text = "".join(self.a_text).strip() or (self.a_href or "")
             href = self.a_href
+            text = "".join(self.a_text).strip()
+            has_image = self.a_has_image
+
+            # <a> 内仅含图片（无文本）：图片已行内输出，不再追加回退裸链接，
+            # 否则会多出一行 [https://host/page](https://host/page)。
+            if not text and has_image:
+                self.in_a = False
+                self.a_href = None
+                self.a_text = []
+                self.a_has_image = False
+                return
+
+            # 无文本也无图片时回退到 href 作为文本
+            if not text:
+                text = href or ""
 
             if href:
                 full = urljoin(self.base_url, href)
@@ -703,12 +774,14 @@ class HTMLToMarkdown(HTMLParser):
                     self.in_a = False
                     self.a_href = None
                     self.a_text = []
+                    self.a_has_image = False
                     return
 
             if text.lower() == "tag" and href and (href.startswith("#") or href.startswith(self.base_url + "#")):
                 self.in_a = False
                 self.a_href = None
                 self.a_text = []
+                self.a_has_image = False
                 return
 
             if href:
@@ -720,6 +793,7 @@ class HTMLToMarkdown(HTMLParser):
             self.in_a = False
             self.a_href = None
             self.a_text = []
+            self.a_has_image = False
         elif tag in ("ul", "ol"):
             if self.list_stack:
                 self.list_stack.pop()
@@ -731,10 +805,6 @@ class HTMLToMarkdown(HTMLParser):
 
     def handle_data(self, data: str) -> None:
         if self.skip_stack:
-            return
-        if self.raw_table_mode:
-            if data:
-                self.raw_table_buf.append(htmllib.escape(data))
             return
         if self.in_annotation_tex:
             self.annotation_buf.append(data or "")
@@ -771,6 +841,80 @@ class HTMLToMarkdown(HTMLParser):
         if self.in_heading:
             self.heading_text.append(data)
         self._append_text(data)
+
+
+def _is_fence_line(line: str) -> bool:
+    """判断一行是否是 Markdown 代码围栏（``` 或 ~~~）的起始/结束。"""
+    stripped = line.lstrip()
+    return stripped.startswith("```") or stripped.startswith("~~~")
+
+
+def _process_outside_code(md: str, fn) -> str:
+    """对 Markdown 文本逐行应用 *fn*，但跳过代码围栏（```/~~~）内的行。
+
+    *fn* 接收单行文本（含换行符），返回替换后的文本。
+    """
+    out_lines: List[str] = []
+    in_fence = False
+    for line in md.splitlines(True):
+        if _is_fence_line(line):
+            in_fence = not in_fence
+            out_lines.append(line)
+            continue
+        if in_fence:
+            out_lines.append(line)
+        else:
+            out_lines.append(fn(line))
+    return "".join(out_lines)
+
+
+def _demote_headings_outside_code(md: str, shift: int) -> str:
+    """将代码块外的 ATX 标题（# ~ ######）等级提升 *shift* 级（封顶 6）。
+
+    用于合并模式：把每页的 #..#### 下移以免与合并文档的顶层标题冲突。
+    代码围栏（```/~~~）内的 # 注释行不受影响。
+    """
+    pat = re.compile(r"^(#{1,6})(\s+)")
+
+    def _bump(line: str) -> str:
+        m = pat.match(line)
+        if not m:
+            return line
+        new_level = min(6, len(m.group(1)) + shift)
+        return "#" * new_level + m.group(2) + line[m.end():]
+
+    return _process_outside_code(md, _bump)
+
+
+def _strip_empty_headings_outside_code(md: str) -> str:
+    """删除代码块外只含井号、无文本的标题行（如 ``###`` 单独成行）。"""
+    return _process_outside_code(
+        md, lambda line: re.sub(r"^\s*#{1,6}\s*\n?$\n?", "", line)
+    )
+
+
+def _collapse_blank_lines_outside_code(md: str) -> str:
+    """把代码块外连续 3+ 空行折叠为 2 个空行（代码块内原样保留）。"""
+    out_lines: List[str] = []
+    in_fence = False
+    blank_run = 0
+    for line in md.splitlines(True):
+        if _is_fence_line(line):
+            in_fence = not in_fence
+            out_lines.append(line)
+            blank_run = 0
+            continue
+        if in_fence:
+            out_lines.append(line)
+            continue
+        if line.strip() == "":
+            blank_run += 1
+            if blank_run <= 2:
+                out_lines.append("\n" if line.endswith("\n") else "")
+        else:
+            blank_run = 0
+            out_lines.append(line)
+    return "".join(out_lines)
 
 
 def _convert_latex_delimiters_outside_code(md: str) -> str:
@@ -825,11 +969,19 @@ def html_to_markdown(article_html: str, base_url: str, url_to_local: Dict[str, s
     parser.feed(article_html)
     md = "".join(parser.out)
     md = md.replace("\r\n", "\n")
-    md = re.sub(r"\n{3,}", "\n\n", md)
-    md = re.sub(r"\n\s*/\s*\n", "\n\n", md)
+    # 以下后处理均在代码围栏（```/~~~）外执行，避免破坏代码块内容
+    md = _collapse_blank_lines_outside_code(md)
     md = _convert_latex_delimiters_outside_code(md)
-    md = re.sub(r"(?m)^\s*#{1,6}\s*$\n?", "", md)
-    md = re.sub(r"(?m)^(#{1,6}\s+.*?)(\s*\[\s*[#¶§]\s*\]\([^)]+\))+\s*$", r"\1", md)
+    md = _strip_empty_headings_outside_code(md)
+    # 标题尾部的锚点链接 [#](url) / [¶](url) 剥离（仅在代码块外）
+    md = _process_outside_code(
+        md,
+        lambda line: re.sub(
+            r"^(#{1,6}\s+.*?)(\s*\[\s*[#¶§]\s*\]\([^)]+\))+\s*$",
+            r"\1",
+            line,
+        ),
+    )
     return md.strip() + "\n"
 
 
@@ -866,22 +1018,42 @@ def strip_duplicate_h1(md_body: str, title: str, max_scan_lines: int = 80) -> st
 
 
 def clean_wechat_noise(md_content: str) -> str:
+    # 微信底部交互按钮（取消/允许/Cancel/Allow/Video/Share 等）的特征是
+    # 转成 Markdown 后**独占一行**（原本是独立 <a> 或按钮）。
+    # 因此所有清理规则都带行锚点 ^...$，避免误删正文句子中的同名词。
     result = md_content
+    # 行内交互按钮串：删除独占整行、仅由逗号/空格/这些词构成的行
     result = re.sub(
-        r"[,，\s]*(?:Video|Mini Program|Like|Wow|Share|Comment|Favorite|听过)\s*[,，]?\s*",
+        r"(?m)^[ \t,，]*(?:Video|Mini Program|Like|Wow|Share|Comment|Favorite|听过)"
+        r"(?:[ \t,，]*(?:Video|Mini Program|Like|Wow|Share|Comment|Favorite|听过))*[ \t,，]*$",
         "",
         result,
         flags=re.IGNORECASE,
     )
-    result = re.sub(r"[,，\s]*轻点两下取消(?:赞|在看)\s*", "", result)
+    # "取消赞"/"取消在看" 等长按提示——独占整行
+    result = re.sub(r"(?m)^[ \t,，]*轻点两下取消(?:赞|在看)[ \t,，]*$", "", result)
     result = re.sub(
-        r"(?:Scan to Follow|Scan with Weixin to\s*use this Mini Program|微信扫一扫可打开此内容.*?使用完整服务)\s*",
+        r"(?m)^[ \t,，]*(?:Scan to Follow|Scan with Weixin to\s*use this Mini Program"
+        r"|微信扫一扫可打开此内容.*?使用完整服务)[ \t,，]*$",
         "",
         result,
-        flags=re.IGNORECASE | re.DOTALL,
+        flags=re.IGNORECASE,
     )
-    result = re.sub(r"(?:Cancel|Allow|取消|允许)\s*", "", result, flags=re.IGNORECASE)
-    result = re.sub(r"(?:阅读原文|Read more|Read original)\s*", "", result, flags=re.IGNORECASE)
+    # Cancel/Allow/取消/允许 按钮文本——仅在独占整行时删除（纯文本或链接形式）
+    result = re.sub(
+        r"(?m)^[ \t,，]*(?:\[?(?:Cancel|Allow|取消|允许)\]?\]\([^)]*\)|Cancel|Allow|取消|允许)[ \t,，]*$",
+        "",
+        result,
+        flags=re.IGNORECASE,
+    )
+    # "阅读原文"/"Read more" 按钮链接——独占整行的纯文本或链接形式均清理
+    result = re.sub(
+        r"(?m)^[ \t,，]*(?:\[(?:阅读原文|Read more|Read original)\]\([^)]*\)"
+        r"|(?:阅读原文|Read more|Read original))[ \t,，]*$",
+        "",
+        result,
+        flags=re.IGNORECASE,
+    )
     result = re.sub(r"\n{3,}", "\n\n", result)
     result = re.sub(r"\n[ \t]+\n", "\n\n", result)
     return result.strip()
@@ -952,5 +1124,36 @@ def rewrite_internal_links(md_content: str, url_to_anchor: Dict[str, str]) -> Tu
 
         return match.group(0)
 
-    result = link_pattern.sub(replace_link, result)
+    # 按代码围栏分段，仅处理围栏外的部分（避免破坏代码示例中的链接）
+    fence_re = re.compile(r"^([`~]{3,})")
+    lines = result.split("\n")
+    parts: List[str] = []
+    in_fence = False
+    fence_char = ""
+    outside_buf: List[str] = []
+
+    def flush_outside() -> None:
+        if outside_buf:
+            parts.append(link_pattern.sub(replace_link, "\n".join(outside_buf)))
+            outside_buf.clear()
+
+    for line in lines:
+        m = fence_re.match(line.strip())
+        if m and (not in_fence or line.strip().startswith(fence_char * 3)):
+            # 围栏开/闭行
+            flush_outside()
+            if not in_fence:
+                in_fence = True
+                fence_char = m.group(1)[0]
+            else:
+                in_fence = False
+                fence_char = ""
+            parts.append(line)
+        elif in_fence:
+            parts.append(line)
+        else:
+            outside_buf.append(line)
+
+    flush_outside()
+    result = "\n".join(parts)
     return result, rewrite_count
