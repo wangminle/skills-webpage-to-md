@@ -118,6 +118,7 @@ from webpage_to_md.security import (
     validate_markdown,
 )
 from webpage_to_md.notion import fetch_notion_page, is_notion_url
+from webpage_to_md.huawei import fetch_huawei_doc, is_huawei_doc_url
 from webpage_to_md.ssr_extract import (
     SSRContent,
     collect_md_image_urls,
@@ -166,6 +167,30 @@ def process_single_url(
                 raise RuntimeError(
                     f"Notion API 提取失败: {e}（不会回退到普通 HTTP，"
                     f"因为 Notion 空壳页面无有效内容）"
+                ) from e
+
+        # ── 华为开发者文档 API 提取（Angular SPA，普通 HTTP 只有 JS 空壳）──
+        # --browser-fetch 显式指定浏览器抓取时不拦截，由下方 browser 分支渲染 SPA
+        if (
+            page_html is None
+            and not config.browser_fetch
+            and not config.no_huawei_api
+            and is_huawei_doc_url(url)
+        ):
+            try:
+                huawei_html, huawei_title = fetch_huawei_doc(
+                    url, timeout_s=config.timeout, retries=config.retries,
+                    max_html_bytes=config.max_html_bytes,
+                )
+                page_html = huawei_html
+                if not custom_title and huawei_title:
+                    custom_title = huawei_title
+            except Exception as e:
+                raise RuntimeError(
+                    f"华为文档 API 提取失败: {e}（不会回退到普通 HTTP，"
+                    f"因为 Angular SPA 空壳页面无有效内容；"
+                    f"可用浏览器另存该页后以 --local-html 导入（最可靠），"
+                    f"或尝试 --browser-fetch 渲染，该站 SPA 较慢可能超时）"
                 ) from e
 
         # 获取页面（非 Notion URL 走普通路径）
@@ -483,22 +508,44 @@ def _batch_main(args: argparse.Namespace) -> int:
         
         source_url = args.url
         print(f"正在从索引页提取链接：{args.url}")
-        
-        try:
-            if getattr(args, "browser_fetch", False):
-                print("使用浏览器获取索引页...")
-                index_html = browser_fetch_html(args.url, timeout_s=args.timeout)
-            else:
-                index_html = fetch_html(
-                    session=session,
-                    url=args.url,
-                    timeout_s=args.timeout,
-                    retries=args.retries,
+
+        # ── 华为开发者文档索引页：走 API 获取正文（含子页链接）──
+        # 普通 HTTP 只能拿到 Angular SPA 空壳（无链接可提取）。
+        # --browser-fetch 显式指定浏览器抓取时不拦截，由浏览器渲染索引页。
+        index_html: Optional[str] = None
+        if (
+            not getattr(args, "no_huawei_api", False)
+            and not getattr(args, "browser_fetch", False)
+            and is_huawei_doc_url(args.url)
+        ):
+            print("🔧 检测到华为开发者文档，通过 API 获取索引页内容...")
+            try:
+                index_html, _hw_title = fetch_huawei_doc(
+                    args.url, timeout_s=args.timeout, retries=args.retries,
                     max_html_bytes=args.max_html_bytes,
                 )
-        except Exception as e:
-            print(f"错误：无法获取索引页：{e}", file=sys.stderr)
-            return EXIT_ERROR
+            except Exception as e:
+                print(f"错误：华为文档 API 提取索引页失败: {e}", file=sys.stderr)
+                print("建议：用浏览器另存该页后以 --local-html 导入（最可靠）；"
+                      "或 --browser-fetch 渲染（该站 SPA 较慢，可能超时）。", file=sys.stderr)
+                return EXIT_ERROR
+
+        if index_html is None:
+            try:
+                if getattr(args, "browser_fetch", False):
+                    print("使用浏览器获取索引页...")
+                    index_html = browser_fetch_html(args.url, timeout_s=args.timeout)
+                else:
+                    index_html = fetch_html(
+                        session=session,
+                        url=args.url,
+                        timeout_s=args.timeout,
+                        retries=args.retries,
+                        max_html_bytes=args.max_html_bytes,
+                    )
+            except Exception as e:
+                print(f"错误：无法获取索引页：{e}", file=sys.stderr)
+                return EXIT_ERROR
 
         # 浏览器模式已通过 JS 挑战，无需重复检测
         if not getattr(args, "browser_fetch", False):
@@ -585,6 +632,7 @@ def _batch_main(args: argparse.Namespace) -> int:
         no_ssr=getattr(args, "no_ssr", False),
         browser_fetch=getattr(args, "browser_fetch", False),
         no_notion=getattr(args, "no_notion", False),
+        no_huawei_api=getattr(args, "no_huawei_api", False),
     )
     
     # Phase 2: 应用文档框架预设
@@ -998,11 +1046,19 @@ def _fetch_page_html(
 
 
 def _extract_title_for_filename(page_html: str, url: str = "",
-                                ssr_result: Optional[SSRContent] = None) -> str:
+                                ssr_result: Optional[SSRContent] = None,
+                                known_title: str = "") -> str:
     """从页面 HTML 中提取标题（用于自动命名文件）。
 
-    优先级：SSR 标题 > 微信标题 > H1 > <title> > "Untitled"
+    优先级：API 已知标题 > SSR 标题 > 微信标题 > H1 > <title> > "Untitled"
+
+    ``known_title`` 为站点接口（华为/Notion 等）直接返回的标题——当正文
+    HTML 恰好不含 <h1>/<title> 时，仅靠 HTML 会退化为 "Untitled"，
+    导致连续导出文件名冲突（甚至被 --overwrite 覆盖），故接口标题优先。
     """
+    # 接口返回的标题最权威（不依赖正文 HTML 的标题标签是否齐全）
+    if known_title and known_title.strip():
+        return known_title.strip()
     # SSR 提取的标题通常最准确（直接来自 API 数据）
     if ssr_result and ssr_result.title:
         return ssr_result.title
@@ -1096,6 +1152,9 @@ urls.txt 文件格式：
     # Notion 公开页面自动提取（默认启用）
     ap.add_argument("--no-notion", action="store_true", default=False,
                     help="禁用 Notion 公开页面自动检测与 API 提取")
+    # 华为开发者文档自动提取（默认启用）
+    ap.add_argument("--no-huawei-api", action="store_true", default=False,
+                    help="禁用华为开发者文档（developer.huawei.com）自动检测与 API 提取")
     ap.add_argument("--tags", help="Frontmatter 中的标签，逗号分隔，如 'tech,ai,tutorial'")
     # Cookie/Header 支持
     ap.add_argument("--cookie", help="Cookie 字符串，如 'session=abc; token=xyz'")
@@ -1257,6 +1316,10 @@ urls.txt 文件格式：
             base = args.out
         elif use_auto_title:
             # --auto-title 模式：先获取页面，提取标题后生成文件名
+            # 接口路径（Notion/华为）返回的标题是权威来源，供文件命名优先使用：
+            # 正文 HTML 不含 <h1>/<title> 时仅靠 HTML 会退化为 "Untitled"，
+            # 造成连续导出文件名冲突（--overwrite 时还会覆盖先前文档）。
+            _api_title = ""
             # Notion URL 走 API 路径
             if not getattr(args, "no_notion", False) and is_notion_url(url):
                 print(f"🔧 检测到 Notion 公开页面，通过 API 获取内容...")
@@ -1267,9 +1330,34 @@ urls.txt 文件格式：
                     page_html = notion_html
                     if notion_title:
                         args.title = args.title or notion_title
+                        _api_title = notion_title
                     print(f"  Notion 页面标题：{notion_title}")
                 except Exception as e:
                     print(f"错误：Notion API 提取失败: {e}", file=sys.stderr)
+                    return EXIT_ERROR
+            # 华为开发者文档 URL 走 API 路径（Angular SPA 空壳无标题可提取）；
+            # --browser-fetch 时不拦截，浏览器渲染后从页面提取标题
+            if (
+                page_html is None
+                and not getattr(args, "browser_fetch", False)
+                and not getattr(args, "no_huawei_api", False)
+                and is_huawei_doc_url(url)
+            ):
+                print(f"🔧 检测到华为开发者文档，通过 API 获取内容...")
+                try:
+                    huawei_html, huawei_title = fetch_huawei_doc(
+                        url, timeout_s=args.timeout, retries=args.retries,
+                        max_html_bytes=args.max_html_bytes,
+                    )
+                    page_html = huawei_html
+                    if huawei_title:
+                        args.title = args.title or huawei_title
+                        _api_title = huawei_title
+                    print(f"  华为文档标题：{huawei_title}")
+                except Exception as e:
+                    print(f"错误：华为文档 API 提取失败: {e}", file=sys.stderr)
+                    print("建议：用浏览器另存该页后以 --local-html 导入（最可靠）；"
+                          "或 --browser-fetch 渲染（该站 SPA 较慢，可能超时）。", file=sys.stderr)
                     return EXIT_ERROR
             if page_html is None:
                 session = _create_session(args, referer_url=url)
@@ -1280,7 +1368,8 @@ urls.txt 文件格式：
             _early_ssr: Optional[SSRContent] = None
             if not getattr(args, "no_ssr", False):
                 _early_ssr = try_ssr_extract(page_html, url)
-            _page_title = _extract_title_for_filename(page_html, url, ssr_result=_early_ssr)
+            _page_title = _extract_title_for_filename(
+                page_html, url, ssr_result=_early_ssr, known_title=_api_title)
             _auto_name = _sanitize_filename_part(_page_title)
             if len(_auto_name) > 80:
                 _auto_name = _auto_name[:80].rstrip("-")
@@ -1328,6 +1417,32 @@ urls.txt 文件格式：
             print(f"  Notion 页面标题：{notion_title}")
         except Exception as e:
             print(f"错误：Notion API 提取失败: {e}", file=sys.stderr)
+            return EXIT_ERROR
+
+    # ── 华为开发者文档自动检测（Angular SPA，普通 HTTP 只有 JS 空壳）──
+    # --browser-fetch 显式指定浏览器抓取时不拦截，浏览器可渲染 SPA
+    is_huawei = (
+        not args.local_html
+        and not getattr(args, "browser_fetch", False)
+        and not getattr(args, "no_huawei_api", False)
+        and page_html is None
+        and is_huawei_doc_url(url)
+    )
+    if is_huawei:
+        print(f"🔧 检测到华为开发者文档，通过 API 获取内容...")
+        try:
+            huawei_html, huawei_title = fetch_huawei_doc(
+                url, timeout_s=args.timeout, retries=args.retries,
+                max_html_bytes=args.max_html_bytes,
+            )
+            page_html = huawei_html
+            if not args.title and huawei_title:
+                args.title = huawei_title
+            print(f"  华为文档标题：{huawei_title}")
+        except Exception as e:
+            print(f"错误：华为文档 API 提取失败: {e}", file=sys.stderr)
+            print("建议：用浏览器另存该页后以 --local-html 导入（最可靠）；"
+                  "或 --browser-fetch 渲染（该站 SPA 较慢，可能超时）。", file=sys.stderr)
             return EXIT_ERROR
 
     # 创建 Session（如果尚未在 auto-title 流程中创建）

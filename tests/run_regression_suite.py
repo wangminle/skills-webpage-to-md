@@ -110,6 +110,25 @@ def _build_command(case: Case, output_dir: Path) -> tuple[List[str], Path]:
         "--best-effort-images",
     ]
 
+    if section.startswith("华为开发者文档") and "multi-devices_voice_experience" in url:
+        # 目录页：API 获取索引（含子页链接）→ crawl+merge 全部子页
+        cmd = [
+            sys.executable,
+            str(GRABBER),
+            url,
+            "--crawl",
+            "--crawl-pattern",
+            "design-guides-V1",
+            "--merge",
+            "--merge-output",
+            str(out_md),
+            "--download-images",
+            "--skip-errors",
+            "--overwrite",
+            "--validate",
+        ]
+        return cmd, out_md
+
     if section == "docs或wiki类多页面导出为单一md":
         if "metalmaniax.com" in url:
             cmd = [
@@ -195,6 +214,9 @@ def _evaluate(case: Case, exit_code: int, merged_output: str, out_md: Path) -> t
 
     if case.section == "Notion公开链接" and "Notion 页面标题" not in merged_output:
         return "WARN", "导出成功，但日志未看到 Notion API 标题提示", size
+
+    if case.section.startswith("华为开发者文档") and "检测到华为开发者文档" not in merged_output:
+        return "WARN", "导出成功，但日志未看到华为 API 适配提示（适配器可能未触发）", size
 
     if case.section == "docs或wiki类多页面导出为单一md" and "失败的 URL：" in merged_output:
         return "WARN", "合并成功，但存在部分子页面抓取失败", size
