@@ -72,4 +72,5 @@ class BatchConfig:
     force: bool = False  # 检测到 JS 反爬时强制继续
     no_ssr: bool = False  # 禁用 SSR 数据自动提取
     no_notion: bool = False  # 禁用 Notion 公开页面 API 提取
+    no_huawei_api: bool = False  # 禁用华为开发者文档 API 提取
     browser_fetch: bool = False  # 使用系统浏览器 headless 获取页面（绕过 Cloudflare 等 JS 反爬）

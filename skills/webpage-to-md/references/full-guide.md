@@ -1,6 +1,6 @@
 # Web to Markdown Grabber 完整参考手册
 
-> 当前版本：0.4.0
+> 当前版本：0.4.2
 
 > **命令说明**：文中使用 `python3` / `pip3`（macOS/Linux 默认），Windows 用户请替换为 `python` / `pip`。脚本兼容 Python 3.8+。
 
@@ -12,7 +12,7 @@
 - [安装](#安装)
 - [参数完整说明](#参数完整说明)（基础 / 网络 / HTTP / Frontmatter / 内容提取 / 导航剥离 / 批量 / 合并 / 爬取 / 安全）
 - [参数支持矩阵](#参数支持矩阵)
-- [使用场景](#使用场景)（单页 / 批量 / 爬取 / 内容过滤 / 反爬 / 微信 / Docs / SSR / Notion / 安全）
+- [使用场景](#使用场景)（单页 / 批量 / 爬取 / 内容过滤 / 反爬 / 微信 / Docs / SSR / Notion / 华为 / 安全）
 - [实战案例](#实战案例)（微信 / 博客 / Wiki）
 - [输出结构](#输出结构)
 - [技术细节](#技术细节)（模块化架构）
@@ -33,6 +33,8 @@
 **特定站点**：微信公众号（自动检测，支持传统长文 + 图文笔记/小绿书新格式）、Wiki 系统噪音清理
 
 **Notion 公开页面**：自动检测 `notion.so` 和 `*.notion.site` URL，通过内部 API 递归获取所有 Block 并转换为 HTML，支持标题/段落/列表/代码/引用/折叠/待办/图片等 Block 类型
+
+**华为开发者文档**：自动检测 `developer.huawei.com/consumer/{cn|en}/doc/` URL，通过站点自身 `getDocumentById` API 获取正文 HTML 与标题（Angular SPA 页面普通 HTTP 只有 JS 空壳），支持单页 / 批量 / 爬取合并三种模式
 
 **浏览器获取**：`--browser-fetch` 使用系统 Chrome/Edge headless 获取页面，绕过 JS 反爬（Cloudflare 等），无需额外 pip 依赖
 
@@ -121,6 +123,7 @@ pip3 install pytest
 | `--clean-wiki-noise` | 清理 Wiki 噪音 | `False` |
 | `--wechat` | 微信模式 | 自动 |
 | `--no-notion` | 禁用 Notion 公开页面 API 自动提取 | `False`（默认自动检测） |
+| `--no-huawei-api` | 禁用华为开发者文档 API 自动提取 | `False`（默认自动检测） |
 
 ### 导航剥离参数（Docs/Wiki 站点优化）
 
@@ -215,6 +218,7 @@ pip3 install pytest
 | `--crawl` | ❌ | ✅ | ✅ | 启用爬取模式 |
 | `--redact-url` | ✅ | ✅ | ✅ | URL 脱敏（仅影响输出文本） |
 | `--no-notion` | ✅ | ✅ | ✅ | 禁用 Notion 公开页面 API 提取 |
+| `--no-huawei-api` | ✅ | ✅ | ✅ | 禁用华为开发者文档 API 提取 |
 
 > **注意**：单页模式默认下载图片到 `<输出文件名>.assets/` 目录；批量模式默认保留原始图片 URL，需显式加 `--download-images` 才下载。
 
@@ -309,7 +313,7 @@ python3 scripts/grab_web_to_md.py URL --ua-preset firefox-win
 **JS Challenge 检测**：工具会自动识别 JavaScript 反爬保护（Cloudflare、Akamai 等），检测到时返回 exit code **4** 并提示使用 `--browser-fetch` 或 `--local-html`。
 
 **三层应对策略**（由工具自动/半自动处理）：
-1. **SSR/API 自动提取**：腾讯云、火山引擎、Notion 等——零配置
+1. **SSR/API 自动提取**：腾讯云、火山引擎、Notion、华为开发者文档等——零配置
 2. **`--browser-fetch` 浏览器获取**：适用于需要 JS 执行或基本 Cloudflare JS Challenge 的站点
 3. **`--local-html` 手动兜底**：适用于 Turnstile 等高级人机验证（headless 无法通过）
 
@@ -320,6 +324,7 @@ python3 scripts/grab_web_to_md.py URL --ua-preset firefox-win
 | 腾讯云开发者 | Next.js SSR | **自动处理**（SSR 提取） |
 | 火山引擎文档 | Modern.js SSR | **自动处理**（SSR 提取） |
 | Notion 公开页面 | SPA（无 SSR） | **自动处理**（Notion API 提取） |
+| 华为开发者文档 | Angular SPA（无 SSR） | **自动处理**（getDocumentById API 提取） |
 | 一般 JS 渲染站点 | 需要 JS 执行 | 使用 `--browser-fetch` |
 | Cloudflare JS Challenge | 基本 JS 验证 | 使用 `--browser-fetch` |
 | 知乎 | 高强度 JS | 先试 `--browser-fetch`，再试 `--local-html` |
@@ -471,7 +476,40 @@ python3 scripts/grab_web_to_md.py \
 >
 > **错误处理**：Notion API 提取失败时**不会**静默回退到普通 HTTP（因为 Notion 空壳 HTML 无内容），而是直接报错。
 
-### 场景 10：数据安全与隐私
+### 场景 10：华为开发者文档导出
+
+```bash
+# 单篇文档 — 自动检测 developer.huawei.com/consumer/{cn|en}/doc/ URL
+python3 scripts/grab_web_to_md.py \
+  "https://developer.huawei.com/consumer/cn/doc/design-guides-V1/multi-devices_voice_experience-0000001111151802-V1" \
+  --auto-title
+
+# 文档目录页：crawl 全部子页并合并为单文件
+python3 scripts/grab_web_to_md.py \
+  "https://developer.huawei.com/consumer/cn/doc/design-guides-V1/multi-devices_voice_experience-0000001111151802-V1" \
+  --crawl --crawl-pattern 'design-guides-V1' \
+  --merge --merge-output huawei_docs.md \
+  --download-images --validate
+
+# 禁用华为 API 自动检测
+python3 scripts/grab_web_to_md.py URL --no-huawei-api
+```
+
+**工作原理**：
+
+1. 检测到 `developer.huawei.com/consumer/{lang}/doc/{catalog}/{fileName}` URL 后，自动切换到华为文档 API 管线（Angular SPA，普通 HTTP 只能拿到 ~1.7KB JS 空壳，无 SSR 数据，`--browser-fetch` 也可能超时）
+2. 调用站点自身的 `documentPortal/getDocumentById` 接口：POST body 为 `{"objectId": fileName, "language": "cn"|"en"}`（fileName 即 URL 最后一段，自动剥离 query/fragment 与 `.md` 后缀——官方 llms.txt/MCP 索引使用 `xxx.md` 链接形式，objectId 不含后缀），无需 Cookie
+3. 返回 `value.title`（标题）与 `value.content.content`（正文 HTML），进入标准 HTML→Markdown 管线
+4. 单页 / 批量 / 爬取三种模式均支持：正文中的子页链接是同站绝对链接，目录页配合 `--crawl --merge` 可导出全部子页
+5. 图片为绝对 URL（communityfile CDN），由标准图片下载管线处理
+6. `--max-html-bytes` 对本 API 路径同样生效：响应以流式读取，先按 `Content-Length` 预判、再在分块累计中校验，超限立即中止（不重试），避免大响应完整载入内存
+7. `--auto-title` 命名优先使用接口返回的 `value.title`（其次才看正文 HTML 的 `<h1>`/`<title>`），因此正文 HTML 缺少标题标签时也不会退化为 `Untitled`
+
+**语言支持**：URL 中的 `/cn/`、`/en/` 段决定接口 `language` 参数（合法值仅 cn/en）；文档无对应语言版本时接口返回 404。
+
+> **错误处理**：华为 API 提取失败时**不会**静默回退到普通 HTTP（因为 Angular SPA 空壳无内容），而是直接报错并给出兜底建议——首选「浏览器另存页面后以 `--local-html` 导入」（最可靠），其次 `--browser-fetch`（该站 SPA 渲染较慢，实测 15s/60s 均可能超时）。预先携带 `--browser-fetch` 时会跳过 API 适配器，直接用浏览器渲染页面（标题也从渲染后的页面提取），此时报错文案里的 `--browser-fetch` 建议才真正可达。
+
+### 场景 11：数据安全与隐私
 
 ```bash
 # 默认行为：URL 脱敏开启，分享给他人时不会泄露 token/签名
@@ -631,18 +669,19 @@ output/
 
 ```
 scripts/
-├── grab_web_to_md.py       # CLI 入口（~1450 行）：参数解析 + 流程调度
+├── grab_web_to_md.py       # CLI 入口（~1730 行）：参数解析 + 流程调度
 └── webpage_to_md/          # 核心功能包
     ├── __init__.py          # 包入口，导出数据模型
-    ├── models.py            # 数据模型（~70 行）
-    ├── security.py          # URL 脱敏 / JS 检测 / 校验（~240 行）
-    ├── http_client.py       # HTTP 会话 + HTML 抓取 + 浏览器 headless 获取（~350 行）
-    ├── ssr_extract.py       # SSR 数据提取：Next.js/Modern.js（~260 行）
-    ├── notion.py            # Notion 公开页面 API 提取（~500 行）
-    ├── images.py            # 图片下载与路径替换（~500 行）
-    ├── extractors.py        # 正文提取 + 框架预设 + 导航剥离 + 微信异步提取（~1210 行）
-    ├── markdown_conv.py     # HTML→Markdown + 噪音清理（~940 行）
-    └── output.py            # 合并/分文件/索引/frontmatter（~450 行）
+    ├── models.py            # 数据模型（~76 行）
+    ├── security.py          # URL 脱敏 / JS 检测 / 校验（~270 行）
+    ├── http_client.py       # HTTP 会话 + HTML 抓取 + 浏览器 headless 获取（~490 行）
+    ├── ssr_extract.py       # SSR 数据提取：Next.js/Modern.js（~1090 行）
+    ├── notion.py            # Notion 公开页面 API 提取（~590 行）
+    ├── huawei.py            # 华为开发者文档 API 提取（~150 行）
+    ├── images.py            # 图片下载与路径替换（~535 行）
+    ├── extractors.py        # 正文提取 + 框架预设 + 导航剥离 + 微信异步提取（~1325 行）
+    ├── markdown_conv.py     # HTML→Markdown + 噪音清理（~1160 行）
+    └── output.py            # 合并/分文件/索引/frontmatter（~480 行）
 ```
 
 **依赖关系**（无循环依赖）：
@@ -667,13 +706,25 @@ output → markdown_conv, models, security
 
 ## 更新日志
 
+### v0.4.2 (2026-09-30)
+- ✅ **华为开发者文档适配**：新增 `huawei.py` 模块（~150 行），自动检测 `developer.huawei.com/consumer/{cn|en}/doc/` URL，通过站点自身 `documentPortal/getDocumentById` API 直接获取正文 HTML 与标题（该站为 Angular SPA，普通 HTTP 只有 ~1.7KB JS 空壳，无 SSR 数据）。单页 / 批量 / `--crawl --merge` 三种模式全覆盖，支持中英文档，无需 Cookie；支持官方 llms.txt/MCP 索引的 `xxx.md` 链接形式（objectId 自动剥离 `.md` 后缀，否则接口返回 code=92531031）；API 失败时直接报错并给出兜底建议，不静默回退空壳
+- ✅ **新增 `--no-huawei-api` 参数**：禁用华为开发者文档自动检测与 API 提取
+- ✅ **专项审查修复（BUG-055 P1 / BUG-056 P2）**：`.md` 后缀剥离修复后，原本 HTTP 直连 404 的 `.md` URL 也能经 API 正常导出（实测 12/12 图片本地化）；`--browser-fetch` 显式指定时跳过 API 适配器，使报错文案中的浏览器兜底建议真正可达
+- ✅ **专项审查修复（BUG-057 P2 / BUG-058 P2）**：`--auto-title` 改用接口返回的标题命名（正文 HTML 无 `<h1>`/`<title>` 时不再退化为 `Untitled/Untitled.md`，避免连续导出文件名冲突与 `--overwrite` 误覆盖）；华为 API 路径接入 `--max-html-bytes` 并改为流式读取，超限立即中止（修复前 10 字节上限对 579 字节正文完全失效）
+- ✅ **回归测试集扩充**：新增「华为开发者文档」场景（目录页 crawl+merge 全部 5 子页 + 内容子页单页导出 + 官方 llms.txt 的 `.md` 链接形式），执行器支持对应命令构造与 API 适配日志校验
+- ✅ **单元测试 199 → 231 项**：新增华为 URL 识别 / API 请求构造与错误处理 / 批量模式集成 / `.md` 后缀剥离 / `--browser-fetch` 跳过适配器（批量·单页·auto-title 三路径）/ 大小上限（超限·预判·0 不限制·上限传递）/ API 标题命名等用例
+
+### v0.4.1 (2026-08-07)
+- ✅ **全量代码审查与集中修复**：修复 9 个 P1（微信噪音误删正文、合并标题降级破坏代码块、void 元素深度泄漏、图片链接回退裸链接、Editor.js 崩溃、Quill 行级属性丢失、Notion 表格静默丢失、JS 反爬误判、browser-fetch noscript 误拦截）与 41 个 P2 边界问题（BUG-001~051，BUG-010 能力缺口遗留），详见 task-list.md
+- ✅ 测试基线 146 → 199 项全绿
+
 ### v0.4.0 (2026-05-20)
 - ✅ **发布版本对齐**：README、Skill 说明和完整手册统一标注当前版本为 `0.4.0`
 - ✅ **PDF 职责拆分**：移除内置 PDF 导出入口和维护代码，本 Skill 只负责生成 Markdown 与本地 assets；需要 PDF 时，先生成 Markdown，再交给 `pdf` skill 或专门的文档/PDF 工具转换
 - ✅ **回归测试行为收敛**：测试集缺失时直接报告失败原因，不再依赖 fallback 示例文件
 - ✅ **Skill 元数据规范化**：frontmatter 保持 `name` / `description` 两项，description 改为 `Use when...` 触发条件描述
 
-> 注：`0.4.0` 为当前 Skill 发布版本；下方 `v2.x` 为早期内部功能迭代记录。
+> 注：`0.4.2` 为当前 Skill 发布版本；下方 `v2.x` 为早期内部功能迭代记录。
 
 ### v2.2.0 (2026-04-10)
 - ✨ **`--browser-fetch` 浏览器获取模式**：

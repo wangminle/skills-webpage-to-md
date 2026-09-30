@@ -1,4 +1,5 @@
 import importlib.util
+import inspect
 import io
 import json
 import os
@@ -172,6 +173,30 @@ class TestAutoTitle(unittest.TestCase):
         html = "<html><body><p>无标题页面</p></body></html>"
         title = grab._extract_title_for_filename(html, "")
         self.assertEqual(title, "Untitled")
+
+    def test_extract_title_for_filename_known_title_wins(self):
+        """BUG-057：接口返回的标题优先于 HTML 中的 h1/<title>。"""
+        html = "<html><head><title>网页标题</title></head><body><h1>页面内标题</h1></body></html>"
+        title = grab._extract_title_for_filename(
+            html, "https://example.com/post", known_title="接口标题")
+        self.assertEqual(title, "接口标题")
+
+    def test_extract_title_for_filename_known_title_blank_falls_back(self):
+        """空/纯空白的 known_title 不应压掉 HTML 提取结果。"""
+        html = "<html><head><title>网页标题</title></head><body><h1>页面内标题</h1></body></html>"
+        for blank in ("", "   ", "\n"):
+            self.assertEqual(
+                grab._extract_title_for_filename(
+                    html, "https://example.com/post", known_title=blank),
+                "页面内标题")
+
+    def test_extract_title_for_filename_known_title_without_html_title(self):
+        """正文 HTML 无 h1/<title> 时用 known_title，而非退化为 Untitled。"""
+        html = "<html><body><p>正文没有标题标签</p></body></html>"
+        self.assertEqual(
+            grab._extract_title_for_filename(html, "", known_title="动效属性"),
+            "动效属性")
+        self.assertEqual(grab._extract_title_for_filename(html, ""), "Untitled")
 
     def test_auto_title_local_html(self):
         """--auto-title + --local-html 模式下使用标题命名"""
@@ -2400,6 +2425,447 @@ class TestP2BugFixes(unittest.TestCase):
         from webpage_to_md.images import sniff_ext
         xml_svg = b'<?xml version="1.0"?><svg xmlns="http://www.w3.org/2000/svg"><rect/></svg>'
         self.assertEqual(sniff_ext(xml_svg), ".svg")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 华为开发者文档适配器测试（DEV-012）
+# ═══════════════════════════════════════════════════════════════════════
+
+from webpage_to_md import huawei as huawei_mod
+from webpage_to_md.huawei import (
+    fetch_huawei_doc,
+    is_huawei_doc_url,
+    parse_huawei_doc_url,
+)
+
+
+class TestHuaweiURLDetection(unittest.TestCase):
+    def test_huawei_url_positive(self):
+        self.assertTrue(is_huawei_doc_url(
+            "https://developer.huawei.com/consumer/cn/doc/design-guides-V1/multi-devices_voice_experience-0000001111151802-V1"))
+        self.assertTrue(is_huawei_doc_url(
+            "https://developer.huawei.com/consumer/en/doc/HarmonyOS-Guides/application-dev-guide-0000001825432533-ENN"))
+
+    def test_huawei_url_with_query_fragment(self):
+        """带 query/fragment 的 URL 应识别，且 fileName 剥离 query/fragment。"""
+        url = ("https://developer.huawei.com/consumer/cn/doc/design-guides-V1/"
+               "multi-devices_voice_experience-0000001111151802-V1?catalogVersion=V1#top")
+        self.assertTrue(is_huawei_doc_url(url))
+        lang, file_name = parse_huawei_doc_url(url)
+        self.assertEqual(lang, "cn")
+        self.assertEqual(file_name, "multi-devices_voice_experience-0000001111151802-V1")
+
+    def test_huawei_url_trailing_slash(self):
+        url = "https://developer.huawei.com/consumer/cn/doc/design-guides-V1/some-doc-V1/"
+        lang, file_name = parse_huawei_doc_url(url)
+        self.assertEqual((lang, file_name), ("cn", "some-doc-V1"))
+
+    def test_huawei_url_negative(self):
+        """非文档路径、其他域名、缺 fileName 的 URL 不应识别。"""
+        for url in [
+            "https://developer.huawei.com/consumer/cn/",  # 非文档路径
+            "https://developer.huawei.com/consumer/cn/doc",  # /doc 后无内容
+            "https://developer.huawei.com/consumer/cn/doc/design-guides-V1",  # 仅 catalog 无 fileName
+            "https://www.huawei.com/cn/phones",
+            "https://notion.so/page-abcdef0123456789abcdef0123456789",
+            "https://example.com/consumer/cn/doc/a/b",
+            "",
+        ]:
+            self.assertFalse(is_huawei_doc_url(url), url)
+
+    def test_huawei_url_language_parsing(self):
+        lang, _ = parse_huawei_doc_url(
+            "https://developer.huawei.com/consumer/en/doc/HarmonyOS-Guides/guide-0000001234567890-ENN")
+        self.assertEqual(lang, "en")
+
+    def test_huawei_url_md_suffix_stripped(self):
+        """BUG-055：官方 llms.txt 索引的 .md 后缀链接应识别，且 fileName 剥离 .md。
+
+        带 .md 后缀请求 API 会直接 document not found（objectId 不含后缀）。
+        """
+        url = ("https://developer.huawei.com/consumer/cn/doc/design-guides-V1/"
+               "animation-attributes-0000001797117229.md")
+        self.assertTrue(is_huawei_doc_url(url))
+        lang, file_name = parse_huawei_doc_url(url)
+        self.assertEqual((lang, file_name),
+                         ("cn", "animation-attributes-0000001797117229"))
+
+
+class _FakeHuaweiResponse:
+    """模拟 requests.post 的响应对象。
+
+    ``content_length=None`` 表示不返回 Content-Length 头（走流式累计校验
+    分支）；显式传入则用于验证 Content-Length 预判分支。
+    """
+
+    def __init__(self, status_code=200, json_data=None, content_type="application/json",
+                 raw_body=None, content_length=None):
+        self.status_code = status_code
+        self._json_data = json_data
+        self.headers = {"Content-Type": content_type}
+        if raw_body is None and json_data is not None:
+            raw_body = json.dumps(json_data, ensure_ascii=False).encode("utf-8")
+        self._raw_body = raw_body if raw_body is not None else b""
+        if content_length is not None:
+            self.headers["Content-Length"] = str(content_length)
+        self.closed = False
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise RuntimeError(f"HTTP {self.status_code}")
+
+    def json(self):
+        if self._json_data is None:
+            raise ValueError("no json")
+        return self._json_data
+
+    def iter_content(self, chunk_size=1):
+        step = max(1, chunk_size)
+        for i in range(0, len(self._raw_body), step):
+            yield self._raw_body[i:i + step]
+
+    def close(self):
+        self.closed = True
+
+
+def _huawei_success_payload():
+    return {
+        "code": 0,
+        "message": "success",
+        "value": {
+            "title": "多设备下的语音体验",
+            "content": {"type": "html", "content": "<html><body><h1>多设备下的语音体验</h1><p>正文内容</p></body></html>"},
+        },
+    }
+
+
+class TestHuaweiFetchDoc(unittest.TestCase):
+    def _patch_post(self, response, calls=None):
+        def _fake_post(url, json=None, headers=None, timeout=None, stream=None):
+            if calls is not None:
+                calls.append({"url": url, "json": json, "stream": stream})
+            return response
+        return unittest.mock.patch("webpage_to_md.huawei.requests.post", side_effect=_fake_post)
+
+    def test_success(self):
+        calls = []
+        with self._patch_post(_FakeHuaweiResponse(json_data=_huawei_success_payload()), calls):
+            html, title = fetch_huawei_doc(
+                "https://developer.huawei.com/consumer/cn/doc/design-guides-V1/doc-0000001111151802-V1")
+        self.assertEqual(title, "多设备下的语音体验")
+        self.assertIn("<h1>", html)
+        # 请求参数：objectId 为 URL 最后一段，language 从 URL 语言段推导
+        self.assertEqual(calls[0]["json"], {"objectId": "doc-0000001111151802-V1", "language": "cn"})
+
+    def test_language_from_url_segment(self):
+        calls = []
+        with self._patch_post(_FakeHuaweiResponse(json_data=_huawei_success_payload()), calls):
+            fetch_huawei_doc(
+                "https://developer.huawei.com/consumer/en/doc/HarmonyOS-Guides/guide-0000001234567890-ENN")
+        self.assertEqual(calls[0]["json"]["language"], "en")
+
+    def test_query_stripped_from_object_id(self):
+        """objectId 必须剥离 query（接口会直接 document not found）。"""
+        calls = []
+        with self._patch_post(_FakeHuaweiResponse(json_data=_huawei_success_payload()), calls):
+            fetch_huawei_doc(
+                "https://developer.huawei.com/consumer/cn/doc/design-guides-V1/doc-0000001111151802-V1?catalogVersion=V1")
+        self.assertEqual(calls[0]["json"]["objectId"], "doc-0000001111151802-V1")
+
+    def test_md_suffix_stripped_from_object_id(self):
+        """BUG-055：llms.txt 的 .md 链接剥离后缀后再请求 API。"""
+        calls = []
+        with self._patch_post(_FakeHuaweiResponse(json_data=_huawei_success_payload()), calls):
+            fetch_huawei_doc(
+                "https://developer.huawei.com/consumer/cn/doc/design-guides-V1/animation-attributes-0000001797117229.md")
+        self.assertEqual(calls[0]["json"]["objectId"],
+                         "animation-attributes-0000001797117229")
+        self.assertEqual(calls[0]["json"]["language"], "cn")
+
+    def test_business_error_no_retry(self):
+        """code != 0 的业务错误是确定性失败，不应重试。"""
+        calls = []
+        resp = _FakeHuaweiResponse(json_data={"code": 92531031, "message": "document not found"})
+        with self._patch_post(resp, calls):
+            with self.assertRaises(RuntimeError) as ctx:
+                fetch_huawei_doc(
+                    "https://developer.huawei.com/consumer/cn/doc/design-guides-V1/missing-0000001111151899-V1",
+                    retries=3)
+        self.assertIn("92531031", str(ctx.exception))
+        self.assertEqual(len(calls), 1)  # 不重试
+
+    def test_404_html_page(self):
+        """文档无对应语言版本时接口返回 404 HTML 页。"""
+        calls = []
+        resp = _FakeHuaweiResponse(status_code=404, content_type="text/html")
+        with self._patch_post(resp, calls):
+            with self.assertRaises(RuntimeError) as ctx:
+                fetch_huawei_doc(
+                    "https://developer.huawei.com/consumer/cn/doc/design-guides-V1/doc-0000001111151802-V1",
+                    retries=3)
+        self.assertIn("404", str(ctx.exception))
+        self.assertEqual(len(calls), 1)
+
+    def test_non_json_response(self):
+        """200 + HTML 错误页（非 JSON）应报错且不重试。"""
+        calls = []
+        resp = _FakeHuaweiResponse(content_type="text/html")
+        with self._patch_post(resp, calls):
+            with self.assertRaises(RuntimeError) as ctx:
+                fetch_huawei_doc(
+                    "https://developer.huawei.com/consumer/cn/doc/design-guides-V1/doc-0000001111151802-V1",
+                    retries=3)
+        self.assertIn("非 JSON", str(ctx.exception))
+        self.assertEqual(len(calls), 1)
+
+    def test_empty_content(self):
+        """code=0 但正文为空应报错。"""
+        payload = {"code": 0, "value": {"title": "t", "content": {"type": "html", "content": ""}}}
+        calls = []
+        with self._patch_post(_FakeHuaweiResponse(json_data=payload), calls):
+            with self.assertRaises(RuntimeError):
+                fetch_huawei_doc(
+                    "https://developer.huawei.com/consumer/cn/doc/design-guides-V1/doc-0000001111151802-V1")
+        self.assertEqual(len(calls), 1)
+
+    def test_max_html_bytes_exceeded_no_retry(self):
+        """BUG-058：API 路径同样执行大小上限，且超限为确定性失败不重试。"""
+        calls = []
+        resp = _FakeHuaweiResponse(json_data=_huawei_success_payload())
+        with self._patch_post(resp, calls):
+            with self.assertRaises(RuntimeError) as ctx:
+                fetch_huawei_doc(
+                    "https://developer.huawei.com/consumer/cn/doc/design-guides-V1/doc-0000001111151802-V1",
+                    retries=3, max_html_bytes=10)
+        self.assertIn("响应过大", str(ctx.exception))
+        self.assertEqual(len(calls), 1)  # 不重试
+        self.assertTrue(resp.closed)  # 提前中止后应释放连接
+
+    def test_max_html_bytes_content_length_precheck(self):
+        """Content-Length 超限时在读取正文前即报错。"""
+        calls = []
+        resp = _FakeHuaweiResponse(
+            json_data=_huawei_success_payload(), content_length=999999)
+        with self._patch_post(resp, calls):
+            with self.assertRaises(RuntimeError) as ctx:
+                fetch_huawei_doc(
+                    "https://developer.huawei.com/consumer/cn/doc/design-guides-V1/doc-0000001111151802-V1",
+                    retries=3, max_html_bytes=1024)
+        self.assertIn("Content-Length", str(ctx.exception))
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(resp.closed)
+
+    def test_max_html_bytes_zero_means_unlimited(self):
+        """max_html_bytes=0 表示不限制（与 --max-html-bytes 语义一致）。"""
+        calls = []
+        resp = _FakeHuaweiResponse(json_data=_huawei_success_payload())
+        with self._patch_post(resp, calls):
+            html, title = fetch_huawei_doc(
+                "https://developer.huawei.com/consumer/cn/doc/design-guides-V1/doc-0000001111151802-V1",
+                max_html_bytes=0)
+        self.assertEqual(title, "多设备下的语音体验")
+        self.assertIn("<h1>", html)
+
+    def test_max_html_bytes_under_limit_passes(self):
+        """未超限时正常返回，且流式读取生效（stream=True）。"""
+        calls = []
+        resp = _FakeHuaweiResponse(json_data=_huawei_success_payload())
+        with self._patch_post(resp, calls):
+            html, title = fetch_huawei_doc(
+                "https://developer.huawei.com/consumer/cn/doc/design-guides-V1/doc-0000001111151802-V1",
+                max_html_bytes=1024 * 1024)
+        self.assertEqual(title, "多设备下的语音体验")
+        self.assertIn("<h1>", html)
+        self.assertIs(calls[0]["stream"], True)
+
+    def test_max_html_bytes_uses_http_client_default(self):
+        """默认上限与 --max-html-bytes 默认值（10MB）保持一致。"""
+        self.assertEqual(
+            inspect.signature(fetch_huawei_doc).parameters["max_html_bytes"].default,
+            huawei_mod._DEFAULT_MAX_HTML_BYTES)
+
+    def test_network_error_retries(self):
+        """网络错误应重试后失败。"""
+        calls = []
+
+        def _flaky_post(url, json=None, headers=None, timeout=None, stream=None):
+            calls.append(url)
+            raise ConnectionError("network down")
+
+        with unittest.mock.patch("webpage_to_md.huawei.requests.post", side_effect=_flaky_post):
+            with unittest.mock.patch("webpage_to_md.huawei.time.sleep"):
+                with self.assertRaises(RuntimeError):
+                    fetch_huawei_doc(
+                        "https://developer.huawei.com/consumer/cn/doc/design-guides-V1/doc-0000001111151802-V1",
+                        retries=3)
+        self.assertEqual(len(calls), 3)
+
+    def test_not_huawei_url(self):
+        with self.assertRaises(RuntimeError):
+            fetch_huawei_doc("https://example.com/doc/a/b")
+
+
+class TestHuaweiBatchIntegration(unittest.TestCase):
+    """批量模式：华为文档 URL 应走 API 适配器而非普通 HTTP。"""
+
+    _HW_URL = ("https://developer.huawei.com/consumer/cn/doc/design-guides-V1/"
+               "multi-devices_voice_experience-0000001111151802-V1")
+
+    def test_batch_uses_huawei_api(self):
+        config = grab.BatchConfig(download_images=False, no_ssr=True, force=True)
+        fake_html = ('<html><head><title>多设备下的语音体验</title></head><body>'
+                     '<h1>多设备下的语音体验</h1>'
+                     '<p>这是华为文档的正文内容，需要足够的长度来通过提取验证。</p></body></html>')
+        with unittest.mock.patch.object(
+                grab, "fetch_huawei_doc", return_value=(fake_html, "多设备下的语音体验")) as m:
+            with unittest.mock.patch.object(grab, "fetch_html") as fetch_html_mock:
+                result = grab.process_single_url(
+                    session=object(), url=self._HW_URL, config=config)
+        self.assertTrue(result.success, result.error)
+        self.assertEqual(result.title, "多设备下的语音体验")
+        m.assert_called_once()
+        fetch_html_mock.assert_not_called()  # 不应回退普通 HTTP
+
+    def test_batch_forwards_max_html_bytes(self):
+        """BUG-058：批量路径把 --max-html-bytes 传入华为 API 适配器。"""
+        config = grab.BatchConfig(download_images=False, no_ssr=True, force=True,
+                                  max_html_bytes=4096)
+        fake_html = ('<html><head><title>多设备下的语音体验</title></head><body>'
+                     '<h1>多设备下的语音体验</h1>'
+                     '<p>这是华为文档的正文内容，需要足够的长度来通过提取验证。</p></body></html>')
+        with mock.patch.object(
+                grab, "fetch_huawei_doc", return_value=(fake_html, "多设备下的语音体验")) as m:
+            grab.process_single_url(session=object(), url=self._HW_URL, config=config)
+        self.assertEqual(m.call_args.kwargs.get("max_html_bytes"), 4096)
+
+    def test_auto_title_uses_huawei_api_title(self):
+        """BUG-057：正文 HTML 无 h1/<title> 时用 API 标题命名，而非 Untitled。"""
+        api_html = ('<html><body>'
+                    '<p>这是华为文档的正文内容，需要足够的长度来通过提取验证。</p>'
+                    '<p>第二段正文内容，确保正文长度达到提取阈值。</p>'
+                    '</body></html>')
+        with tempfile.TemporaryDirectory() as td:
+            original_cwd = os.getcwd()
+            try:
+                os.chdir(td)
+                out_buf = io.StringIO()
+                err_buf = io.StringIO()
+                with mock.patch.object(
+                        grab, "fetch_huawei_doc",
+                        return_value=(api_html, "动效属性")) as hw_mock:
+                    with redirect_stdout(out_buf), redirect_stderr(err_buf):
+                        code = grab.main([
+                            self._HW_URL,
+                            "--auto-title",
+                            "--overwrite",
+                            "--no-map-json",
+                        ])
+                self.assertEqual(code, grab.EXIT_SUCCESS, err_buf.getvalue())
+                self.assertTrue(
+                    os.path.isfile(os.path.join("动效属性", "动效属性.md")),
+                    f"Expected 动效属性/动效属性.md. Files: {os.listdir(td)}")
+                self.assertNotIn("Untitled", out_buf.getvalue())
+                # 单页路径同样把大小上限传给适配器
+                self.assertEqual(hw_mock.call_args.kwargs.get("max_html_bytes"),
+                                 grab._DEFAULT_MAX_HTML_BYTES)
+            finally:
+                os.chdir(original_cwd)
+
+    def test_batch_no_huawei_api_flag(self):
+        """--no-huawei-api 时应走普通 HTTP 路径。"""
+        config = grab.BatchConfig(download_images=False, no_ssr=True, force=True,
+                                  no_huawei_api=True)
+        fake_html = ('<html><head><title>普通页面</title></head><body>'
+                     '<h1>普通页面</h1><p>这是普通 HTTP 抓取的正文内容，需要足够的长度。</p></body></html>')
+        with unittest.mock.patch.object(grab, "fetch_huawei_doc") as hw_mock:
+            with unittest.mock.patch.object(grab, "fetch_html", return_value=fake_html):
+                result = grab.process_single_url(
+                    session=object(), url=self._HW_URL, config=config)
+        self.assertTrue(result.success, result.error)
+        hw_mock.assert_not_called()
+
+    def test_batch_huawei_api_failure(self):
+        """API 失败应报错（不静默回退到 SPA 空壳）。"""
+        config = grab.BatchConfig(download_images=False, no_ssr=True, force=True)
+        with unittest.mock.patch.object(
+                grab, "fetch_huawei_doc",
+                side_effect=RuntimeError("华为文档接口错误（code=92531031）：document not found")):
+            with unittest.mock.patch.object(grab, "fetch_html") as fetch_html_mock:
+                result = grab.process_single_url(
+                    session=object(), url=self._HW_URL, config=config)
+        self.assertFalse(result.success)
+        self.assertIn("华为", result.error or "")
+        fetch_html_mock.assert_not_called()
+        # BUG-056：兜底建议须指向真实可达的动作（该站 SPA 浏览器渲染实测会超时）
+        self.assertIn("--local-html", result.error or "")
+        self.assertIn("--browser-fetch", result.error or "")
+
+    def test_batch_browser_fetch_skips_huawei_api(self):
+        """BUG-056：--browser-fetch 显式指定浏览器抓取时，不应被华为 API 适配器拦截。"""
+        config = grab.BatchConfig(download_images=False, no_ssr=True, force=True,
+                                  browser_fetch=True)
+        fake_html = ('<html><head><title>渲染页</title></head><body>'
+                     '<h1>渲染页</h1><p>这是浏览器渲染后的正文内容，需要足够的长度。</p></body></html>')
+        with unittest.mock.patch.object(grab, "fetch_huawei_doc") as hw_mock:
+            with unittest.mock.patch.object(
+                    grab, "browser_fetch_html", return_value=fake_html) as bf_mock:
+                result = grab.process_single_url(
+                    session=object(), url=self._HW_URL, config=config)
+        self.assertTrue(result.success, result.error)
+        hw_mock.assert_not_called()
+        bf_mock.assert_called_once()
+
+    def test_single_page_browser_fetch_skips_huawei_api(self):
+        """BUG-056：单页模式 --browser-fetch 时华为 URL 应走浏览器而非 API。"""
+        with tempfile.TemporaryDirectory() as td:
+            out_md = os.path.join(td, "out.md")
+            fake_html = ('<html><head><title>渲染页</title></head><body>'
+                         '<h1>渲染页</h1><p>这是浏览器渲染后的正文内容，需要足够的长度。</p></body></html>')
+            with mock.patch.object(grab, "fetch_huawei_doc") as hw_mock:
+                with mock.patch.object(
+                        grab, "browser_fetch_html", return_value=fake_html) as bf_mock:
+                    out_buf = io.StringIO()
+                    err_buf = io.StringIO()
+                    with redirect_stdout(out_buf), redirect_stderr(err_buf):
+                        code = grab.main([
+                            self._HW_URL,
+                            "--out", out_md,
+                            "--overwrite",
+                            "--no-map-json",
+                            "--browser-fetch",
+                        ])
+            self.assertEqual(code, grab.EXIT_SUCCESS, err_buf.getvalue())
+            hw_mock.assert_not_called()
+            bf_mock.assert_called_once()
+
+    def test_auto_title_browser_fetch_skips_huawei_api(self):
+        """BUG-056：--auto-title + --browser-fetch 时华为 URL 不走 API，标题取自渲染页。"""
+        fake_html = ('<html><head><title>渲染页</title></head><body>'
+                     '<h1>渲染页标题</h1><p>这是浏览器渲染后的正文内容，需要足够的长度。</p></body></html>')
+        with tempfile.TemporaryDirectory() as td:
+            original_cwd = os.getcwd()
+            try:
+                os.chdir(td)
+                with mock.patch.object(grab, "fetch_huawei_doc") as hw_mock:
+                    with mock.patch.object(
+                            grab, "browser_fetch_html", return_value=fake_html) as bf_mock:
+                        out_buf = io.StringIO()
+                        err_buf = io.StringIO()
+                        with redirect_stdout(out_buf), redirect_stderr(err_buf):
+                            code = grab.main([
+                                self._HW_URL,
+                                "--auto-title",
+                                "--overwrite",
+                                "--no-map-json",
+                                "--browser-fetch",
+                            ])
+                self.assertEqual(code, grab.EXIT_SUCCESS, err_buf.getvalue())
+                hw_mock.assert_not_called()
+                bf_mock.assert_called_once()
+                self.assertIn("自动标题命名", out_buf.getvalue())
+                self.assertIn("渲染页标题", out_buf.getvalue())
+            finally:
+                os.chdir(original_cwd)
 
 
 if __name__ == "__main__":

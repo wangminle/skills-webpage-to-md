@@ -2,7 +2,7 @@
 
 一个功能强大的 Python 工具，用于抓取网页并转换为干净的 Markdown 格式。
 
-> 当前版本：0.4.0
+> 当前版本：0.4.2
 
 ## 功能特性
 
@@ -13,6 +13,7 @@
 - ✅ **特定站点**：微信公众号（自动检测，支持传统长文 + 图文笔记/小绿书新格式）、Wiki 噪音清理
 - ✅ **SSR 数据提取**：自动从 Next.js / Modern.js 的 SSR 数据中提取正文（腾讯云开发者、火山引擎文档等）
 - ✅ **Notion 公开页面**：自动检测 Notion URL（`notion.so` 和 `*.notion.site`），通过内部 API 递归获取全部 Block 并转换（无需浏览器）
+- ✅ **华为开发者文档**：自动检测 `developer.huawei.com` 文档 URL，通过站点自身 `getDocumentById` API 直接提取正文与标题（Angular SPA 页面无需浏览器），支持单页 / 批量 / 爬取合并
 - ✅ **通用 JSON 富文本转换**：兼容 ProseMirror / Slate / Editor.js / Lexical / Quill Delta 五种 Schema，零依赖自动兜底
 - ✅ **浏览器获取模式**：`--browser-fetch` 调用系统 Chrome/Edge headless 绕过 JS 反爬（无需额外 pip 依赖）
 - ✅ **反爬支持**：Cookie/Header/UA 定制
@@ -136,6 +137,26 @@ python3 skills/webpage-to-md/scripts/grab_web_to_md.py \
   "https://www.notion.so/Page-ID" --no-notion
 ```
 
+### 华为开发者文档导出示例
+
+```bash
+# 单篇文档 — 自动检测 developer.huawei.com/consumer/{cn|en}/doc/ URL
+python3 skills/webpage-to-md/scripts/grab_web_to_md.py \
+  "https://developer.huawei.com/consumer/cn/doc/design-guides-V1/multi-devices_voice_experience-0000001111151802-V1" \
+  --auto-title
+
+# 文档目录页：crawl 全部子页并合并为单文件
+python3 skills/webpage-to-md/scripts/grab_web_to_md.py \
+  "https://developer.huawei.com/consumer/cn/doc/design-guides-V1/multi-devices_voice_experience-0000001111151802-V1" \
+  --crawl --crawl-pattern 'design-guides-V1' \
+  --merge --merge-output huawei_docs.md \
+  --download-images --validate
+
+# 禁用华为 API 自动检测
+python3 skills/webpage-to-md/scripts/grab_web_to_md.py \
+  "https://developer.huawei.com/consumer/cn/doc/..." --no-huawei-api
+```
+
 ### 浏览器获取模式（JS 保护站点）
 
 ```bash
@@ -179,6 +200,7 @@ python3 skills/webpage-to-md/scripts/grab_web_to_md.py \
 | `--browser-fetch` | 使用系统 Chrome/Edge headless 获取页面（绕过 JS 反爬） | 全部 |
 | `--no-ssr` | 禁用 SSR 数据自动提取（默认启用） | 全部 |
 | `--no-notion` | 禁用 Notion 公开页面 API 自动提取 | 全部 |
+| `--no-huawei-api` | 禁用华为开发者文档 API 自动提取 | 全部 |
 
 ## 数据安全
 
@@ -230,13 +252,14 @@ skills-webpage-to-md/
 │       ├── SKILL.md                    # Skills 核心文件
 │       ├── scripts/
 │       │   ├── grab_web_to_md.py       # CLI 入口（参数解析 + 流程调度）
-│       │   └── webpage_to_md/          # 核心功能包（9 个子模块）
+│       │   └── webpage_to_md/          # 核心功能包（10 个子模块）
 │       │       ├── __init__.py         # 包入口，导出数据模型
 │       │       ├── models.py           # 数据模型（BatchConfig / BatchPageResult 等）
 │       │       ├── security.py         # URL 脱敏 / JS challenge 检测 / 校验
 │       │       ├── http_client.py      # HTTP 会话创建与 HTML 抓取
 │       │       ├── ssr_extract.py      # SSR 数据提取 + 通用 JSON 富文本转换
 │       │       ├── notion.py           # Notion 公开页面 API 提取（Block→HTML）
+│       │       ├── huawei.py           # 华为开发者文档 API 提取（getDocumentById）
 │       │       ├── images.py           # 图片下载、格式嗅探与路径替换
 │       │       ├── extractors.py       # 正文 / 标题 / 链接提取 + docs 框架预设 + 导航剥离
 │       │       ├── markdown_conv.py    # HTML→Markdown 转换 + 噪音清理 + 链接改写
@@ -255,15 +278,16 @@ skills-webpage-to-md/
 
 | 模块 | 行数 | 职责 |
 |------|------|------|
-| `models.py` | ~70 | 数据模型定义（BatchConfig、BatchPageResult、JSChallengeResult 等） |
-| `security.py` | ~240 | URL 脱敏、JS 反爬检测、Markdown 校验 |
-| `http_client.py` | ~350 | UA 预设、Session 创建、HTML 抓取（含重试/大小限制）、浏览器 headless 获取 |
-| `images.py` | ~500 | 图片下载（流式/跨域隔离）、格式嗅探、路径替换 |
-| `extractors.py` | ~1210 | 正文/标题/链接提取、10 种 Docs 框架预设、导航剥离、微信异步提取 |
-| `markdown_conv.py` | ~940 | HTML→Markdown 解析器、LaTeX 公式、表格、噪音清理 |
-| `ssr_extract.py` | ~530 | SSR 数据检测/提取 + 通用 JSON 富文本→HTML 转换器 + 两阶段兜底 |
-| `notion.py` | ~500 | Notion 公开页面 API 提取（Block 递归获取 + Block→HTML 转换） |
-| `output.py` | ~450 | Frontmatter 生成、合并/分文件/索引输出、锚点管理 |
+| `models.py` | ~76 | 数据模型定义（BatchConfig、BatchPageResult、JSChallengeResult 等） |
+| `security.py` | ~270 | URL 脱敏、JS 反爬检测、Markdown 校验 |
+| `http_client.py` | ~490 | UA 预设、Session 创建、HTML 抓取（含重试/大小限制）、浏览器 headless 获取 |
+| `images.py` | ~535 | 图片下载（流式/跨域隔离）、格式嗅探、路径替换 |
+| `extractors.py` | ~1325 | 正文/标题/链接提取、10 种 Docs 框架预设、导航剥离、微信异步提取 |
+| `markdown_conv.py` | ~1160 | HTML→Markdown 解析器、LaTeX 公式、表格、噪音清理 |
+| `ssr_extract.py` | ~1090 | SSR 数据检测/提取 + 通用 JSON 富文本→HTML 转换器 + 两阶段兜底 |
+| `notion.py` | ~590 | Notion 公开页面 API 提取（Block 递归获取 + Block→HTML 转换） |
+| `huawei.py` | ~150 | 华为开发者文档 API 提取（URL 识别 + getDocumentById 调用） |
+| `output.py` | ~480 | Frontmatter 生成、合并/分文件/索引输出、锚点管理 |
 
 依赖关系：`models` ← `security` ← `markdown_conv` / `images` / `output`，无循环依赖。
 

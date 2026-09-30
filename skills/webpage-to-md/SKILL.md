@@ -1,13 +1,13 @@
 ---
 name: webpage-to-md
-description: "Use when saving web articles, WeChat posts, public Notion pages, Wiki/Docs sites, or JS-protected pages as Markdown with local images; batch crawling and merging URL lists; downloading webpage images; or converting HTML tables, code blocks, and rich text into clean Markdown."
+description: "Use when saving web articles, WeChat posts, public Notion pages, Huawei developer docs, Wiki/Docs sites, or JS-protected pages as Markdown with local images; batch crawling and merging URL lists; downloading webpage images; or converting HTML tables, code blocks, and rich text into clean Markdown."
 ---
 
 # Web to Markdown Grabber
 
 Extract web content and convert to clean Markdown with local images.
 
-Current version: 0.4.0.
+Current version: 0.4.2.
 
 ## Script Location
 
@@ -16,12 +16,13 @@ This skill uses a modular Python package:
 ```
 scripts/
 ├── grab_web_to_md.py       # CLI entry point (argument parsing + orchestration)
-└── webpage_to_md/          # Core package (9 submodules)
+└── webpage_to_md/          # Core package (10 submodules)
     ├── models.py           # Data models (BatchConfig, BatchPageResult, etc.)
     ├── security.py         # URL redaction / JS challenge detection / validation
     ├── http_client.py      # HTTP session + HTML fetching + browser headless fetch
     ├── ssr_extract.py      # SSR data extraction (Next.js/Modern.js → HTML/Markdown)
     ├── notion.py           # Notion public page API extraction (Block→HTML)
+    ├── huawei.py           # Huawei developer docs API extraction (getDocumentById)
     ├── images.py           # Image download, format sniffing, path replacement
     ├── extractors.py       # Content/title/link extraction + docs presets + nav stripping
     ├── markdown_conv.py    # HTML→Markdown converter + noise cleanup + link rewriting
@@ -91,6 +92,27 @@ python3 SKILL_DIR/scripts/grab_web_to_md.py "https://www.notion.so/..." --no-not
 ```
 
 **Auto behavior**: Detects `notion.so` and `*.notion.site` URLs → fetches all blocks via Notion internal API (`loadPageChunk` + `syncRecordValues`) → converts block tree to HTML → runs standard HTML→Markdown pipeline. Supports 15+ block types including text, headings, lists, code, quotes, toggles, to-do items, images, bookmarks. Only works for **publicly shared** pages. If API extraction fails, the tool **reports an error** instead of silently falling back to HTTP (which would yield empty Notion shell HTML).
+
+### Huawei Developer Docs Export
+
+```bash
+# Single doc page — auto-detected via developer.huawei.com/consumer/{cn|en}/doc/ URLs
+python3 SKILL_DIR/scripts/grab_web_to_md.py \
+  "https://developer.huawei.com/consumer/cn/doc/design-guides-V1/multi-devices_voice_experience-0000001111151802-V1" \
+  --auto-title
+
+# Doc TOC page: crawl all sub-pages and merge into one file
+python3 SKILL_DIR/scripts/grab_web_to_md.py \
+  "https://developer.huawei.com/consumer/cn/doc/design-guides-V1/multi-devices_voice_experience-0000001111151802-V1" \
+  --crawl --crawl-pattern 'design-guides-V1' \
+  --merge --merge-output huawei_docs.md \
+  --download-images --validate
+
+# Disable Huawei API extraction
+python3 SKILL_DIR/scripts/grab_web_to_md.py "https://developer.huawei.com/consumer/cn/doc/..." --no-huawei-api
+```
+
+**Auto behavior**: `developer.huawei.com` doc pages are an Angular SPA (plain HTTP returns only a ~1.7KB JS shell, no SSR data). Detects Huawei doc URLs → calls the site's own `documentPortal/getDocumentById` API with the `objectId` from the URL's last path segment → gets full content HTML + title → runs standard HTML→Markdown pipeline. Works in single-page, batch, and `--crawl --merge` modes (sub-page links in doc content are absolute same-site links, so crawl works). Chinese (`/cn/`) and English (`/en/`) docs supported. No cookies needed. `.md`-suffix URLs from the site's official llms.txt/MCP index work too (the suffix is stripped before the API call). `--max-html-bytes` applies to this API path as well (streamed read aborts as soon as the cap is exceeded). In `--auto-title` mode the API-returned title is used for file naming even when the content HTML has no `<h1>`/`<title>`. If API extraction fails, the tool reports an error with a fallback hint instead of silently falling back to HTTP (which would yield the empty SPA shell): `--local-html` (save the page from a browser, most reliable) or `--browser-fetch` (this site's SPA renders slowly and may time out). Passing `--browser-fetch` up front skips the API adapter and renders the page in the browser.
 
 ## Offline Smoke Test (No Network Required)
 
@@ -305,7 +327,7 @@ python3 SKILL_DIR/scripts/grab_web_to_md.py \
 | `--base-url URL` | Base URL for downloading images (used with --local-html) |
 | `--force` | Force continue even when JS challenge detected (content may be empty) |
 
-Auto-handled sites: Tencent Cloud (SSR), Volcengine (SSR), Notion (API). For details on JS challenge detection, known protected sites, and SSR extraction, see [references/full-guide.md](references/full-guide.md) §JS Challenge Detection.
+Auto-handled sites: Tencent Cloud (SSR), Volcengine (SSR), Notion (API), Huawei developer docs (API). For details on JS challenge detection, known protected sites, and SSR extraction, see [references/full-guide.md](references/full-guide.md) §JS Challenge Detection.
 
 ## Output Structure
 
