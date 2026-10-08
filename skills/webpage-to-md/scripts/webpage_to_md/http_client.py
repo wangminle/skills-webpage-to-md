@@ -9,7 +9,9 @@ import shutil
 import subprocess
 import sys
 import time
+from http.cookiejar import eff_request_host
 from typing import Dict, Optional, Sequence
+from urllib.parse import urlparse
 
 import requests
 
@@ -390,28 +392,192 @@ def browser_fetch_html(url: str, *, timeout_s: int = 60) -> str:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-def _parse_cookies_file(filepath: str) -> Dict[str, str]:
-    """解析 Netscape 格式的 cookies.txt 文件。
+_COOKIE_NAME_RE = re.compile(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+")
+_COOKIE_VALUE_RE = re.compile(r'[\x21\x23-\x2b\x2d-\x3a\x3c-\x5b\x5d-\x7e]*')
+
+
+def _valid_cookie_pair(name: str, value: str) -> bool:
+    """接受 RFC 6265 的 token 名称和 cookie-octet 值（可整体双引号包裹）。"""
+    if value.startswith('"') and value.endswith('"') and len(value) >= 2:
+        value = value[1:-1]
+    return bool(_COOKIE_NAME_RE.fullmatch(name) and _COOKIE_VALUE_RE.fullmatch(value))
+
+
+def _parse_cookies_file(filepath: str) -> requests.cookies.RequestsCookieJar:
+    """解析 Netscape 格式的 cookies.txt 文件，保留 domain/path/secure/expires。
 
     支持浏览器导出常见的 ``#HttpOnly_`` 前缀行（HttpOnly cookie）；
     真正的注释行（以 ``#`` 开头且非该前缀）仍被跳过。
+
+    第二列 include-subdomains 标志生效（curl Netscape 格式文档）：
+    - TRUE（或 domain 本身带点前缀）→ 子域名共享，domain 归一化为点前缀；
+    - FALSE → host-only，仅在第一列的**精确域名**上发送，cookie 会被打上
+      ``_host_only_domain`` 标记，由 ``_HostOnlyCookieSession`` 在请求路径
+      强制执行（http.cookiejar 对 version=0 cookie 只做域名后缀匹配，
+      无法原生表达 host-only）。
+    - 第一列为空的行被拒绝——那会生成发往所有域名的"超级 cookie"。
+    - 名称或值包含非法分隔符、空白或控制字符的行被拒绝，不截断或修改登录值。
+
+    返回 ``RequestsCookieJar``（而非 dict），使 cookie 只在其 domain 匹配的
+    请求下发送，避免把目标站点登录态泄漏给无关第三方域名。
     """
-    cookies: Dict[str, str] = {}
+    jar = requests.cookies.RequestsCookieJar()
     with open(filepath, "r", encoding="utf-8") as f:
         for line in f:
-            line = line.strip()
-            if not line:
+            line = line.rstrip("\r\n")
+            if not line.strip():
                 continue
+            http_only = False
             # Netscape 扩展：#HttpOnly_<domain>\t... 表示 HttpOnly cookie
             if line.startswith("#HttpOnly_"):
                 line = line[len("#HttpOnly_"):]
+                http_only = True
             elif line.startswith("#"):
                 continue
+            # 列：domain \t flag \t path \t secure \t expires \t name \t value
             parts = line.split("\t")
-            if len(parts) >= 7:
-                name, value = parts[5], parts[6]
-                cookies[name] = value
-    return cookies
+            if len(parts) != 7:
+                continue
+            domain, flag, path, secure, expires, name, value = parts
+            if not _valid_cookie_pair(name, value):
+                continue
+            domain = domain.strip().lower()
+            if not domain:
+                continue
+            # 点前缀与 TRUE 都表示子域名共享；domain 大小写归一（请求侧
+            # host 总是小写，混合大小写会导致永不匹配）
+            include_subdomains = domain.startswith(".") or flag.strip().upper() == "TRUE"
+            if include_subdomains and not domain.startswith("."):
+                domain = "." + domain
+            try:
+                expires_val: Optional[int] = (
+                    int(expires) if expires.strip() not in ("", "0") else None
+                )
+            except ValueError:
+                expires_val = None
+            kwargs: Dict[str, object] = {
+                "domain": domain,
+                "path": path or "/",
+                "secure": secure.strip().upper() == "TRUE",
+                "expires": expires_val,
+            }
+            if http_only:
+                kwargs["rest"] = {"HttpOnly": True}
+            cookie = requests.cookies.create_cookie(name, value, **kwargs)
+            if not include_subdomains:
+                cookie._host_only_domain = domain
+            jar.set_cookie(cookie)
+    return jar
+
+
+def _cookie_host_only_domain(cookie) -> Optional[str]:
+    """返回 cookie 的 host-only 域名（仅匹配该精确域名），非 host-only 返回 None。
+
+    两种来源：
+
+    - ``_host_only_domain`` 私有标记：cookies.txt 第二列 FALSE 的导入 cookie，
+      或响应提取后记录的真实来源主机（避免 CookieJar 的 .local 表示产生歧义）；
+    - RFC 6265 标准属性：服务器响应未带 Domain 属性设置的 cookie
+      （``domain_specified=False`` 且 domain 非空）本就是
+      host-only——服务器更新同名 Cookie 后替换掉带标记的导入 cookie，
+      仅靠私有标记会漏拦（见 BUG-061）。domain 为空的 cookie（如
+      ``--cookie`` 字符串）按 requests 既有语义仍发往所有域名，不在此列。
+    """
+    marked = getattr(cookie, "_host_only_domain", None)
+    if marked:
+        return marked
+    if not getattr(cookie, "domain_specified", False) and getattr(cookie, "domain", ""):
+        return cookie.domain
+    return None
+
+
+class _HostOnlyCookieSession(requests.Session):
+    """在真实请求路径上执行 host-only 语义的 Session。
+
+    http.cookiejar 对 version=0 cookie 只按域名后缀匹配——``login.example.com``
+    的 cookie 也会发给 ``untrusted.login.example.com``；而 ``prepare_request``
+    与重定向（``resolve_redirects`` → ``self.send`` 递归）总是把 cookie 合并进
+    新建的默认策略 jar，自定义 policy 无法存活。因此在 ``prepare_request``
+    与 ``send`` 出口处，先筛选 Cookie 对象，再生成自动 Cookie 头，保留
+    同名同值但来源不同的合法 Cookie。显式 Cookie 头遵循 requests 的优先级，
+    原样保留；requests 在重定向中删除显式头后，新生成的头仍受域限制。
+    """
+
+    @staticmethod
+    def _enforce_host_only(prep: "requests.PreparedRequest") -> None:
+        jar = getattr(prep, "_cookies", None)
+        if jar is None:
+            return
+        header = prep.headers.get("Cookie")
+        host = (urlparse(prep.url or "").hostname or "").lower()
+        # 原生 CookieJar 给无点主机及 IPv6 加 .local；导入/已记录来源的 Cookie
+        # 则直接按真实 URL 主机比较，不能把 localhost 与 localhost.local 当成同域。
+        effective_host = eff_request_host(requests.cookies.MockRequest(prep))[1].lower()
+        safe = requests.cookies.RequestsCookieJar()
+        safe.set_policy(jar.get_policy())
+        removed = False
+        for cookie in jar:
+            only = _cookie_host_only_domain(cookie)
+            target = host if getattr(cookie, "_host_only_domain", None) else effective_host
+            if only and only.lower() != target:
+                removed = True
+            else:
+                safe.set_cookie(cookie)
+
+        # prepare_request 和 rebuild_auth 分别标记初始头与重定向自动头的来源。
+        # 外部传入的 PreparedRequest 若无标记，用原 jar 的序列化结果作兼容判断。
+        explicit = getattr(prep, "_explicit_cookie_header", None)
+        if explicit is None:
+            probe = prep.copy()
+            probe.headers.pop("Cookie", None)
+            automatic = requests.cookies.get_cookie_header(jar, probe)
+            explicit = header is not None and header != automatic
+        elif not explicit and hasattr(prep, "_generated_cookie_header"):
+            explicit = header != prep._generated_cookie_header
+        prep._explicit_cookie_header = explicit
+        if not removed:
+            prep._generated_cookie_header = header
+            return
+        prep._cookies = safe
+        if not explicit:
+            prep.headers.pop("Cookie", None)
+            prep.prepare_cookies(safe)
+        prep._generated_cookie_header = prep.headers.get("Cookie")
+
+    def prepare_request(self, request, *args, **kwargs):
+        prep = super().prepare_request(request, *args, **kwargs)
+        headers = requests.structures.CaseInsensitiveDict(self.headers)
+        headers.update(request.headers or {})
+        prep._explicit_cookie_header = headers.get("Cookie") is not None
+        self._enforce_host_only(prep)
+        return prep
+
+    def rebuild_auth(self, prepared_request, response):
+        super().rebuild_auth(prepared_request, response)
+        # requests 在此之前已删除旧 Cookie 头并按 jar 自动生成新头；副本不保留
+        # 自定义属性，需要重新标记，不能因 Cookie 到期等序列化差异误判为显式头。
+        prepared_request._explicit_cookie_header = False
+
+    def resolve_redirects(self, response, request, **kwargs):
+        # Session.send 已把响应 Cookie 写入 session jar，但尚未构造重定向请求。
+        # 在此记录真正的来源主机；普通响应（无 Location）也会经过此入口。
+        received = requests.cookies.RequestsCookieJar()
+        requests.cookies.extract_cookies_to_jar(received, request, response.raw)
+        host = (urlparse(request.url or "").hostname or "").lower()
+        for cookie in received:
+            if cookie.domain_specified or not cookie.domain:
+                continue
+            for jar in (self.cookies, response.cookies):
+                for stored in jar:
+                    if (stored.domain, stored.path, stored.name) == (
+                        cookie.domain, cookie.path, cookie.name
+                    ):
+                        stored._host_only_domain = host
+        yield from super().resolve_redirects(response, request, **kwargs)
+
+    def send(self, request, *args, **kwargs):
+        self._enforce_host_only(request)
+        return super().send(request, *args, **kwargs)
 
 
 def _parse_cookie_string(cookie_str: str) -> Dict[str, str]:
@@ -440,8 +606,8 @@ def _apply_header_lines(headers: Dict[str, str], header_lines: Sequence[str]) ->
 
 
 def _create_session(args: argparse.Namespace, referer_url: Optional[str] = None) -> requests.Session:
-    """创建并配置 requests.Session"""
-    session = requests.Session()
+    """创建并配置 requests.Session（含 cookies.txt host-only 语义执行）"""
+    session = _HostOnlyCookieSession()
     session.headers.update(
         {
             "User-Agent": _resolve_user_agent(args.user_agent, args.ua_preset),

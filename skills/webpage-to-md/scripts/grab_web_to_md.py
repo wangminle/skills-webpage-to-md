@@ -57,6 +57,7 @@ from webpage_to_md.models import BatchConfig, BatchPageResult, JSChallengeResult
 from webpage_to_md.http_client import (
     UA_PRESETS,
     _DEFAULT_MAX_HTML_BYTES,
+    _HostOnlyCookieSession,
     _create_session,
     browser_fetch_html,
     fetch_html,
@@ -409,8 +410,14 @@ def _clone_session(session: requests.Session) -> requests.Session:
     requests.Session 不是线程安全的（连接池、cookie jar、默认 header 字典
     均无内部锁），并发 worker 共享同一实例可能导致连接池状态异常或 header
     交叉污染。通过为每个 worker 克隆一个独立 Session 来规避。
+
+    源 Session 是 _HostOnlyCookieSession 时克隆为同类，保持 cookies.txt
+    host-only 语义在批量 worker 的请求路径继续生效。
     """
-    new = requests.Session()
+    if isinstance(session, _HostOnlyCookieSession):
+        new: requests.Session = _HostOnlyCookieSession()
+    else:
+        new = requests.Session()
     new.headers.update(session.headers)
     new.cookies.update(session.cookies)
     return new

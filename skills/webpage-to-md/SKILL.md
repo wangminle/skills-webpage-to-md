@@ -7,7 +7,7 @@ description: "Use when saving web articles, WeChat posts, public Notion pages, H
 
 Extract web content and convert to clean Markdown with local images.
 
-Current version: 0.4.2.
+Current version: 0.4.3.
 
 ## Script Location
 

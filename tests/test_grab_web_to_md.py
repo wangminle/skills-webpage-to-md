@@ -2868,5 +2868,773 @@ class TestHuaweiBatchIntegration(unittest.TestCase):
                 os.chdir(original_cwd)
 
 
+class TestStripHtmlElementsOmittedEndTags(unittest.TestCase):
+    """回归：HTML5 省略结束标签（</li>/</p> 等）不应导致剥离子树计数器失步而吞掉正文。
+
+    注意 issue #1 的 `nav.menu` 复现路径本身不成立：_SimpleSelectorMatcher 会把
+    `nav.menu` 当成字面 tag 名（见 _SimpleSelectorMatcher.__init__），不会命中
+    `<nav class="menu">`。因此这里用 class 选择器 `.menu` 和 tag 选择器 `nav` 验证。
+    """
+
+    _NAV_HTML = (
+        '<html><body><nav class="menu"><ul><li>Home<li>Docs<li>Blog</ul></nav>'
+        '<h1>标题</h1><p>MAIN CONTENT HERE</p></body></html>'
+    )
+
+    def test_omitted_li_class_selector_keeps_body(self):
+        """省略 </li> 时剥离 .menu 不应吞掉正文。"""
+        out, _ = grab.strip_html_elements(self._NAV_HTML, [".menu"])
+        self.assertIn("MAIN CONTENT HERE", out)
+        self.assertNotIn('<nav class="menu">', out)
+        self.assertNotIn("Home", out)
+
+    def test_omitted_li_tag_selector_keeps_body(self):
+        """省略 </li> 时剥离 nav tag 不应吞掉正文。"""
+        out, _ = grab.strip_html_elements(self._NAV_HTML, ["nav"])
+        self.assertIn("MAIN CONTENT HERE", out)
+        self.assertNotIn("<nav", out)
+
+    def test_explicit_li_end_tags_keeps_body(self):
+        """对照组：显式 </li> 的正常行为保持不变。"""
+        html = self._NAV_HTML.replace("<li>Home<li>Docs<li>Blog", "<li>Home</li><li>Docs</li><li>Blog</li>")
+        out, _ = grab.strip_html_elements(html, [".menu"])
+        self.assertIn("MAIN CONTENT HERE", out)
+        self.assertNotIn("Home", out)
+
+    def test_omitted_p_end_tag_inserted_match_with_omitted_p(self):
+        """被剥离子树的 <p> 省略结束标签（<p>a<p>b）也不应让计数器失步。"""
+        html = '<html><body><nav class="menu"><p>v1<p>v2</nav><p>BODY</p></body></html>'
+        out, _ = grab.strip_html_elements(html, [".menu"])
+        self.assertIn("BODY", out)
+        self.assertNotIn("v1", out)
+
+    def test_nav_menu_literal_tag_selector_does_not_match(self):
+        """`nav.menu` 按字面 tag 处理，不应误伤（复现路径本身不成立）。"""
+        out, stats = grab.strip_html_elements(self._NAV_HTML, ["nav.menu"])
+        self.assertEqual(stats.elements_removed, 0)
+        self.assertIn("MAIN CONTENT HERE", out)
+
+    def test_omitted_li_closed_by_parent_ul_end_tag(self):
+        """BUG-059：被剥离 li 自身省略 </li>、由父 </ul> 闭合时，正文必须保留。"""
+        html = '<ul><li id="content" class="drop">FIRST</ul><p>TAIL</p>'
+        out, _ = grab.strip_html_elements(html, [".drop"])
+        self.assertNotIn("FIRST", out)
+        self.assertIn("TAIL", out)
+        # 父元素开始/结束标签均应保留且成对
+        self.assertIn("<ul>", out)
+        self.assertIn("</ul>", out)
+
+    def test_omitted_table_rows_closed_by_next_row(self):
+        """BUG-060：剥离 tr 内 td 省略结束标签后接下一 tr，后续行与正文保留。"""
+        html = '<table><tr id="content" class="drop"><td>FIRST<tr><td>SECOND</table><p>TAIL</p>'
+        out, _ = grab.strip_html_elements(html, [".drop"])
+        self.assertNotIn("FIRST", out)
+        self.assertIn("SECOND", out)
+        self.assertIn("TAIL", out)
+
+    def test_omitted_cell_p_closed_by_next_cell(self):
+        """BUG-060：剥离 td 内 p 省略结束标签后接下一 td，后续单元格与正文保留。"""
+        html = '<table><tr><td id="content" class="drop"><p>FIRST<td>SECOND</tr></table><p>TAIL</p>'
+        out, _ = grab.strip_html_elements(html, [".drop"])
+        self.assertNotIn("FIRST", out)
+        self.assertIn("SECOND", out)
+        self.assertIn("TAIL", out)
+
+    def test_nested_table_inner_rows_do_not_close_outer(self):
+        """嵌套表格：内层 tr/td 不得误闭合外层元素，外层 </table> 后正文保留。"""
+        html = ('<table><tr><td id="content" class="drop"><table><tr><td>INNER</table>'
+                '</td></tr></table><p>TAIL</p>')
+        out, _ = grab.strip_html_elements(html, [".drop"])
+        self.assertNotIn("INNER", out)
+        self.assertIn("TAIL", out)
+        self.assertIn("</table>", out)
+
+    def test_stray_end_tag_inside_skip_still_ignored(self):
+        """反例：子树内游离的 </ul>（无匹配祖先）仍应被忽略，不提前结束剥离。"""
+        html = '<div class="drop">KEEP-OUT</ul><span>ALSO-OUT</span></div><p>TAIL</p>'
+        out, _ = grab.strip_html_elements(html, [".drop"])
+        self.assertNotIn("KEEP-OUT", out)
+        self.assertNotIn("ALSO-OUT", out)
+        self.assertIn("TAIL", out)
+
+    def test_omitted_li_closed_by_parent_menu_end_tag(self):
+        """BUG-059：menu 的内容模型同样允许 li，</menu> 闭合省略 </li> 的 li。"""
+        html = '<menu><li id="content" class="drop">FIRST</menu><p>TAIL</p>'
+        out, _ = grab.strip_html_elements(html, [".drop"])
+        self.assertNotIn("FIRST", out)
+        self.assertIn("TAIL", out)
+        self.assertIn("<menu>", out)
+        self.assertIn("</menu>", out)
+
+
+class TestTargetExtractorOmittedEndTags(unittest.TestCase):
+    """回归：_TargetSectionExtractor 对游离/省略结束标签应基于标签栈而非深度计数。"""
+
+    def test_stray_p_end_does_not_truncate(self):
+        """游离 </p>（HTML5 容错常见）不应让目标容器提前 done。"""
+        html = '<div id="content"><p>FIRST</p></p><p>SECOND</p></div>'
+        out = grab.extract_target_html(html, target_id="content", target_class=None)
+        self.assertIsNotNone(out)
+        self.assertIn("FIRST", out)
+        self.assertIn("SECOND", out)
+
+    def test_omitted_li_end_does_not_overshoot_footer(self):
+        """省略 </li> 不应让深度永不归零、超采到页脚。"""
+        html = '<div id="content"><ul><li>a<li>b</ul><p>TAIL</p></div><footer>FOOTER NOISE</footer>'
+        out = grab.extract_target_html(html, target_id="content", target_class=None)
+        self.assertIsNotNone(out)
+        self.assertIn("TAIL", out)
+        self.assertNotIn("FOOTER", out)
+
+    def test_target_container_implied_closed_by_sibling(self):
+        """目标容器本身是可省略结束标签的元素：后续同名 start tag 隐式闭合即视为 done。"""
+        html = '<div><p id="content">C1<p>next</p></div>'
+        out = grab.extract_target_html(html, target_id="content", target_class=None)
+        self.assertIsNotNone(out)
+        self.assertIn("C1", out)
+        self.assertNotIn("next", out)
+
+    def test_omitted_li_target_closed_by_parent_ul_end(self):
+        """BUG-059：目标 li 省略 </li>，父 </ul> 出现时采集应止于 FIRST。"""
+        html = '<ul><li id="content">FIRST</ul><p>TAIL</p>'
+        out = grab.extract_target_html(html, target_id="content", target_class=None)
+        self.assertIsNotNone(out)
+        self.assertIn("FIRST", out)
+        self.assertNotIn("TAIL", out)
+
+    def test_omitted_p_target_closed_by_ancestor_div_end(self):
+        """BUG-059（p 变体）：目标 p 省略 </p>，祖先 </div> 出现时采集结束。"""
+        html = '<div><p id="content">FIRST</div><p>TAIL</p>'
+        out = grab.extract_target_html(html, target_id="content", target_class=None)
+        self.assertIsNotNone(out)
+        self.assertIn("FIRST", out)
+        self.assertNotIn("TAIL", out)
+
+    def test_target_tr_closed_by_next_row_after_omitted_td(self):
+        """BUG-060：目标 tr 内 td 省略结束标签，下一 <tr> 应结束采集。"""
+        html = '<table><tr id="content"><td>FIRST<tr><td>SECOND</table><p>TAIL</p>'
+        out = grab.extract_target_html(html, target_id="content", target_class=None)
+        self.assertIsNotNone(out)
+        self.assertIn("FIRST", out)
+        self.assertNotIn("SECOND", out)
+        self.assertNotIn("TAIL", out)
+
+    def test_target_td_closed_by_next_cell_after_omitted_p(self):
+        """BUG-060：目标 td 内 p 省略结束标签，下一 <td> 应结束采集。"""
+        html = '<table><tr><td id="content"><p>FIRST<td>SECOND</tr></table><p>TAIL</p>'
+        out = grab.extract_target_html(html, target_id="content", target_class=None)
+        self.assertIsNotNone(out)
+        self.assertIn("FIRST", out)
+        self.assertNotIn("SECOND", out)
+        self.assertNotIn("TAIL", out)
+
+    def test_nested_table_inner_rows_do_not_close_target(self):
+        """嵌套表格：内层 tr/td 不应闭合目标 td，直到外层 </td> 才结束。"""
+        html = ('<table><tr><td id="content"><table><tr><td>INNER</table>'
+                '</td></tr></table><p>TAIL</p>')
+        out = grab.extract_target_html(html, target_id="content", target_class=None)
+        self.assertIsNotNone(out)
+        self.assertIn("INNER", out)
+        self.assertNotIn("TAIL", out)
+
+    def test_stray_end_tag_does_not_close_target_root(self):
+        """反例：目标内游离 </p> 不应提前结束目标 li 的采集。"""
+        html = '<ul><li id="content">A</p> B</ul><p>TAIL</p>'
+        out = grab.extract_target_html(html, target_id="content", target_class=None)
+        self.assertIsNotNone(out)
+        self.assertIn("A", out)
+        self.assertIn("B", out)
+        self.assertNotIn("TAIL", out)
+
+    def test_stray_nonexistent_parent_end_tag_keeps_collecting(self):
+        """BUG-059：不存在的 </ol>（无真实祖先）不得截断采集，SECOND 须保留。"""
+        html = '<ul><li id="content">FIRST</ol>SECOND</li></ul>'
+        out = grab.extract_target_html(html, target_id="content", target_class=None)
+        self.assertIsNotNone(out)
+        self.assertIn("FIRST", out)
+        self.assertIn("SECOND", out)
+
+    def test_real_parent_end_tag_still_closes_target(self):
+        """对照：真实存在的 </ul> 仍应闭合省略 </li> 的目标（祖先链核实生效）。"""
+        html = '<ul><li id="content">FIRST</ul><p>TAIL</p>'
+        out = grab.extract_target_html(html, target_id="content", target_class=None)
+        self.assertIsNotNone(out)
+        self.assertIn("FIRST", out)
+        self.assertNotIn("TAIL", out)
+
+    def test_stray_parent_end_after_closed_ancestor_ignored(self):
+        """游离 </div>：div 在目标开始前已闭合（不在祖先链），不得结束采集。"""
+        html = '<div><p>x</p></div><p id="content">FIRST</div><b>TAIL</b>'
+        out = grab.extract_target_html(html, target_id="content", target_class=None)
+        self.assertIsNotNone(out)
+        self.assertIn("FIRST", out)
+        self.assertIn("TAIL", out)
+
+    def test_menu_parent_end_tag_closes_target(self):
+        """BUG-059：目标 li 位于 menu 内时，</menu> 结束采集。"""
+        html = '<menu><li id="content">FIRST</menu><p>TAIL</p>'
+        out = grab.extract_target_html(html, target_id="content", target_class=None)
+        self.assertIsNotNone(out)
+        self.assertIn("FIRST", out)
+        self.assertNotIn("TAIL", out)
+
+
+class TestFenceTrackerOutsideCode(unittest.TestCase):
+    """回归：代码围栏识别须区分 ``` 与 ~~~ 并跟踪长度（CommonMark 规则）。"""
+
+    def _mc(self):
+        from webpage_to_md import markdown_conv
+        return markdown_conv
+
+    def test_backtick_fence_contains_tilde_literal(self):
+        """``` 块内字面量 ~~~ 不应提前关闭围栏，块内 ### 标题行得以保留。"""
+        md = self._mc()._strip_empty_headings_outside_code('```\n~~~\n###\n```\n')
+        self.assertIn("###", md)
+
+    def test_backtick_fence_blank_lines_preserved(self):
+        """``` 块内字面量 ~~~ + 连续空行不应被折叠。"""
+        md = self._mc()._collapse_blank_lines_outside_code('```\n~~~\nline1\n\n\n\nline2\n```\n')
+        self.assertIn("line1\n\n\n\nline2", md)
+
+    def test_backtick_fence_shell_comment_not_demoted(self):
+        """``` 块内的 # 注释行（含字面量 ~~~）不应被标题降级改写。
+
+        断言完整输出：错误实现若把该行降级为 "## ..."，assertIn 仍会通过，
+        必须用整串比较才能检出。
+        """
+        src = '```sh\n~~~\n# 这是 shell 注释\n```\n'
+        md = self._mc()._demote_headings_outside_code(src, 1)
+        self.assertEqual(md, src)
+
+    def test_tilde_fence_latex_not_converted(self):
+        """~~~ 围栏同样被识别：块内 LaTeX 分隔符不应被转换。"""
+        md = self._mc()._convert_latex_delimiters_outside_code('~~~\n\\[a\\] \\(b\\)\n~~~\n')
+        self.assertNotIn("$$", md)
+        self.assertIn("\\[a\\]", md)
+
+    def test_latex_outside_fence_still_converted(self):
+        """对照组：围栏外的 LaTeX 分隔符仍应转换。"""
+        md = self._mc()._convert_latex_delimiters_outside_code('\\[a\\] \\(b\\)\n')
+        self.assertIn("$$a$$", md)
+        self.assertIn("$b$", md)
+
+    def test_fence_length_gte_close_rule(self):
+        """结束围栏长度 < 开始围栏时不应视为关闭（CommonMark 长度规则）。
+
+        断言完整输出：``` 不够关闭 ```` 围栏，其后直到 ```` 前的内容都
+        在围栏内（空标题行 ### 不删）；真正的关闭行之后的空标题行才删除。
+        只检查围栏前内容的旧断言无法检出长度规则回归。
+        """
+        src = '````\n```\n###\n````\n###\n'
+        md = self._mc()._strip_empty_headings_outside_code(src)
+        self.assertEqual(md, '````\n```\n###\n````\n')
+
+    def test_html_code_block_with_backtick_line(self):
+        """BUG-062：代码正文含 ``` 行时生成围栏须加长，### 不得被后处理删除。"""
+        md = grab.html_to_markdown(
+            '<pre><code>```\n###\n</code></pre><h1>AFTER</h1>',
+            base_url="https://example.com/", url_to_local={})
+        self.assertEqual(md, '````\n```\n###\n````\n\n# AFTER\n')
+
+    def test_html_code_block_with_four_backticks_uses_five_fence(self):
+        """BUG-062：正文含 ```` 时生成 ````` 围栏；普通代码仍为 ```。"""
+        md = grab.html_to_markdown(
+            '<pre><code>````\nx\n</code></pre>',
+            base_url="https://example.com/", url_to_local={})
+        self.assertEqual(md, '`````\n````\nx\n`````\n')
+        plain = grab.html_to_markdown(
+            '<pre><code>print(1)\n</code></pre>',
+            base_url="https://example.com/", url_to_local={})
+        self.assertEqual(plain, '```\nprint(1)\n```\n')
+
+    def test_rewrite_links_skips_short_fence_inside_long_fence(self):
+        """BUG-063：四反引号围栏内的 ``` 行不是关闭，块内链接不得改写。"""
+        md = "````\n```\n[x](https://example.com/page)\n````\n"
+        out, n = grab.rewrite_internal_links(md, {"https://example.com/page": "anchor"})
+        self.assertEqual(n, 0)
+        self.assertEqual(out, md)
+
+    def test_rewrite_links_outside_fence_still_rewritten(self):
+        """对照组：围栏外链接仍正常改写，围栏内同 URL 链接保持原样。"""
+        md = ("see [x](https://example.com/page)\n"
+              "````\n```\n[y](https://example.com/page)\n````\n")
+        out, n = grab.rewrite_internal_links(md, {"https://example.com/page": "anchor"})
+        self.assertEqual(n, 1)
+        self.assertIn("[x](#anchor)", out)
+        self.assertIn("[y](https://example.com/page)", out)
+
+    def test_rewrite_links_multiline_link_text(self):
+        """BUG-066：转换器自身会生成文字含换行的链接（[first\\nsecond](url)），
+        按围栏分段后对完整围栏外文本块整体匹配，跨行链接仍被改写。"""
+        md = grab.html_to_markdown(
+            '<p><a href="https://example.com/p">first\nsecond</a></p>',
+            base_url="https://example.com/", url_to_local={})
+        self.assertIn("[first\nsecond](https://example.com/p)", md)
+        out, n = grab.rewrite_internal_links(md, {"https://example.com/p": "p"})
+        self.assertEqual(n, 1)
+        self.assertIn("[first\nsecond](#p)", out)
+        self.assertNotIn("(https://example.com/p)", out)
+
+    def test_rewrite_links_multiline_link_inside_fence_untouched(self):
+        """对照：围栏内的跨行链接示例不改写。"""
+        md = "````\n```\n[x\ny](https://example.com/p)\n````\n"
+        out, n = grab.rewrite_internal_links(md, {"https://example.com/p": "p"})
+        self.assertEqual(n, 0)
+        self.assertEqual(out, md)
+
+    def test_html_to_markdown_pre_code_tilde_content(self):
+        """端到端：<pre><code> 内是 ~~~ + 标题文本时，标题行不应在转 Markdown 时丢失。"""
+        md = grab.html_to_markdown('<pre><code>~~~\n###\n</code></pre>',
+                                   base_url="https://example.com/", url_to_local={})
+        self.assertIn("###", md)
+
+
+class TestCookiesFileDomainScope(unittest.TestCase):
+    """回归：cookies.txt 应保留 domain 字段，cookie 只发送给匹配的域名。"""
+
+    @staticmethod
+    def _cookies_file(content):
+        from webpage_to_md.http_client import _parse_cookies_file
+
+        with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8") as f:
+            f.write(content)
+            path = f.name
+        try:
+            return _parse_cookies_file(path)
+        finally:
+            os.unlink(path)
+
+    def _prepare(self, url, cookies):
+        import requests as _requests
+
+        s = _requests.Session()
+        s.cookies.update(cookies)
+        req = s.prepare_request(_requests.Request("GET", url))
+        return req.headers.get("Cookie") or ""
+
+    def test_cookie_not_sent_to_unrelated_domains(self):
+        """`.example.com` 的 cookie 不应发送给无关第三方域名（隐私泄漏回归）。"""
+        cookies = self._cookies_file(
+            ".example.com\tTRUE\t/\tFALSE\t0\tsession\tSECRET_TOKEN\n"
+        )
+        self.assertIn("session=SECRET_TOKEN",
+                      self._prepare("https://www.example.com/page", cookies))
+        self.assertIn("session=SECRET_TOKEN",
+                      self._prepare("https://example.com/page", cookies))
+        self.assertEqual("", self._prepare("https://evil.other-domain.com/x", cookies))
+        self.assertEqual("", self._prepare("https://cdn.unrelated.net/img.png", cookies))
+
+    def test_cookie_secure_and_httponly_fields_kept(self):
+        """secure / #HttpOnly_ 字段应保留（不再退化为无域名的超级 cookie）。"""
+        cookies = self._cookies_file(
+            "#HttpOnly_.example.com\tTRUE\t/\tTRUE\t0\thtoken\tHVAL\n"
+        )
+        c = list(cookies)
+        self.assertEqual(len(c), 1)
+        self.assertEqual(c[0].domain, ".example.com")
+        self.assertEqual(c[0].secure, True)
+        self.assertEqual(c[0].path, "/")
+        self.assertEqual(c[0].value, "HVAL")
+
+
+class TestCookiesFileHostOnlyScope(unittest.TestCase):
+    """回归：cookies.txt 第二列 FALSE 的 host-only cookie 不得发往子域名。
+
+    http.cookiejar 对 version=0 cookie 只做域名后缀匹配，无法原生表达
+    host-only；语义由 cookie 上的 _host_only_domain 标记 + _HostOnlyCookieSession
+    在 prepare_request/send（含重定向）出口强制执行。验收必须走真实
+    Session 请求准备/克隆/重定向路径，不能只看 Cookie 对象字段。
+    """
+
+    @staticmethod
+    def _session(content):
+        from webpage_to_md.http_client import _HostOnlyCookieSession
+
+        s = _HostOnlyCookieSession()
+        s.cookies.update(TestCookiesFileDomainScope._cookies_file(content))
+        return s
+
+    def test_host_only_cookie_not_sent_to_subdomain(self):
+        """第二列 FALSE：精确域名附带，子域名不得附带登录 Cookie。"""
+        s = self._session(
+            "login.example.com\tFALSE\t/\tFALSE\t0\tsession\tSYNTHETIC_TOKEN\n"
+        )
+        req = s.prepare_request(requests.Request("GET", "https://login.example.com/"))
+        self.assertEqual(req.headers.get("Cookie"), "session=SYNTHETIC_TOKEN")
+        req2 = s.prepare_request(
+            requests.Request("GET", "https://untrusted.login.example.com/")
+        )
+        self.assertIsNone(req2.headers.get("Cookie"))
+
+    def test_include_subdomains_true_still_sent_to_subdomains(self):
+        """对照组：第二列 TRUE 的域 cookie 对合法子域仍生效，无关域名不带。"""
+        s = self._session(".example.com\tTRUE\t/\tFALSE\t0\tsession\tTOK\n")
+        for url in ("https://example.com/", "https://www.example.com/"):
+            req = s.prepare_request(requests.Request("GET", url))
+            self.assertIn("session=TOK", req.headers.get("Cookie") or "")
+        req = s.prepare_request(requests.Request("GET", "https://evil.other.net/"))
+        self.assertNotIn("session=TOK", req.headers.get("Cookie") or "")
+
+    def test_mixed_host_only_and_domain_cookies(self):
+        """host-only 与域 cookie 共存：子域只收到域 cookie。"""
+        s = self._session(
+            "login.example.com\tFALSE\t/\tFALSE\t0\thostonly\tHO\n"
+            ".example.com\tTRUE\t/\tFALSE\t0\tdomain\tDOM\n"
+        )
+        req = s.prepare_request(
+            requests.Request("GET", "https://untrusted.login.example.com/")
+        )
+        self.assertEqual(req.headers.get("Cookie"), "domain=DOM")
+
+    def test_empty_domain_line_rejected(self):
+        """空 domain 行必须被拒绝（否则生成发往所有域名的超级 cookie）。"""
+        jar = TestCookiesFileDomainScope._cookies_file(
+            "\tTRUE\t/\tFALSE\t0\twid\tX\n"
+        )
+        self.assertEqual(len(list(jar)), 0)
+
+    def test_cloned_session_keeps_host_only_enforcement(self):
+        """会话克隆（deepcopy）后 host-only 语义仍生效。"""
+        import copy
+
+        s = self._session(
+            "login.example.com\tFALSE\t/\tFALSE\t0\tsession\tSYNTHETIC_TOKEN\n"
+        )
+        cloned = copy.deepcopy(s)
+        req = cloned.prepare_request(
+            requests.Request("GET", "https://untrusted.login.example.com/")
+        )
+        self.assertIsNone(req.headers.get("Cookie"))
+        req2 = cloned.prepare_request(requests.Request("GET", "https://login.example.com/"))
+        self.assertEqual(req2.headers.get("Cookie"), "session=SYNTHETIC_TOKEN")
+
+    def test_batch_worker_clone_session_keeps_host_only_enforcement(self):
+        """批量模式 _clone_session（每 worker 一份）克隆后 host-only 语义仍生效。"""
+        s = self._session(
+            "login.example.com\tFALSE\t/\tFALSE\t0\tsession\tSYNTHETIC_TOKEN\n"
+        )
+        worker = grab._clone_session(s)
+        req = worker.prepare_request(
+            requests.Request("GET", "https://untrusted.login.example.com/")
+        )
+        self.assertIsNone(req.headers.get("Cookie"))
+        req2 = worker.prepare_request(requests.Request("GET", "https://login.example.com/"))
+        self.assertEqual(req2.headers.get("Cookie"), "session=SYNTHETIC_TOKEN")
+
+    def test_host_only_cookie_not_leaked_on_redirect(self):
+        """重定向（302 跨子域）后的 Cookie 头同样不得带 host-only cookie。"""
+        from requests.adapters import HTTPAdapter
+
+        seen = {}
+
+        class _RedirectAdapter(HTTPAdapter):
+            def send(self, request, **kwargs):
+                seen[request.url] = request.headers.get("Cookie")
+                r = requests.Response()
+                r.status_code = 302 if request.url.endswith("/start") else 200
+                r.url = request.url
+                r.request = request
+                if r.status_code == 302:
+                    r.headers["Location"] = "https://untrusted.login.example.com/x"
+                r._content = b""
+                r._content_consumed = True
+                return r
+
+        s = self._session(
+            "login.example.com\tFALSE\t/\tFALSE\t0\tsession\tSYNTHETIC_TOKEN\n"
+        )
+        s.mount("https://", _RedirectAdapter())
+        s.get("https://login.example.com/start", allow_redirects=True, timeout=5)
+        self.assertEqual(
+            seen.get("https://login.example.com/start"), "session=SYNTHETIC_TOKEN"
+        )
+        self.assertIsNone(seen.get("https://untrusted.login.example.com/x"))
+
+    @staticmethod
+    def _run_redirect_with_set_cookie(session, set_cookie):
+        """302 → 子域，且首个响应带 Set-Cookie；返回各跳的 Cookie 头。"""
+        from http.client import HTTPMessage
+        from types import SimpleNamespace
+        from requests.adapters import HTTPAdapter
+
+        seen = {}
+
+        class _Adapter(HTTPAdapter):
+            def send(self, request, **kwargs):
+                seen[request.url] = request.headers.get("Cookie")
+                r = requests.Response()
+                r.url = request.url
+                r.request = request
+                r._content = b""
+                r._content_consumed = True
+                headers = HTTPMessage()
+                if request.url.endswith("/start"):
+                    r.status_code = 302
+                    r.headers["Location"] = "https://untrusted.login.example.com/end"
+                    if set_cookie:
+                        headers.add_header("Set-Cookie", set_cookie)
+                else:
+                    r.status_code = 200
+                r.raw = SimpleNamespace(_original_response=SimpleNamespace(msg=headers))
+                return r
+
+        session.mount("https://", _Adapter())
+        session.get("https://login.example.com/start", timeout=5)
+        return seen
+
+    def test_refreshed_host_only_cookie_not_leaked_on_redirect(self):
+        """BUG-061：服务器 Set-Cookie 更新同名 cookie（无 Domain 属性 →
+        RFC 6265 host-only）后，重定向到子域不得泄漏刷新值。"""
+        s = self._session(
+            "login.example.com\tFALSE\t/\tFALSE\t0\tsession\tIMPORTED\n"
+        )
+        seen = self._run_redirect_with_set_cookie(s, "session=REFRESHED; Path=/")
+        self.assertEqual(
+            seen.get("https://login.example.com/start"), "session=IMPORTED"
+        )
+        self.assertIsNone(seen.get("https://untrusted.login.example.com/end"))
+
+    def test_server_new_host_only_cookie_not_leaked_on_redirect(self):
+        """对照 1：服务器新增（非替换）的无 Domain cookie 同样只限本域——
+        首跳响应设置的 tracker 在重定向子域不带，回到精确域仍正常发送。"""
+        s = self._session(
+            "login.example.com\tFALSE\t/\tFALSE\t0\tsession\tIMPORTED\n"
+        )
+        seen = self._run_redirect_with_set_cookie(s, "tracker=NEW; Path=/")
+        # 首跳请求时 tracker 尚未设置
+        self.assertEqual(
+            seen.get("https://login.example.com/start"), "session=IMPORTED"
+        )
+        self.assertIsNone(seen.get("https://untrusted.login.example.com/end"))
+        # 重定向结束后再访问精确域：新 cookie 正常携带（未被一刀切丢弃）
+        s.get("https://login.example.com/after", timeout=5)
+        after = seen.get("https://login.example.com/after") or ""
+        self.assertIn("session=IMPORTED", after)
+        self.assertIn("tracker=NEW", after)
+
+    def test_server_explicit_domain_cookie_shared_on_redirect(self):
+        """对照 2：服务器显式 Domain=example.com 的 cookie 允许子域共享。"""
+        from webpage_to_md.http_client import _HostOnlyCookieSession
+
+        s = _HostOnlyCookieSession()
+        seen = self._run_redirect_with_set_cookie(
+            s, "shared=DOM; Domain=example.com; Path=/"
+        )
+        self.assertIsNone(seen.get("https://login.example.com/start"))
+        self.assertEqual(
+            seen.get("https://untrusted.login.example.com/end"), "shared=DOM"
+        )
+
+    def test_manual_cookie_header_preserved_with_host_only_filtering(self):
+        """BUG-065：jar 含不匹配的 host-only cookie 时，用户显式设置的
+        Cookie 请求头（--header 'Cookie: …'）不得被清空。"""
+        s = self._session(
+            "login.example.com\tFALSE\t/\tFALSE\t0\tsession\tIMPORTED\n"
+        )
+        s.headers["Cookie"] = "manual=EXPLICIT"
+        req = s.prepare_request(
+            requests.Request("GET", "https://unrelated.example.net/")
+        )
+        self.assertEqual(req.headers.get("Cookie"), "manual=EXPLICIT")
+
+    def test_manual_cookie_header_mixed_with_domain_cookie(self):
+        """显式 Cookie 头与 cookies-file 域 cookie 混用：显式头保留，
+        host-only 限制不因显式头存在而失效。"""
+        s = self._session(
+            "login.example.com\tFALSE\t/\tFALSE\t0\tsession\tIMPORTED\n"
+            ".example.com\tTRUE\t/\tFALSE\t0\tdom\tDOM\n"
+        )
+        s.headers["Cookie"] = "manual=EXPLICIT"
+        # 匹配域：requests 语义为显式头优先（jar 不覆盖已存在的 Cookie 头）
+        req = s.prepare_request(requests.Request("GET", "https://www.example.com/"))
+        self.assertEqual(req.headers.get("Cookie"), "manual=EXPLICIT")
+        # host-only 违规域：显式头保留，且不混入 host-only 值
+        req2 = s.prepare_request(
+            requests.Request("GET", "https://untrusted.login.example.com/")
+        )
+        self.assertEqual(req2.headers.get("Cookie"), "manual=EXPLICIT")
+
+
+class TestCookieBoundaryRegressions(unittest.TestCase):
+    """BUG-067～069：验证实际请求头、服务器响应与 Cookie 来源。"""
+
+    _session = staticmethod(TestCookiesFileHostOnlyScope._session)
+
+    @staticmethod
+    def _redirect(session, start, end, set_cookie, first_status=302):
+        from http.client import HTTPMessage
+        from types import SimpleNamespace
+        from requests.adapters import HTTPAdapter
+
+        seen = []
+
+        class Adapter(HTTPAdapter):
+            def send(self, request, **kwargs):
+                seen.append((request.url, request.headers.get("Cookie")))
+                response = requests.Response()
+                response.url, response.request = request.url, request
+                response._content, response._content_consumed = b"", True
+                headers = HTTPMessage()
+                if request.url == start:
+                    response.status_code = first_status
+                    response.headers["Location"] = end
+                    headers.add_header("Set-Cookie", set_cookie)
+                else:
+                    response.status_code = 200
+                response.raw = SimpleNamespace(_original_response=SimpleNamespace(msg=headers))
+                return response
+
+        session.trust_env = False
+        session.mount("http://", Adapter())
+        session.mount("https://", Adapter())
+        session.get(start, timeout=5)
+        return seen
+
+    def test_single_label_and_ipv6_same_host_redirect_keeps_cookie(self):
+        """BUG-067：CookieJar 的 .local 存储形式不得阻止同主机发送。"""
+        from webpage_to_md.http_client import _HostOnlyCookieSession
+
+        for host in ("localhost", "intranet", "[::1]"):
+            with self.subTest(host=host):
+                seen = self._redirect(
+                    _HostOnlyCookieSession(), f"http://{host}/start",
+                    f"http://{host}/end", "session=LOCAL; Path=/")
+                self.assertEqual(seen[1][1], "session=LOCAL")
+
+    def test_single_label_server_cookie_not_sent_to_other_host(self):
+        """无点主机的 Cookie 仍不得发往子主机或不相关主机。"""
+        from webpage_to_md.http_client import _HostOnlyCookieSession
+
+        for end in ("http://untrusted.localhost/end", "http://other.test/end"):
+            with self.subTest(end=end):
+                seen = self._redirect(
+                    _HostOnlyCookieSession(), "http://localhost/start", end,
+                    "session=LOCAL; Path=/")
+                self.assertIsNone(seen[1][1])
+
+    def test_local_suffix_is_not_a_host_only_alias(self):
+        """内部 .local 表示不能让 localhost 与实际 localhost.local 共享 Cookie。"""
+        from webpage_to_md.http_client import _HostOnlyCookieSession
+
+        for source, target in (("localhost", "localhost.local"), ("localhost.local", "localhost")):
+            with self.subTest(source=source):
+                s = _HostOnlyCookieSession()
+                self._redirect(s, f"http://{source}/start", f"http://{source}/end",
+                               "session=LOCAL; Path=/")
+                request = s.prepare_request(requests.Request("GET", f"http://{target}/"))
+                self.assertIsNone(request.headers.get("Cookie"))
+
+    def test_non_redirect_response_cookie_source_survives_clone(self):
+        """普通响应也记录真实主机；批量 worker 克隆后仍保持精确来源。"""
+        from webpage_to_md.http_client import _HostOnlyCookieSession
+
+        s = _HostOnlyCookieSession()
+        self._redirect(s, "http://localhost/start", "http://localhost/end",
+                       "session=LOCAL; Path=/", first_status=200)
+        cloned = grab._clone_session(s)
+        same = cloned.prepare_request(requests.Request("GET", "http://localhost/"))
+        other = cloned.prepare_request(requests.Request("GET", "http://localhost.local/"))
+        self.assertEqual(same.headers.get("Cookie"), "session=LOCAL")
+        self.assertIsNone(other.headers.get("Cookie"))
+
+    def test_same_name_value_shared_cookie_survives_host_only_filter(self):
+        """BUG-068：同名同值不代表同一 Cookie，合法共享条目必须保留。"""
+        s = self._session(
+            "login.example.com\tFALSE\t/\tFALSE\t0\tsession\tSHARED\n"
+            ".example.com\tTRUE\t/\tFALSE\t0\tsession\tSHARED\n")
+        for host in ("www.example.com", "untrusted.login.example.com", "example.com"):
+            with self.subTest(host=host):
+                request = s.prepare_request(requests.Request("GET", f"https://{host}/"))
+                self.assertEqual(request.headers.get("Cookie"), "session=SHARED")
+
+    def test_shared_cookie_collision_respects_path_secure_and_expiry(self):
+        """合法共享条目须真正匹配，不能仅凭名值对给违规 Cookie 放行。"""
+        for shared, url, expected in (
+            ("/private\tTRUE\t0", "https://untrusted.login.example.com/private/a", "session=SHARED"),
+            ("/private\tTRUE\t0", "https://untrusted.login.example.com/public", None),
+            ("/private\tTRUE\t0", "http://untrusted.login.example.com/private/a", None),
+            ("/\tFALSE\t1", "https://untrusted.login.example.com/", None),
+        ):
+            with self.subTest(shared=shared, url=url):
+                s = self._session(
+                    "login.example.com\tFALSE\t/\tFALSE\t0\tsession\tSHARED\n"
+                    f".example.com\tTRUE\t{shared}\tsession\tSHARED\n")
+                request = s.prepare_request(requests.Request("GET", url))
+                self.assertEqual(request.headers.get("Cookie"), expected)
+
+    def test_redirect_keeps_same_name_value_server_domain_cookie(self):
+        """服务器新增共享 Cookie 与导入私有 Cookie 同名同值时仍正常发送。"""
+        s = self._session("login.example.com\tFALSE\t/\tFALSE\t0\tsession\tSHARED\n")
+        seen = self._redirect(
+            s, "https://login.example.com/start", "https://www.example.com/end",
+            "session=SHARED; Domain=example.com; Path=/")
+        self.assertEqual(seen[1][1], "session=SHARED")
+
+    def test_explicit_cookie_header_same_value_is_preserved(self):
+        """显式头优先：用户主动指定的值不因恰好与 jar 条目相同而消失。"""
+        s = self._session("login.example.com\tFALSE\t/\tFALSE\t0\tsession\tPRIVATE\n")
+        for headers in ({"Cookie": "session=PRIVATE"}, {"cookie": "session=PRIVATE"}):
+            with self.subTest(headers=headers):
+                request = s.prepare_request(requests.Request(
+                    "GET", "https://untrusted.login.example.com/", headers=headers))
+                self.assertEqual(request.headers.get("Cookie"), "session=PRIVATE")
+
+    def test_explicit_header_override_none_restores_automatic_filtering(self):
+        s = self._session("login.example.com\tFALSE\t/\tFALSE\t0\tsession\tPRIVATE\n")
+        s.headers["Cookie"] = "manual=EXPLICIT"
+        request = s.prepare_request(requests.Request(
+            "GET", "https://untrusted.login.example.com/", headers={"Cookie": None}))
+        self.assertIsNone(request.headers.get("Cookie"))
+
+    def test_explicit_header_set_after_preparation_is_preserved_on_send(self):
+        """调用方准备请求后主动更改头时，send 不应重新生成它。"""
+        from requests.adapters import HTTPAdapter
+
+        s = self._session("login.example.com\tFALSE\t/\tFALSE\t0\tsession\tPRIVATE\n")
+        request = s.prepare_request(requests.Request("GET", "https://untrusted.login.example.com/"))
+        request.headers["Cookie"] = "session=PRIVATE"
+        seen = []
+
+        class Adapter(HTTPAdapter):
+            def send(self, request, **kwargs):
+                seen.append(request.headers.get("Cookie"))
+                response = requests.Response()
+                response.status_code, response.url, response.request = 200, request.url, request
+                response._content, response._content_consumed = b"", True
+                return response
+
+        s.mount("https://", Adapter())
+        s.send(request, timeout=5)
+        self.assertEqual(seen, ["session=PRIVATE"])
+
+    def test_cookie_file_rejects_unsafe_names_and_values(self):
+        """BUG-069：非法值不能进入 jar；不应截断、转义后当登录值发送。"""
+        for value in ("SECRET ", " SECRET", "FIRST;SECOND", "x\ty", "x\x00y", '"a;b"', 'a"b'):
+            with self.subTest(value=value):
+                jar = TestCookiesFileDomainScope._cookies_file(
+                    f"login.example.com\tFALSE\t/\tFALSE\t0\tsession\t{value}\n")
+                self.assertEqual(len(jar), 0)
+        jar = TestCookiesFileDomainScope._cookies_file(
+            "login.example.com\tFALSE\t/\tFALSE\t0\tbad;name\tSAFE\n")
+        self.assertEqual(len(jar), 0)
+
+    def test_cookie_file_preserves_valid_values(self):
+        """空值、等号、百分号和合法带引号值均按原值保留。"""
+        for value in ("", "a=b=c", "a%20b", '"SAFE"', "!#$%&'()*+-./:<=>?@[]^_`{|}~"):
+            with self.subTest(value=value):
+                s = self._session(f"login.example.com\tFALSE\t/\tFALSE\t0\tsession\t{value}\n")
+                request = s.prepare_request(requests.Request("GET", "https://login.example.com/"))
+                self.assertEqual(request.headers.get("Cookie"), f"session={value}")
+
+    def test_quoted_semicolon_response_cookie_does_not_leak(self):
+        """BUG-069：服务器宽松解析出的异常值也必须先按来源过滤。"""
+        from webpage_to_md.http_client import _HostOnlyCookieSession
+
+        seen = self._redirect(
+            _HostOnlyCookieSession(), "https://login.example.com/start",
+            "https://untrusted.login.example.com/end", 'session="FIRST;SECOND"; Path=/')
+        self.assertIsNone(seen[1][1])
+
+
 if __name__ == "__main__":
     unittest.main()

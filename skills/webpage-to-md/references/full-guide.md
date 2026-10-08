@@ -1,6 +1,6 @@
 # Web to Markdown Grabber 完整参考手册
 
-> 当前版本：0.4.2
+> 当前版本：0.4.3
 
 > **命令说明**：文中使用 `python3` / `pip3`（macOS/Linux 默认），Windows 用户请替换为 `python` / `pip`。脚本兼容 Python 3.8+。
 
@@ -309,6 +309,8 @@ python3 scripts/grab_web_to_md.py URL --header "Authorization: Bearer xxx"
 # 切换 UA
 python3 scripts/grab_web_to_md.py URL --ua-preset firefox-win
 ```
+
+`--cookies-file` 读取七列 Netscape 格式。host-only Cookie 只发给精确主机；同名的合法共享 Cookie 仍按域名、路径、HTTPS 和有效期发送。名称或值含非法分隔符、空白或控制字符的行会被忽略，合法值保持原样。显式 `--header "Cookie: …"` 按用户输入保留；重定向按 requests 的规则删除该头并重新生成受域限制的 Cookie 头。
 
 **JS Challenge 检测**：工具会自动识别 JavaScript 反爬保护（Cloudflare、Akamai 等），检测到时返回 exit code **4** 并提示使用 `--browser-fetch` 或 `--local-html`。
 
@@ -706,6 +708,13 @@ output → markdown_conv, models, security
 
 ## 更新日志
 
+### v0.4.3 (2026-10-08)
+- ✅ **2026-10-08 Cookie 边界补修（BUG-067～069）**：记录服务器 Cookie 的真实来源主机，兼容 localhost、内网单标签主机和 IPv6，并防止 `.local` 内部表示混淆不同主机；自动 Cookie 头先按 Cookie 对象筛选再生成，合法共享 Cookie 不再因同名同值被误删；拒绝非法导入名值及额外列，保留空值、等号和合法引号值。显式 Cookie 头继续保留，重定向自动头重新标记来源。新增 13 项测试，295 项全绿；修复前工作区快照有 21 个断言失败、0 个运行错误，见 CHK-015 与审查报告最新章节。
+- ✅ **GitHub issue #1–#4 补修（BUG-059/060 P1）**：HTML5 省略结束标签的标签栈改为作用域限定的隐式闭合——新的 `<tr>`/`<td>`/`<li>` 等 start tag 自栈顶向下搜索最近目标元素并连同其上未闭合内容一起弹出，遇屏障元素（嵌套的 `table`/`ul`/`ol`/`menu`/`tr` 等）立即放弃，内层表格/列表不会误闭合外层元素；父元素的结束标签（如 `<ul><li class="drop">…</ul>`、`<menu><li>…</menu>` 的父结束标签、`</div>` 闭合省略 `</p>` 的目标）现在会隐式闭合被剥离/提取目标，剥离不再吞掉后续正文、提取不再超采；提取器记录目标外祖先链，无对应真实祖先的游离父结束标签（如 `</ol>`）不会提前截断采集
+- ✅ **GitHub issue #4 补修（BUG-061 P1）**：cookies.txt 第二列 include-subdomains 标志生效——FALSE 的 host-only Cookie 只发送给精确域名（新增 `_HostOnlyCookieSession` 在请求准备、重定向与克隆路径强制精确匹配），不再泄漏给子域名；同时识别 RFC 6265 标准 host-only 属性，服务器 Set-Cookie 未带 Domain 更新/新增的 Cookie 一并仅限本域，显式 `Domain=` 的 Cookie 仍子域共享；TRUE/点前缀域名归一化为子域共享；空 domain 行直接拒绝；用户显式设置的 Cookie 请求头（`--header`）不受过滤影响
+- ✅ **GitHub issue #3 补修（BUG-062 P1 / BUG-063 P2）**：HTML 代码块按正文行首反引号串最长长度动态选取更长的外层围栏（正文含 ``` 时生成 ````），代码内容不再被后处理误删；`rewrite_internal_links` 围栏识别统一改用 `_FenceTracker`（长度与关闭行尾规则），长围栏内的短反引号行之后链接不再被改写，围栏外文本块整体匹配使跨行链接（`[first\nsecond](url)`）也能正常改写
+- ✅ **单元测试 248 → 295 项**：新增省略结束标签（含嵌套表格、menu、游离标签反例）、cookies host-only（prepare_request/deepcopy 克隆/批量 worker 克隆/302 重定向/Set-Cookie 刷新/显式头混用/localhost/IPv6/同名同值/异常导入值）、围栏与跨行链接等回归用例，并加强 2 处断言过弱的旧测试为整串比较；历轮验证记录见 `docs/issue-fix-review-20261006.md`
+
 ### v0.4.2 (2026-09-30)
 - ✅ **华为开发者文档适配**：新增 `huawei.py` 模块（~150 行），自动检测 `developer.huawei.com/consumer/{cn|en}/doc/` URL，通过站点自身 `documentPortal/getDocumentById` API 直接获取正文 HTML 与标题（该站为 Angular SPA，普通 HTTP 只有 ~1.7KB JS 空壳，无 SSR 数据）。单页 / 批量 / `--crawl --merge` 三种模式全覆盖，支持中英文档，无需 Cookie；支持官方 llms.txt/MCP 索引的 `xxx.md` 链接形式（objectId 自动剥离 `.md` 后缀，否则接口返回 code=92531031）；API 失败时直接报错并给出兜底建议，不静默回退空壳
 - ✅ **新增 `--no-huawei-api` 参数**：禁用华为开发者文档自动检测与 API 提取
@@ -724,7 +733,7 @@ output → markdown_conv, models, security
 - ✅ **回归测试行为收敛**：测试集缺失时直接报告失败原因，不再依赖 fallback 示例文件
 - ✅ **Skill 元数据规范化**：frontmatter 保持 `name` / `description` 两项，description 改为 `Use when...` 触发条件描述
 
-> 注：`0.4.2` 为当前 Skill 发布版本；下方 `v2.x` 为早期内部功能迭代记录。
+> 注：`0.4.3` 为当前 Skill 发布版本；下方 `v2.x` 为早期内部功能迭代记录。
 
 ### v2.2.0 (2026-04-10)
 - ✨ **`--browser-fetch` 浏览器获取模式**：

@@ -439,6 +439,176 @@ class _SimpleSelectorMatcher:
         return False
 
 
+# ── HTML5 可选结束标签（omitted end tags）──────────────────────────────
+# 参考 HTML5「Optional tags」：li/dt/dd/td/th/tr/option 等元素的结束标签可省略，
+# 在遇到特定 start tag（或父元素结束）时自动闭合。仅按深度计数会因省略/游离的
+# 结束标签而失步，故这里维护真正的标签栈。
+_IMPLIED_END_BY_START: Dict[str, frozenset] = {
+    "li": frozenset({"li"}),
+    "dt": frozenset({"dt", "dd"}),
+    "dd": frozenset({"dt", "dd"}),
+    "td": frozenset({"td", "th"}),
+    "th": frozenset({"td", "th"}),
+    "tr": frozenset({"tr"}),
+    "thead": frozenset({"thead", "tbody", "tfoot", "tr"}),
+    "tbody": frozenset({"thead", "tbody", "tfoot", "tr"}),
+    "tfoot": frozenset({"thead", "tbody", "tfoot", "tr"}),
+    "colgroup": frozenset({"colgroup"}),
+    "option": frozenset({"option"}),
+    "optgroup": frozenset({"option", "optgroup"}),
+    "rt": frozenset({"rt", "rp"}),
+    "rp": frozenset({"rt", "rp"}),
+}
+
+# 以下块级 start tag 出现时，栈顶的 <p> 自动闭合
+_P_IMPLIED_END_STARTS = frozenset(
+    {
+        "address", "article", "aside", "blockquote", "details", "div", "dl",
+        "fieldset", "figcaption", "figure", "footer", "form", "h1", "h2", "h3",
+        "h4", "h5", "h6", "header", "hgroup", "hr", "main", "menu", "nav", "ol",
+        "p", "pre", "section", "table", "ul",
+    }
+)
+
+# 作用域限定的隐式闭合规则：start tag → (需闭合的目标标签, 作用域屏障)。
+# 遇到这些 start tag 时向下搜索最近的同组目标元素并连同其上元素一起弹出；
+# 搜索途中碰到屏障元素立即放弃。屏障保证嵌套结构的安全：内层 tr/td 永远
+# 不会误闭合外层表格的元素，内层列表的 li 不会闭合外层 li。
+# 仅检查栈顶时，目标 tr 之上有未闭合 td、目标 td 之上有未闭合 p 等省略
+# 结束标签的合法写法会漏闭合（见 BUG-060）。
+_IMPLIED_END_SCOPED_RULES: Dict[str, Tuple[frozenset, frozenset]] = {
+    "li": (frozenset({"li"}), frozenset({"ul", "ol", "menu", "table", "td", "th"})),
+    "dt": (frozenset({"dt", "dd"}), frozenset({"dl", "table", "td", "th"})),
+    "dd": (frozenset({"dt", "dd"}), frozenset({"dl", "table", "td", "th"})),
+    "td": (frozenset({"td", "th"}), frozenset({"tr", "table"})),
+    "th": (frozenset({"td", "th"}), frozenset({"tr", "table"})),
+    "tr": (frozenset({"tr"}), frozenset({"table"})),
+    "thead": (frozenset({"thead", "tbody", "tfoot"}), frozenset({"table"})),
+    "tbody": (frozenset({"thead", "tbody", "tfoot"}), frozenset({"table"})),
+    "tfoot": (frozenset({"thead", "tbody", "tfoot"}), frozenset({"table"})),
+}
+
+# 父元素的结束标签 → 其按省略结束标签规则隐式闭合的子元素集合。
+# 合法 HTML 允许 li/p/td 等元素省略结束标签、由父元素的结束标签收尾
+# （如 <ul><li>a</ul>）；收到这类结束标签时，仍在栈中未闭合的可选元素
+# 应视为已闭合（见 BUG-059）。p 例外：几乎所有块级/可选元素的结束标签
+# 处理前都会先生成隐式结束标签，因此 p 单独按集合判断。
+_ENDTAG_IMPLIED_CLOSE: Dict[str, frozenset] = {
+    "ul": frozenset({"li"}),
+    "ol": frozenset({"li"}),
+    "menu": frozenset({"li"}),
+    "dl": frozenset({"dt", "dd"}),
+    "table": frozenset(
+        {"tr", "td", "th", "thead", "tbody", "tfoot", "caption", "colgroup"}
+    ),
+    "tr": frozenset({"td", "th"}),
+    "tbody": frozenset({"tr", "td", "th"}),
+    "thead": frozenset({"tr", "td", "th"}),
+    "tfoot": frozenset({"tr", "td", "th"}),
+    "select": frozenset({"option", "optgroup"}),
+    "optgroup": frozenset({"option"}),
+    "ruby": frozenset({"rt", "rp"}),
+}
+
+_P_IMPLIED_END_ENDTAGS = _P_IMPLIED_END_STARTS | {
+    "li", "dt", "dd", "td", "th", "tr", "tbody", "thead", "tfoot",
+    "caption", "colgroup", "option", "optgroup", "select", "rt", "rp",
+    "ruby", "table", "ul", "ol", "dl",
+}
+
+
+def _implied_end_tags(start_tag: str) -> frozenset:
+    """返回 *start_tag* 出现时会自动闭合的栈顶标签集合（HTML5 可选结束标签）。"""
+    closed = _IMPLIED_END_BY_START.get(start_tag, frozenset())
+    if start_tag in _P_IMPLIED_END_STARTS:
+        closed = closed | {"p"}
+    return closed
+
+
+def _endtag_closes_tag(endtag: str, open_tag: str) -> bool:
+    """结束标签 *endtag* 是否按省略结束标签规则隐式闭合 *open_tag*。"""
+    if open_tag == "p":
+        return endtag in _P_IMPLIED_END_ENDTAGS
+    return open_tag in _ENDTAG_IMPLIED_CLOSE.get(endtag, frozenset())
+
+
+class _TagStack:
+    """HTML 标签栈，按 HTML5 可选结束标签规则维护开/闭配对。
+
+    解决仅按深度计数时的两类失步：
+
+    - 游离结束标签（无对应开标签）不应弹出任何元素；
+    - 省略结束标签的可选元素（li/p/td/...）在遇到同名或父级 start tag 时自动闭合。
+    """
+
+    def __init__(self) -> None:
+        self._entries: List[Tuple[str, object]] = []
+
+    def __len__(self) -> int:
+        return len(self._entries)
+
+    def push(self, tag: str, payload: object = None) -> List[Tuple[str, object]]:
+        """自动闭合栈顶被隐式结束的元素后压入 *tag*，返回被弹出的条目。"""
+        popped = self.pop_implied(tag)
+        self._entries.append((tag, payload))
+        return popped
+
+    def pop_implied(self, tag: str) -> List[Tuple[str, object]]:
+        """仅执行 *tag* 触发的隐式闭合（不压入），返回被弹出的条目。"""
+        scoped = _IMPLIED_END_SCOPED_RULES.get(tag)
+        if scoped is not None:
+            # 作用域限定的隐式闭合：向下搜索最近的目标元素，连带其上的
+            # 未闭合内容一起弹出；命中屏障元素则不做任何弹出
+            targets, boundaries = scoped
+            for i in range(len(self._entries) - 1, -1, -1):
+                name = self._entries[i][0]
+                if name in targets:
+                    popped = self._entries[i:]
+                    del self._entries[i:]
+                    return popped
+                if name in boundaries:
+                    return []
+            return []
+        closed = _implied_end_tags(tag)
+        popped: List[Tuple[str, object]] = []
+        while self._entries and self._entries[-1][0] in closed:
+            popped.append(self._entries.pop())
+        return popped
+
+    def close(self, tag: str, min_index: int = 0) -> List[Tuple[str, object]]:
+        """处理结束标签：从栈顶向下找同名元素，连同其上元素一并弹出并返回。
+
+        未找到同名元素（游离结束标签）时返回空列表，不改变栈。
+        *min_index* 限定搜索下界，避免误弹下界以下的祖先元素。
+        """
+        idx = self.find(tag, min_index)
+        if idx < 0:
+            return []
+        popped = self._entries[idx:]
+        del self._entries[idx:]
+        return popped
+
+    def find(self, tag: str, min_index: int = 0, stop: Optional[int] = None) -> int:
+        """返回 [*min_index*, *stop*) 范围内最近的同名元素下标，未找到返回 -1。"""
+        end = len(self._entries) if stop is None else min(stop, len(self._entries))
+        for i in range(end - 1, min_index - 1, -1):
+            if self._entries[i][0] == tag:
+                return i
+        return -1
+
+    def entry_tag(self, index: int) -> Optional[str]:
+        """返回指定下标元素的标签名，越界返回 None。"""
+        if 0 <= index < len(self._entries):
+            return self._entries[index][0]
+        return None
+
+    def pop_from(self, index: int) -> List[Tuple[str, object]]:
+        """弹出下标 *index* 及其上的全部条目并返回。"""
+        popped = self._entries[index:]
+        del self._entries[index:]
+        return popped
+
+
 class _HTMLElementStripper(HTMLParser):
     VOID_ELEMENTS = frozenset(
         {
@@ -466,10 +636,22 @@ class _HTMLElementStripper(HTMLParser):
         super().__init__(convert_charrefs=True)
         self.matchers = [_SimpleSelectorMatcher(s) for s in selectors if s.strip()]
         self.buf: List[str] = []
-        self.skip_depth = 0
-        self.skip_tag: Optional[str] = None
+        # 标签栈（payload 标记该元素是否属于被剥离子树）
+        self.stack = _TagStack()
+        self.skip_count = 0  # 栈中处于被剥离子树内的元素数
         self.stats = NavStripStats()
         self._raw_content_depth = 0  # script/style 内不转义 data
+
+    def _apply_implied_closes(self, tag: str) -> None:
+        """按 HTML5 可选结束标签规则自动闭合栈顶元素，并同步 skip_count。"""
+        for _t, skipped in self.stack.pop_implied(tag):
+            if skipped:
+                self.skip_count -= 1
+
+    def _drop_skipped(self, popped: List[Tuple[str, object]]) -> None:
+        for _t, skipped in popped:
+            if skipped:
+                self.skip_count -= 1
 
     def _should_skip(self, tag: str, attrs: Dict[str, Optional[str]]) -> Optional[str]:
         for matcher in self.matchers:
@@ -492,9 +674,14 @@ class _HTMLElementStripper(HTMLParser):
         tag = tag.lower()
         attrs = dict(attrs_list)
 
-        if self.skip_depth > 0:
+        # 先按 HTML5 规则自动闭合被省略结束标签的元素，避免计数器失步
+        self._apply_implied_closes(tag)
+
+        if self.skip_count > 0:
+            # 已在被剥离子树内：整棵子树按跳过处理（void 元素不入栈）
             if tag not in self.VOID_ELEMENTS:
-                self.skip_depth += 1
+                self.stack.push(tag, True)
+                self.skip_count += 1
             return
 
         matched = self._should_skip(tag, attrs)
@@ -503,8 +690,8 @@ class _HTMLElementStripper(HTMLParser):
                 self.stats.elements_removed += 1
                 self.stats.add_rule_match(matched)
                 return
-            self.skip_depth = 1
-            self.skip_tag = tag
+            self.stack.push(tag, True)
+            self.skip_count = 1
             self.stats.elements_removed += 1
             self.stats.add_rule_match(matched)
             return
@@ -514,6 +701,8 @@ class _HTMLElementStripper(HTMLParser):
             self.buf.append(f"<{tag} {attr_str}>")
         else:
             self.buf.append(f"<{tag}>")
+        if tag not in self.VOID_ELEMENTS:
+            self.stack.push(tag, False)
         # 进入 script/style 时不转义 data（CDATA 内容，含 math/tex 公式）
         if tag in ("script", "style"):
             self._raw_content_depth += 1
@@ -522,7 +711,10 @@ class _HTMLElementStripper(HTMLParser):
         tag = tag.lower()
         attrs = dict(attrs_list)
 
-        if self.skip_depth > 0:
+        # 自闭合写法同样可能隐式闭合 <p>（如 <hr/>）
+        self._apply_implied_closes(tag)
+
+        if self.skip_count > 0:
             return
 
         matched = self._should_skip(tag, attrs)
@@ -540,18 +732,34 @@ class _HTMLElementStripper(HTMLParser):
     def handle_endtag(self, tag: str) -> None:
         tag = tag.lower()
 
-        if self.skip_depth > 0:
-            self.skip_depth -= 1
-            if self.skip_depth == 0:
-                self.skip_tag = None
-            return
+        if self.skip_count > 0:
+            # 在跳过子树内：仅在跳过范围内弹出到同名元素（含其上被省略结束标签
+            # 的元素）；游离结束标签或匹配到范围外的祖先时忽略，不再错误递减
+            root = len(self.stack) - self.skip_count
+            popped = self.stack.close(tag, min_index=root)
+            if popped:
+                self._drop_skipped(popped)
+                return
+            # 结束标签匹配子树根之外的祖先，且按省略结束标签规则它会隐式闭合
+            # 子树根（如 </ul> 闭合省略了 </li> 的 <li class="drop">）：
+            # 剥离子树到此结束，祖先的结束标签按正常流程输出（见 BUG-059）
+            if (
+                root > 0
+                and self.stack.find(tag, 0, root) >= 0
+                and _endtag_closes_tag(tag, self.stack.entry_tag(root))
+            ):
+                self._drop_skipped(self.stack.pop_from(root))
+            else:
+                return
 
+        popped = self.stack.close(tag)
         self.buf.append(f"</{tag}>")
-        if tag in ("script", "style") and self._raw_content_depth > 0:
-            self._raw_content_depth -= 1
+        if popped:
+            if tag in ("script", "style") and self._raw_content_depth > 0:
+                self._raw_content_depth -= 1
 
     def handle_data(self, data: str) -> None:
-        if self.skip_depth > 0:
+        if self.skip_count > 0:
             return
         # script/style CDATA 内容不转义（避免污染 math/tex 公式）
         if self._raw_content_depth > 0:
@@ -560,12 +768,12 @@ class _HTMLElementStripper(HTMLParser):
             self.buf.append(htmllib.escape(data, quote=False))
 
     def handle_comment(self, data: str) -> None:
-        if self.skip_depth > 0:
+        if self.skip_count > 0:
             return
         self.buf.append(f"<!--{data}-->")
 
     def handle_decl(self, decl: str) -> None:
-        if self.skip_depth > 0:
+        if self.skip_count > 0:
             return
         self.buf.append(f"<!{decl}>")
 
@@ -873,7 +1081,12 @@ class _TargetSectionExtractor(HTMLParser):
         super().__init__(convert_charrefs=True)
         self.target_id = (target_id or "").strip() or None
         self.target_class = (target_class or "").strip() or None
-        self.depth = 0
+        # 标签栈替代深度计数：正确处理游离结束标签与省略的 </li> 等
+        self.stack = _TagStack()
+        # 目标开始之前的祖先链（目标外元素不入 self.stack）：用于核实
+        # 结束标签是否对应真实存在的祖先，而非游离标签（见 BUG-059）
+        self._context = _TagStack()
+        self.started = False  # 是否已进入目标容器
         self.done = False
         self.buf: List[str] = []
         self._raw_content_depth = 0  # script/style 内不转义 data
@@ -903,9 +1116,25 @@ class _TargetSectionExtractor(HTMLParser):
             return
         tag = tag.lower()
         attrs = dict(attrs_list)
-        if self.depth == 0:
+
+        # HTML5 可选结束标签：先自动闭合栈顶被隐式结束的元素
+        self.stack.pop_implied(tag)
+        if self.started and len(self.stack) == 0:
+            # 目标容器本身是可省略结束标签的元素（如 <p id="content">），
+            # 被后续块级 start tag 隐式闭合 → 采集结束
+            self.done = True
+            return
+
+        if not self.started:
             if not self._match(attrs):
+                # 未进入目标：维护目标外祖先链（省略结束标签的元素同样
+                # 按隐式闭合规则配对，避免游离结束标签污染祖先记录）
+                self._context.pop_implied(tag)
+                if tag not in _VOID_TAGS_EXTRACTOR:
+                    self._context.push(tag)
                 return
+            # 目标开始标签同样隐式闭合祖先链栈顶（如目标 li 闭合前一个 li）
+            self._context.pop_implied(tag)
             if tag in _VOID_TAGS_EXTRACTOR:
                 # 目标容器本身是 void 元素（如 <img id="content">）：
                 # 没有结束标签，写入后立即结束，避免吞入后续内容
@@ -913,10 +1142,10 @@ class _TargetSectionExtractor(HTMLParser):
                 self.buf.append(f"<{tag} {attr_str}>" if attr_str else f"<{tag}>")
                 self.done = True
                 return
-            self.depth = 1
-        elif tag not in _VOID_TAGS_EXTRACTOR:
-            # void 元素（br/img/hr 等）没有结束标签，不能计入深度
-            self.depth += 1
+            self.started = True
+        if tag not in _VOID_TAGS_EXTRACTOR:
+            # void 元素（br/img/hr 等）没有结束标签，不入栈
+            self.stack.push(tag)
         attr_str = self._attrs_to_str(attrs_list)
         if attr_str:
             self.buf.append(f"<{tag} {attr_str}>")
@@ -931,11 +1160,19 @@ class _TargetSectionExtractor(HTMLParser):
             return
         tag = tag.lower()
         attrs = dict(attrs_list)
-        if self.depth == 0:
+        if not self.started:
             if not self._match(attrs):
+                # 自闭合写法也可能隐式闭合祖先链栈顶（如 <hr/> 闭合 <p>）
+                self._context.pop_implied(tag)
                 return
             self.done = True
-        # 自闭合标签（含 void 元素的 <br/> 写法）不改变深度
+        else:
+            # 自闭合标签可能隐式闭合目标容器（如 <hr/> 闭合 <p id="content">）
+            self.stack.pop_implied(tag)
+            if len(self.stack) == 0:
+                self.done = True
+                return
+        # 自闭合标签（含 void 元素的 <br/> 写法）不改变栈
         attr_str = self._attrs_to_str(attrs_list)
         if attr_str:
             self.buf.append(f"<{tag} {attr_str}/>")
@@ -943,18 +1180,37 @@ class _TargetSectionExtractor(HTMLParser):
             self.buf.append(f"<{tag}/>")
 
     def handle_endtag(self, tag: str) -> None:
-        if self.done or self.depth == 0:
-            return
         tag = tag.lower()
+        if self.done:
+            return
+        if not self.started:
+            # 目标开始前：弹出祖先链上已匹配的元素，保持祖先记录真实
+            self._context.close(tag)
+            return
+        # 从栈顶向下找同名元素；游离结束标签被忽略，不再错误归零
+        popped = self.stack.close(tag)
+        if not popped:
+            # 结束标签可能是目标外部祖先的（目标外元素不在 self.stack）：
+            # 仅当它对应 _context 中真实打开的祖先、且按省略结束标签规则
+            # 隐式闭合目标根时（如 </ul> 闭合省略 </li> 的目标 li、
+            # </div> 闭合省略 </p> 的目标 p），采集到此结束；
+            # 不存在的 </ol> 等游离标签不得截断采集（见 BUG-059）
+            if (
+                self.stack
+                and _endtag_closes_tag(tag, self.stack.entry_tag(0))
+                and self._context.find(tag) >= 0
+            ):
+                self.stack.pop_from(0)
+                self.done = True
+            return
         self.buf.append(f"</{tag}>")
         if tag in ("script", "style") and self._raw_content_depth > 0:
             self._raw_content_depth -= 1
-        self.depth -= 1
-        if self.depth == 0:
+        if len(self.stack) == 0:
             self.done = True
 
     def handle_data(self, data: str) -> None:
-        if self.done or self.depth == 0 or not data:
+        if self.done or not self.started or not data:
             return
         # script/style CDATA 内容不转义（避免污染 math/tex 公式）
         if self._raw_content_depth > 0:

@@ -138,6 +138,24 @@ def _class_list(attrs: Dict[str, Optional[str]]) -> List[str]:
     return [str(cls)]
 
 
+_LINE_START_BACKTICKS_RE = re.compile(r"(?m)^ {0,3}(`+)")
+
+
+def _safe_backtick_fence_len(code: str) -> int:
+    """计算能安全包裹 *code* 的反引号围栏长度（至少 3）。
+
+    CommonMark：行首（至多 3 个空格缩进）的同字符反引号串，长度不小于
+    开启围栏且行内无其它内容时会结束代码块。因此代码正文含 ``` 行时固定
+    三反引号围栏会被提前闭合（见 BUG-062），生成围栏必须比正文内最长的
+    行首反引号串再长一格；正文无反引号行时维持三反引号。
+    """
+    longest = max(
+        (len(m.group(1)) for m in _LINE_START_BACKTICKS_RE.finditer(code)),
+        default=0,
+    )
+    return max(3, longest + 1)
+
+
 class HTMLToMarkdown(HTMLParser):
     def __init__(self, base_url: str, url_to_local: Dict[str, str], keep_html: bool = False):
         super().__init__(convert_charrefs=True)
@@ -735,7 +753,8 @@ class HTMLToMarkdown(HTMLParser):
             code = "".join(self.pre_buf)
             code = code.replace("\r\n", "\n").replace("\r", "\n").strip("\n")
             fence_lang = self._sanitize_fence_language(self.pre_lang)
-            self.out.append(f"```{fence_lang}\n" + code + "\n```\n\n")
+            fence = "`" * _safe_backtick_fence_len(code)
+            self.out.append(f"{fence}{fence_lang}\n" + code + f"\n{fence}\n\n")
             self.in_pre = False
             self.pre_buf = []
             self.pre_lang = ""
@@ -843,10 +862,48 @@ class HTMLToMarkdown(HTMLParser):
         self._append_text(data)
 
 
-def _is_fence_line(line: str) -> bool:
-    """判断一行是否是 Markdown 代码围栏（``` 或 ~~~）的起始/结束。"""
-    stripped = line.lstrip()
-    return stripped.startswith("```") or stripped.startswith("~~~")
+class _FenceTracker:
+    """跟踪 Markdown 代码围栏状态（CommonMark 规则）。
+
+    开始围栏为行首最多 3 个空格外连续 3+ 个反引号或波浪号（反引号围栏的
+    信息串不能含反引号）；结束围栏必须与开始围栏**同字符**且长度**不小于**
+    开始围栏，且行内除空白外无其它内容。
+
+    这样可避免 ``` 代码块内出现字面量 ~~~ 时状态被提前翻转、并正确识别
+    ~~~ 围栏，防止块内内容被后处理篡改。
+    """
+
+    _RE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
+
+    def __init__(self) -> None:
+        self.char = ""
+        self.length = 0
+
+    @property
+    def in_fence(self) -> bool:
+        return bool(self.char)
+
+    def feed(self, line: str) -> bool:
+        """喂入一行，返回该行是否为围栏界定行（开始或结束）。
+
+        调用后可用 ``in_fence`` 查询当前是否位于围栏内。
+        """
+        m = self._RE.match(line.rstrip("\r\n"))
+        if not m:
+            return False
+        fence, rest = m.group(1), m.group(2)
+        char, length = fence[0], len(fence)
+        if not self.in_fence:
+            # 开始围栏：反引号围栏的信息串不能含反引号
+            if char == "`" and "`" in rest:
+                return False
+            self.char, self.length = char, length
+            return True
+        # 结束围栏：同字符、长度 >= 开始长度，且除空白外无其它内容
+        if char == self.char and length >= self.length and rest.strip() == "":
+            self.char, self.length = "", 0
+            return True
+        return False
 
 
 def _process_outside_code(md: str, fn) -> str:
@@ -855,13 +912,10 @@ def _process_outside_code(md: str, fn) -> str:
     *fn* 接收单行文本（含换行符），返回替换后的文本。
     """
     out_lines: List[str] = []
-    in_fence = False
+    tracker = _FenceTracker()
     for line in md.splitlines(True):
-        if _is_fence_line(line):
-            in_fence = not in_fence
-            out_lines.append(line)
-            continue
-        if in_fence:
+        is_delim = tracker.feed(line)
+        if is_delim or tracker.in_fence:
             out_lines.append(line)
         else:
             out_lines.append(fn(line))
@@ -896,16 +950,12 @@ def _strip_empty_headings_outside_code(md: str) -> str:
 def _collapse_blank_lines_outside_code(md: str) -> str:
     """把代码块外连续 3+ 空行折叠为 2 个空行（代码块内原样保留）。"""
     out_lines: List[str] = []
-    in_fence = False
+    tracker = _FenceTracker()
     blank_run = 0
     for line in md.splitlines(True):
-        if _is_fence_line(line):
-            in_fence = not in_fence
+        if tracker.feed(line) or tracker.in_fence:
             out_lines.append(line)
             blank_run = 0
-            continue
-        if in_fence:
-            out_lines.append(line)
             continue
         if line.strip() == "":
             blank_run += 1
@@ -919,16 +969,11 @@ def _collapse_blank_lines_outside_code(md: str) -> str:
 
 def _convert_latex_delimiters_outside_code(md: str) -> str:
     out_lines: List[str] = []
-    in_fence = False
+    tracker = _FenceTracker()
     in_inline_code = False
     inline_tick_len = 0
     for line in md.splitlines(True):
-        stripped = line.lstrip()
-        if stripped.startswith("```"):
-            in_fence = not in_fence
-            out_lines.append(line)
-            continue
-        if in_fence:
+        if tracker.feed(line) or tracker.in_fence:
             out_lines.append(line)
             continue
 
@@ -1124,36 +1169,26 @@ def rewrite_internal_links(md_content: str, url_to_anchor: Dict[str, str]) -> Tu
 
         return match.group(0)
 
-    # 按代码围栏分段，仅处理围栏外的部分（避免破坏代码示例中的链接）
-    fence_re = re.compile(r"^([`~]{3,})")
-    lines = result.split("\n")
+    # 仅改写代码围栏外的链接（避免破坏代码示例中的链接，见 BUG-031/063）。
+    # 按 _FenceTracker 分段（CommonMark 长度与关闭行尾规则），对完整的
+    # 围栏外文本块整体执行正则——跨行链接（如 [first\nsecond](url)，
+    # 转换器自身就会生成）才能匹配
+    tracker = _FenceTracker()
     parts: List[str] = []
-    in_fence = False
-    fence_char = ""
     outside_buf: List[str] = []
 
     def flush_outside() -> None:
         if outside_buf:
-            parts.append(link_pattern.sub(replace_link, "\n".join(outside_buf)))
+            parts.append(link_pattern.sub(replace_link, "".join(outside_buf)))
             outside_buf.clear()
 
-    for line in lines:
-        m = fence_re.match(line.strip())
-        if m and (not in_fence or line.strip().startswith(fence_char * 3)):
-            # 围栏开/闭行
+    for line in result.splitlines(True):
+        if tracker.feed(line) or tracker.in_fence:
             flush_outside()
-            if not in_fence:
-                in_fence = True
-                fence_char = m.group(1)[0]
-            else:
-                in_fence = False
-                fence_char = ""
-            parts.append(line)
-        elif in_fence:
             parts.append(line)
         else:
             outside_buf.append(line)
 
     flush_outside()
-    result = "\n".join(parts)
+    result = "".join(parts)
     return result, rewrite_count
